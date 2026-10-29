@@ -66,7 +66,7 @@ function OpportunityCard({ item, onBuy, isLive }: { item: Opportunity; onBuy: (i
 export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => void }) {
   const { account } = useAccount()
   const isLive = account?.mode === 'live'
-  const liveReady = !isLive || Boolean(account?.live_configured)
+  const liveReady = !isLive || Boolean(account?.live_ready)
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<Opportunity | null>(null)
   const [amount, setAmount] = useState('')
@@ -110,7 +110,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     setScanning(true)
     try {
       const result = await api.scan(controller.signal)
-      toast({ title: '扫描完成', description: `本次返回 ${formatNumber(result.total, 0)} 个候选机会。`, variant: 'success' })
+      toast({ title: '扫描完成', description: `本次返回 ${formatNumber(result.total, 0)} 个候选机会；仅刷新行情，未自动下单。`, variant: 'success' })
       refresh()
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
@@ -166,6 +166,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-slate-100 pt-3 text-[11px] text-slate-400">
           <span>毛收益 = (1 − 价格) / 价格</span>
           <span>年化为理论换算，并非收益承诺</span>
+          <span>立即扫描仅刷新行情，不会自动下单</span>
           {data && <span className="sm:ml-auto">来源 {data.source} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
         </div>
       </Card>
@@ -225,7 +226,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} className="mt-0.5 h-4 w-4 rounded border-slate-300 accent-emerald-600 dark:accent-emerald-500" />
               <span className="text-xs leading-5 text-slate-600">{isLive ? <><span className="font-medium text-rose-800">我确认这是真实资金实盘买入。</span> 我理解订单会立即提交到 Polymarket，且高价结果失败时可能损失大部分本金。</> : <><span className="font-medium text-slate-800">我确认这是模拟买入。</span> 仅使用虚拟资金；当前价格不保证最终结算。</>}</span>
             </label>
-            {!liveReady && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">实盘凭据未配置。</span> 服务端缺少 POLYMARKET_PRIVATE_KEY，无法提交真实订单。</span></div>}
+            {!liveReady && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">{account?.live_configured ? '实盘凭据未就绪。' : '实盘凭据未配置。'}</span> {account?.live_configured ? (account.live_error || '请检查 Funder、CLOB 凭据与 USDC 授权。') : '服务端缺少 POLYMARKET_PRIVATE_KEY，无法提交真实订单。'}</span></div>}
             {orderError && <div className="break-words rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><span className="font-medium">订单未提交：</span>{orderError}</div>}
             <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
               <Button variant="secondary" onClick={() => setSelected(null)} disabled={submitting}>取消</Button>

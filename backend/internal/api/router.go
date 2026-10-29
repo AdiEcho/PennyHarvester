@@ -68,14 +68,13 @@ func maxBodySize(limit int64) gin.HandlerFunc {
 func (h *Handler) health(c *gin.Context) {
 	defaultAccount, err := h.engine.ResolveAccount(c.Request.Context(), 0)
 	mode := "live"
-	liveConfigured := false
 	if err == nil {
 		mode = string(defaultAccount.Mode)
-		liveConfigured = defaultAccount.LiveConfigured
 	}
+	liveConfigured, liveReady, liveError := h.engine.LiveStatus()
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok", "service": "pennyharvester",
-		"mode": mode, "live_configured": liveConfigured,
+		"mode": mode, "live_configured": liveConfigured, "live_ready": liveReady, "live_error": liveError,
 		"default_account_mode": mode, "time": time.Now().UTC(),
 	})
 }
@@ -158,7 +157,22 @@ func (h *Handler) opportunities(c *gin.Context) {
 }
 
 func (h *Handler) scan(c *gin.Context) {
-	if err := h.engine.Scan(c.Request.Context()); err != nil {
+	execute := false
+	if raw := c.Query("execute"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "execute 必须是布尔值"})
+			return
+		}
+		execute = parsed
+	}
+	var err error
+	if execute {
+		err = h.engine.Scan(c.Request.Context())
+	} else {
+		err = h.engine.ScanOnly(c.Request.Context())
+	}
+	if err != nil {
 		respondError(c, err)
 		return
 	}
@@ -171,8 +185,8 @@ func (h *Handler) positions(c *gin.Context) {
 		return
 	}
 	status := c.DefaultQuery("status", "open")
-	if status != "open" && status != "won" && status != "lost" && status != "all" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "status 仅支持 open、won、lost 或 all"})
+	if status != "open" && status != "won" && status != "lost" && status != "split" && status != "all" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status 仅支持 open、won、lost、split 或 all"})
 		return
 	}
 	positions, err := h.engine.Positions(c.Request.Context(), accountID, status)
@@ -188,6 +202,13 @@ func (h *Handler) orders(c *gin.Context) {
 	if !ok {
 		return
 	}
+	status := c.DefaultQuery("status", "all")
+	switch status {
+	case "all", "filled", "settled", "rejected", "pending", "unknown", "unresolved":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status 仅支持 all、filled、settled、rejected、pending、unknown 或 unresolved"})
+		return
+	}
 	limit := 100
 	if raw := c.Query("limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -197,7 +218,16 @@ func (h *Handler) orders(c *gin.Context) {
 		}
 		limit = parsed
 	}
-	orders, err := h.engine.Orders(c.Request.Context(), accountID, limit)
+	offset := 0
+	if raw := c.Query("offset"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "offset 须为非负整数"})
+			return
+		}
+		offset = parsed
+	}
+	orders, err := h.engine.Orders(c.Request.Context(), accountID, status, limit, offset)
 	if err != nil {
 		respondError(c, err)
 		return

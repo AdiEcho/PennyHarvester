@@ -46,6 +46,7 @@ type Account struct {
 	LiveConfigured bool   `json:"live_configured"`
 	LiveReady      bool   `json:"live_ready"`
 	LiveSigner     string `json:"live_signer"`
+	LiveMaker      string `json:"live_maker"`
 	LiveError      string `json:"live_error"`
 }
 
@@ -128,6 +129,7 @@ type Position struct {
 	Outcome       string     `json:"outcome"`
 	TokenID       string     `json:"token_id"`
 	Side          string     `json:"side"`
+	Kind          string     `json:"kind"`
 	EntryPrice    float64    `json:"entry_price"`
 	CurrentPrice  float64    `json:"current_price"`
 	Shares        float64    `json:"shares"`
@@ -179,6 +181,7 @@ type Metrics struct {
 	OpenExposure     float64 `json:"open_exposure"`
 	OpenPositions    int     `json:"open_positions"`
 	SettledPositions int     `json:"settled_positions"`
+	SplitPositions   int     `json:"split_positions"`
 	WinRate          float64 `json:"win_rate"`
 	TotalOrders      int64   `json:"total_orders"`
 }
@@ -236,11 +239,13 @@ type LiveFill struct {
 	Status  string
 }
 
-// CashSnapshot is the real USDC collateral balance of the live wallet.
+// CashSnapshot is the real USDC collateral balance and allowance of the live
+// wallet. Both values are denominated in USDC.
 type CashSnapshot struct {
-	Amount float64
-	At     time.Time
-	Stale  bool
+	Amount    float64
+	Allowance float64
+	At        time.Time
+	Stale     bool
 }
 
 // LiveExecutor is implemented by the Polymarket CLOB adapter. A nil executor
@@ -248,8 +253,14 @@ type CashSnapshot struct {
 type LiveExecutor interface {
 	Configured() bool
 	Signer() string
+	Maker() string
 	ReadyError() string
-	Buy(ctx context.Context, tokenID string, amount, maxPrice float64) (LiveFill, error)
+	// Buy signs an order and invokes onSigned before submitting it. The
+	// callback must persist the order so a crash or timeout cannot lose a
+	// real fill. conditionID is required to load the market's fee schedule.
+	Buy(ctx context.Context, tokenID, conditionID string, amount, maxPrice float64, onSigned func(orderID string) error) (LiveFill, error)
+	LookupOrder(ctx context.Context, orderID, conditionID string) (LiveFill, bool, error)
+	EstimateBuyFee(ctx context.Context, conditionID string, amount, price float64) (float64, error)
 	Collateral(ctx context.Context) (CashSnapshot, error)
 }
 
@@ -267,10 +278,14 @@ type Repository interface {
 	UpdateAccountBaseline(context.Context, int64, float64) error
 
 	CreatePosition(context.Context, Position) (Position, error)
+	CreatePositionWithOrder(context.Context, Position, Order) (Position, Order, error)
 	CreateOrder(context.Context, Order) (Order, error)
 	ListPositions(context.Context, int64, string) ([]Position, error)
-	ListOrders(context.Context, int64, int) ([]Order, error)
-	CountOrders(context.Context, int64) (int64, error)
+	ListOrders(context.Context, int64, string, int, int) ([]Order, error)
+	CountOrders(context.Context, int64, string) (int64, error)
+	ListUnresolvedOrders(context.Context, int64) ([]Order, error)
+	MarkOrderStatus(context.Context, int64, string, string) error
+	FinalizeLiveBuy(context.Context, int64, Position, LiveFill) (Position, error)
 	UpdateMark(context.Context, int64, float64, float64) error
 	SettlePosition(context.Context, Position, Order) error
 	AddSnapshot(context.Context, int64, EquityPoint) error

@@ -11,6 +11,7 @@ export interface Account {
   live_configured: boolean
   live_ready: boolean
   live_signer: string
+  live_maker: string
   live_error: string
 }
 
@@ -25,6 +26,8 @@ export interface Health {
   mode: AccountMode | string
   default_account_mode: AccountMode | string
   live_configured: boolean
+  live_ready: boolean
+  live_error: string
   time: string
 }
 
@@ -42,6 +45,7 @@ export interface Metrics {
   open_exposure: number
   open_positions: number
   settled_positions: number
+  split_positions: number
   win_rate: number
   total_orders: number
 }
@@ -96,7 +100,7 @@ export interface OpportunitiesResponse {
   source: string
 }
 
-export type PositionStatus = 'open' | 'won' | 'lost'
+export type PositionStatus = 'open' | 'won' | 'lost' | 'split'
 
 export interface Position {
   id: number
@@ -107,6 +111,7 @@ export interface Position {
   outcome: string
   token_id: string
   side: 'BUY'
+  kind: 'manual' | 'auto'
   entry_price: number
   current_price: number
   shares: number
@@ -125,7 +130,8 @@ export interface PositionsResponse {
   total: number
 }
 
-export type OrderStatus = 'filled' | 'rejected' | 'settled'
+export type OrderStatus = 'filled' | 'rejected' | 'settled' | 'pending' | 'unknown'
+export type OrderStatusFilter = OrderStatus | 'all' | 'unresolved'
 
 export interface Order {
   id: number

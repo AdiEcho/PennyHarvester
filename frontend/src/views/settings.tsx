@@ -239,17 +239,18 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
           <div className={cn('rounded-xl border p-4', isLive ? 'border-amber-200 bg-amber-50/50' : 'border-emerald-100 bg-emerald-50/50')}>
             <div className="flex items-center justify-between gap-3">
               <div><p className="text-sm font-semibold text-slate-800">{isLive ? '实盘自动交易' : '模拟自动交易'}</p><p className="mt-0.5 text-xs leading-5 text-slate-500">{isLive ? '开启后，引擎将按策略参数提交真实买单。' : '开启后，引擎将按策略参数创建虚拟买单。'}</p></div>
-              <Switch checked={account.auto_trade} onCheckedChange={toggleAuto} disabled={saving || (isLive && !account.live_configured)} aria-label={isLive ? '实盘自动交易' : '模拟自动交易'} />
+              <Switch checked={account.auto_trade} onCheckedChange={toggleAuto} disabled={saving || (isLive && !account.live_ready && !account.auto_trade)} aria-label={isLive ? '实盘自动交易' : '模拟自动交易'} />
             </div>
             <dl className="mt-4 space-y-2 text-xs">
               <div className="flex justify-between gap-3"><dt className="text-slate-500">账户模式</dt><dd className="font-medium text-slate-800">{isLive ? '真实资金 · CLOB' : '虚拟资金 · 本地撮合'}</dd></div>
-              <div className="flex justify-between gap-3"><dt className="text-slate-500">基准权益</dt><dd className="font-medium tabular-nums text-slate-800">{account.baseline_equity > 0 ? `$${account.baseline_equity.toFixed(2)}` : '待首次余额同步'}</dd></div>
-              {isLive && <div className="flex justify-between gap-3"><dt className="text-slate-500">交易钱包</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-700" title={account.live_signer}>{account.live_signer || '未配置'}</dd></div>}
+              <div className="flex justify-between gap-3"><dt className="text-slate-500">{isLive ? '基准权益' : '模拟基准权益'}</dt><dd className="font-medium tabular-nums text-slate-800">{account.baseline_equity > 0 ? `$${account.baseline_equity.toFixed(2)}` : isLive ? '待首次余额同步' : '待初始化'}</dd></div>
+              {isLive && <div className="flex justify-between gap-3"><dt className="text-slate-500">交易钱包 (Maker)</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-700" title={account.live_maker || account.live_signer}>{account.live_maker || account.live_signer || '未配置'}</dd></div>}
+              {isLive && account.live_maker && account.live_signer && account.live_maker.toLowerCase() !== account.live_signer.toLowerCase() && <div className="flex justify-between gap-3"><dt className="text-slate-500">签名地址</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-500" title={account.live_signer}>{account.live_signer}</dd></div>}
             </dl>
-            {isLive && !account.live_configured && (
+            {isLive && !account.live_ready && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-rose-200 bg-surface/70 p-3 text-xs leading-5 text-rose-700">
                 <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>未配置 <code className="rounded bg-rose-100 px-1">POLYMARKET_PRIVATE_KEY</code>，实盘下单会被拒绝。可先使用模拟账户测试策略。</span>
+                <span>{account.live_configured ? <>实盘凭据未就绪：{account.live_error || '请检查 Funder、API 凭据与 USDC 授权。'}</> : <>未配置 <code className="rounded bg-rose-100 px-1">POLYMARKET_PRIVATE_KEY</code>，实盘下单会被拒绝。可先使用模拟账户测试策略。</>}</span>
               </div>
             )}
             {isLive && account.live_error && <p className="mt-2 break-words text-xs leading-5 text-rose-600">实盘错误：{account.live_error}</p>}
@@ -265,7 +266,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
 
         <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs leading-5 text-slate-500">
           <Info className="mr-1 inline h-3.5 w-3.5 align-[-2px]" />
-          实盘账户使用服务端环境变量中的钱包和 CLOB 凭据；模拟账户只写本地数据库。实盘账户不可删除，每个实例只允许一个实盘账户。
+          实盘账户使用服务端环境变量中的钱包和 CLOB 凭据，下单前需在 Polymarket 完成 USDC 授权；模拟账户只写本地数据库。实盘账户不可删除，每个实例只允许一个实盘账户。
         </div>
       </CardContent>
 
@@ -425,7 +426,7 @@ export function SettingsView() {
 
           <SettingsSection icon={ShieldCheck} title="资金与风控" description="风控上限同时作用于实盘与模拟账户；初始资金仅用于模拟账户。">
             <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
-              <NumberField id="initial_bankroll" label="模拟初始资金" description="模拟账户的基准资金，不是真实现金余额。实盘基准由钱包余额自动初始化。" value={draft.initial_bankroll} unit="USD" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
+              <NumberField id="initial_bankroll" label="新建模拟账户初始资金" description="只用于之后创建的模拟账户；已有账户使用创建时的基准，不会因修改此值而重算历史。" value={draft.initial_bankroll} unit="USD" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
               <NumberField id="order_size" label="单笔金额" description="每次自动买入的目标名义金额。" value={draft.order_size} unit="USD" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
               <NumberField id="max_position" label="单市场持仓上限" description="不得低于单笔金额。" value={draft.max_position} unit="USD" min={0} error={errors.max_position} onChange={(value) => update('max_position', value)} />
               <NumberField id="max_exposure" label="总敞口上限" description="全部未平仓头寸的风险预算上限。" value={draft.max_exposure} unit="USD" min={0} error={errors.max_exposure} onChange={(value) => update('max_exposure', value)} />

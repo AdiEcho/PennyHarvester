@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"pennyharvester/backend/internal/engine"
@@ -63,12 +64,13 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		outcome TEXT NOT NULL,
 		token_id TEXT NOT NULL,
 		side TEXT NOT NULL,
+		kind TEXT NOT NULL DEFAULT 'manual',
 		entry_price REAL NOT NULL,
 		current_price REAL NOT NULL,
 		shares REAL NOT NULL,
 		cost REAL NOT NULL,
 		fee REAL NOT NULL,
-		status TEXT NOT NULL CHECK(status IN ('open', 'won', 'lost')),
+		status TEXT NOT NULL CHECK(status IN ('open', 'won', 'lost', 'split')),
 		opened_at TEXT NOT NULL,
 		closed_at TEXT,
 		end_date TEXT NOT NULL,
@@ -88,7 +90,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		amount REAL NOT NULL,
 		price REAL NOT NULL,
 		shares REAL NOT NULL,
-		status TEXT NOT NULL CHECK(status IN ('filled', 'rejected', 'settled')),
+		status TEXT NOT NULL CHECK(status IN ('filled', 'rejected', 'settled', 'pending', 'unknown')),
 		reason TEXT NOT NULL,
 		external_id TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL
@@ -121,7 +123,16 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "orders", "external_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "positions", "kind", "TEXT NOT NULL DEFAULT 'manual'"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "equity_snapshots", "account_id", fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", paperID)); err != nil {
+		return err
+	}
+	if err := s.migratePositionStatus(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateOrderStatus(ctx); err != nil {
 		return err
 	}
 	const indexes = `
@@ -133,6 +144,115 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *SQLite) tableSQL(ctx context.Context, name string) (string, error) {
+	var statement string
+	err := s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", name).Scan(&statement)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return statement, err
+}
+
+// migratePositionStatus rebuilds the positions table when an older CHECK
+// constraint does not allow the split status. SQLite cannot alter a CHECK in
+// place, so the table has to be recreated. Foreign keys are disabled for the
+// duration because orders references positions.
+func (s *SQLite) migratePositionStatus(ctx context.Context) error {
+	statement, err := s.tableSQL(ctx, "positions")
+	if err != nil || strings.Contains(statement, "'split'") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return err
+	}
+	defer func() { _, _ = s.db.ExecContext(context.Background(), "PRAGMA foreign_keys=ON") }()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	const rebuild = `
+	DROP TABLE IF EXISTS positions_new;
+	CREATE TABLE positions_new (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account_id INTEGER NOT NULL REFERENCES accounts(id),
+		market_id TEXT NOT NULL,
+		condition_id TEXT NOT NULL,
+		question TEXT NOT NULL,
+		outcome TEXT NOT NULL,
+		token_id TEXT NOT NULL,
+		side TEXT NOT NULL,
+		kind TEXT NOT NULL DEFAULT 'manual',
+		entry_price REAL NOT NULL,
+		current_price REAL NOT NULL,
+		shares REAL NOT NULL,
+		cost REAL NOT NULL,
+		fee REAL NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('open', 'won', 'lost', 'split')),
+		opened_at TEXT NOT NULL,
+		closed_at TEXT,
+		end_date TEXT NOT NULL,
+		realized_pnl REAL NOT NULL DEFAULT 0,
+		unrealized_pnl REAL NOT NULL DEFAULT 0
+	);
+	INSERT INTO positions_new(id, account_id, market_id, condition_id, question, outcome, token_id, side, kind,
+		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at, end_date, realized_pnl, unrealized_pnl)
+	SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side, COALESCE(kind, 'manual'),
+		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at, end_date, realized_pnl, unrealized_pnl
+	FROM positions;
+	DROP TABLE positions;
+	ALTER TABLE positions_new RENAME TO positions;`
+	if _, err := tx.ExecContext(ctx, rebuild); err != nil {
+		return fmt.Errorf("迁移 positions 状态约束: %w", err)
+	}
+	return tx.Commit()
+}
+
+// migrateOrderStatus adds pending/unknown to the orders status CHECK. Orders
+// have no child tables, so this rebuild does not need foreign keys disabled.
+func (s *SQLite) migrateOrderStatus(ctx context.Context) error {
+	statement, err := s.tableSQL(ctx, "orders")
+	if err != nil || (strings.Contains(statement, "'pending'") && strings.Contains(statement, "'unknown'")) {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	const rebuild = `
+	DROP TABLE IF EXISTS orders_new;
+	CREATE TABLE orders_new (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account_id INTEGER NOT NULL REFERENCES accounts(id),
+		position_id INTEGER REFERENCES positions(id),
+		market_id TEXT NOT NULL,
+		question TEXT NOT NULL,
+		outcome TEXT NOT NULL,
+		token_id TEXT NOT NULL,
+		kind TEXT NOT NULL CHECK(kind IN ('manual', 'auto')),
+		type TEXT NOT NULL CHECK(type IN ('buy', 'settle')),
+		amount REAL NOT NULL,
+		price REAL NOT NULL,
+		shares REAL NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('filled', 'rejected', 'settled', 'pending', 'unknown')),
+		reason TEXT NOT NULL,
+		external_id TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL
+	);
+	INSERT INTO orders_new(id, account_id, position_id, market_id, question, outcome, token_id, kind, type,
+		amount, price, shares, status, reason, external_id, created_at)
+	SELECT id, account_id, position_id, market_id, question, outcome, token_id, kind, type,
+		amount, price, shares, status, reason, external_id, created_at
+	FROM orders;
+	DROP TABLE orders;
+	ALTER TABLE orders_new RENAME TO orders;`
+	if _, err := tx.ExecContext(ctx, rebuild); err != nil {
+		return fmt.Errorf("迁移 orders 状态约束: %w", err)
+	}
+	return tx.Commit()
 }
 
 func (s *SQLite) seedAccounts(ctx context.Context) (liveID, paperID int64, err error) {
@@ -232,7 +352,9 @@ func (s *SQLite) LoadSettings(ctx context.Context) (engine.Settings, error) {
 	if err != nil {
 		return engine.Settings{}, err
 	}
-	var settings engine.Settings
+	// Start from defaults so a payload written by an older version that lacks
+	// a newly added field remains readable instead of failing validation.
+	settings := engine.DefaultSettings()
 	if err := json.Unmarshal([]byte(payload), &settings); err != nil {
 		return engine.Settings{}, fmt.Errorf("读取策略设置: %w", err)
 	}
@@ -303,8 +425,11 @@ func (s *SQLite) CreateAccount(ctx context.Context, account engine.Account) (eng
 }
 
 func (s *SQLite) UpdateAccount(ctx context.Context, account engine.Account) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET name = ?, auto_trade = ?, baseline_equity = ? WHERE id = ?`,
-		account.Name, account.AutoTrade, account.BaselineEquity, account.ID)
+	// baseline_equity is updated separately by UpdateAccountBaseline so a
+	// concurrent live-balance sync cannot be overwritten by a name/auto-trade
+	// edit.
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET name = ?, auto_trade = ? WHERE id = ?`,
+		account.Name, account.AutoTrade, account.ID)
 	return err
 }
 
@@ -372,20 +497,54 @@ func scanAccount(scanner accountScanner) (engine.Account, error) {
 	return account, nil
 }
 
-func (s *SQLite) CreatePosition(ctx context.Context, p engine.Position) (engine.Position, error) {
-	result, err := s.db.ExecContext(ctx, `INSERT INTO positions(
-		account_id, market_id, condition_id, question, outcome, token_id, side, entry_price,
+type execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertPosition(ctx context.Context, db execer, p engine.Position) (engine.Position, error) {
+	kind := p.Kind
+	if kind == "" {
+		kind = "manual"
+	}
+	result, err := db.ExecContext(ctx, `INSERT INTO positions(
+		account_id, market_id, condition_id, question, outcome, token_id, side, kind, entry_price,
 		current_price, shares, cost, fee, status, opened_at, closed_at, end_date,
 		realized_pnl, unrealized_pnl
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.AccountID, p.MarketID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, p.EntryPrice,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.AccountID, p.MarketID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, kind, p.EntryPrice,
 		p.CurrentPrice, p.Shares, p.Cost, p.Fee, p.Status, formatTime(p.OpenedAt),
 		nullableTime(p.ClosedAt), formatTime(p.EndDate), p.RealizedPNL, p.UnrealizedPNL)
 	if err != nil {
 		return engine.Position{}, err
 	}
+	p.Kind = kind
 	p.ID, err = result.LastInsertId()
 	return p, err
+}
+
+func (s *SQLite) CreatePosition(ctx context.Context, p engine.Position) (engine.Position, error) {
+	return insertPosition(ctx, s.db, p)
+}
+
+func (s *SQLite) CreatePositionWithOrder(ctx context.Context, p engine.Position, order engine.Order) (engine.Position, engine.Order, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return engine.Position{}, engine.Order{}, err
+	}
+	defer tx.Rollback()
+	p, err = insertPosition(ctx, tx, p)
+	if err != nil {
+		return engine.Position{}, engine.Order{}, err
+	}
+	order.PositionID = &p.ID
+	order.ID, err = insertOrder(ctx, tx, order)
+	if err != nil {
+		return engine.Position{}, engine.Order{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return engine.Position{}, engine.Order{}, err
+	}
+	return p, order, nil
 }
 
 func (s *SQLite) CreateOrder(ctx context.Context, order engine.Order) (engine.Order, error) {
@@ -413,7 +572,7 @@ func insertOrder(ctx context.Context, db orderInserter, order engine.Order) (int
 }
 
 func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status string) ([]engine.Position, error) {
-	query := `SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side,
+	query := `SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side, kind,
 		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at,
 		end_date, realized_pnl, unrealized_pnl FROM positions WHERE account_id = ?`
 	args := []any{accountID}
@@ -433,7 +592,7 @@ func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status stri
 		var openedAt, endDate string
 		var closedAt sql.NullString
 		if err := rows.Scan(&p.ID, &p.AccountID, &p.MarketID, &p.ConditionID, &p.Question, &p.Outcome,
-			&p.TokenID, &p.Side, &p.EntryPrice, &p.CurrentPrice, &p.Shares, &p.Cost,
+			&p.TokenID, &p.Side, &p.Kind, &p.EntryPrice, &p.CurrentPrice, &p.Shares, &p.Cost,
 			&p.Fee, &p.Status, &openedAt, &closedAt, &endDate, &p.RealizedPNL, &p.UnrealizedPNL); err != nil {
 			return nil, err
 		}
@@ -457,14 +616,22 @@ func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status stri
 	return positions, rows.Err()
 }
 
-func (s *SQLite) ListOrders(ctx context.Context, accountID int64, limit int) ([]engine.Order, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, account_id, position_id, market_id, question, outcome,
-		token_id, kind, type, amount, price, shares, status, reason, external_id, created_at
-		FROM orders WHERE account_id = ? ORDER BY id DESC LIMIT ?`, accountID, limit)
-	if err != nil {
-		return nil, err
+func orderStatusClause(status string) (string, []any) {
+	switch status {
+	case "", "all":
+		return "", nil
+	case "unresolved":
+		return " AND status IN ('pending', 'unknown')", nil
+	default:
+		return " AND status = ?", []any{status}
 	}
-	defer rows.Close()
+}
+
+const orderColumns = `SELECT id, account_id, position_id, market_id, question, outcome,
+	token_id, kind, type, amount, price, shares, status, reason, external_id, created_at
+	FROM orders`
+
+func scanOrderRows(rows *sql.Rows) ([]engine.Order, error) {
 	orders := []engine.Order{}
 	for rows.Next() {
 		var order engine.Order
@@ -478,19 +645,82 @@ func (s *SQLite) ListOrders(ctx context.Context, accountID int64, limit int) ([]
 		if positionID.Valid {
 			order.PositionID = &positionID.Int64
 		}
-		order.CreatedAt, err = parseTime(createdAt)
+		parsed, err := parseTime(createdAt)
 		if err != nil {
 			return nil, err
 		}
+		order.CreatedAt = parsed
 		orders = append(orders, order)
 	}
 	return orders, rows.Err()
 }
 
-func (s *SQLite) CountOrders(ctx context.Context, accountID int64) (int64, error) {
+func (s *SQLite) ListOrders(ctx context.Context, accountID int64, status string, limit, offset int) ([]engine.Order, error) {
+	query := orderColumns + " WHERE account_id = ?"
+	args := []any{accountID}
+	clause, filterArgs := orderStatusClause(status)
+	query += clause
+	args = append(args, filterArgs...)
+	query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOrderRows(rows)
+}
+
+func (s *SQLite) CountOrders(ctx context.Context, accountID int64, status string) (int64, error) {
+	query := "SELECT COUNT(*) FROM orders WHERE account_id = ?"
+	args := []any{accountID}
+	clause, filterArgs := orderStatusClause(status)
+	query += clause
+	args = append(args, filterArgs...)
 	var count int64
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM orders WHERE account_id = ?", accountID).Scan(&count)
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
+}
+
+func (s *SQLite) ListUnresolvedOrders(ctx context.Context, accountID int64) ([]engine.Order, error) {
+	rows, err := s.db.QueryContext(ctx, orderColumns+" WHERE account_id = ? AND status IN ('pending', 'unknown') AND external_id <> '' ORDER BY id ASC", accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOrderRows(rows)
+}
+
+func (s *SQLite) MarkOrderStatus(ctx context.Context, orderID int64, status, reason string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE orders SET status = ?, reason = ? WHERE id = ? AND status IN ('pending', 'unknown')`, status, reason, orderID)
+	return err
+}
+
+func (s *SQLite) FinalizeLiveBuy(ctx context.Context, orderID int64, p engine.Position, fill engine.LiveFill) (engine.Position, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return engine.Position{}, err
+	}
+	defer tx.Rollback()
+	p, err = insertPosition(ctx, tx, p)
+	if err != nil {
+		return engine.Position{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE orders SET position_id = ?, amount = ?, price = ?, shares = ?,
+		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END
+		WHERE id = ? AND status IN ('pending', 'unknown')`,
+		p.ID, fill.Cost, fill.Price, fill.Shares, "Polymarket CLOB 实盘成交", fill.OrderID, orderID)
+	if err != nil {
+		return engine.Position{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return engine.Position{}, fmt.Errorf("实盘订单 %d 已处理或不存在", orderID)
+	}
+	if err := tx.Commit(); err != nil {
+		return engine.Position{}, err
+	}
+	return p, nil
 }
 
 func (s *SQLite) UpdateMark(ctx context.Context, id int64, price, unrealized float64) error {

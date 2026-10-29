@@ -6,6 +6,7 @@ import type {
   Engine,
   Health,
   OpportunitiesResponse,
+  OrderStatusFilter,
   OrdersResponse,
   Position,
   PositionStatus,
@@ -83,14 +84,20 @@ export const api = {
   opportunities: (signal?: AbortSignal) => request<OpportunitiesResponse>('/opportunities', { signal }),
   positions: (accountId: number | undefined, status: PositionStatus | 'all', signal?: AbortSignal) =>
     request<PositionsResponse>(withAccount(`/positions?status=${status}`, accountId), { signal }),
-  orders: (accountId: number | undefined, limit = 100, signal?: AbortSignal) =>
-    request<OrdersResponse>(withAccount(`/orders?limit=${limit}`, accountId), { signal }),
+  orders: (
+    accountId: number | undefined,
+    status: OrderStatusFilter = 'all',
+    limit = 100,
+    offset = 0,
+    signal?: AbortSignal,
+  ) => request<OrdersResponse>(withAccount(`/orders?status=${status}&limit=${limit}&offset=${offset}`, accountId), { signal }),
   settings: (signal?: AbortSignal) => request<Settings>('/settings', { signal }),
   updateSettings: (settings: Settings, signal?: AbortSignal) =>
     request<Settings>('/settings', { method: 'PUT', body: settings, signal }),
   toggleEngine: (running: boolean, signal?: AbortSignal) =>
     request<Engine>('/engine/toggle', { method: 'POST', body: { running }, signal }),
-  scan: (signal?: AbortSignal) => request<OpportunitiesResponse>('/scan', { method: 'POST', signal }),
+  scan: (signal?: AbortSignal, execute = false) =>
+    request<OpportunitiesResponse>(`/scan${execute ? '?execute=true' : ''}`, { method: 'POST', signal }),
   createOrder: (
     accountId: number,
     body: { market_id: string; outcome: string; token_id: string; amount: number },

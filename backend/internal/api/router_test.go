@@ -192,3 +192,68 @@ func TestAccountCreationAndDefaultSwitch(t *testing.T) {
 func itoa(value int64) string {
 	return strconv.FormatInt(value, 10)
 }
+
+func TestScanAPIDefaultsToScanOnly(t *testing.T) {
+	handler, instance := setupRouter(t)
+	paperID := accountID(t, handler, engine.AccountModePaper)
+	update := request(t, handler, http.MethodPatch, "/api/v1/accounts/"+itoa(paperID), map[string]any{"auto_trade": true})
+	if update.Code != http.StatusOK {
+		t.Fatalf("enable auto trade failed: %d %s", update.Code, update.Body.String())
+	}
+	scan := request(t, handler, http.MethodPost, "/api/v1/scan", nil)
+	if scan.Code != http.StatusOK {
+		t.Fatalf("scan failed: %d %s", scan.Code, scan.Body.String())
+	}
+	positions, err := instance.Positions(context.Background(), paperID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 0 {
+		t.Fatalf("scan-only API placed an order: %+v", positions.Items)
+	}
+	execute := request(t, handler, http.MethodPost, "/api/v1/scan?execute=true", nil)
+	if execute.Code != http.StatusOK {
+		t.Fatalf("execute scan failed: %d %s", execute.Code, execute.Body.String())
+	}
+	positions, err = instance.Positions(context.Background(), paperID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("execute scan did not auto-trade: %+v", positions.Items)
+	}
+}
+
+func TestOrdersAPIReportsTotalAndSupportsFilters(t *testing.T) {
+	handler, _ := setupRouter(t)
+	paperID := accountID(t, handler, engine.AccountModePaper)
+	for i := 0; i < 3; i++ {
+		order := request(t, handler, http.MethodPost, "/api/v1/accounts/"+itoa(paperID)+"/orders", map[string]any{
+			"market_id": "test-1", "outcome": "Yes", "token_id": "yes", "amount": 50,
+		})
+		if order.Code != http.StatusCreated {
+			t.Fatalf("paper order failed: %d %s", order.Code, order.Body.String())
+		}
+	}
+	response := request(t, handler, http.MethodGet, "/api/v1/orders?account_id="+itoa(paperID)+"&status=filled&limit=2&offset=0", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("orders failed: %d %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Items []engine.Order `json:"items"`
+		Total int            `json:"total"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Total != 3 || len(payload.Items) != 2 {
+		t.Fatalf("unexpected orders page: total=%d rows=%d", payload.Total, len(payload.Items))
+	}
+	rejected := request(t, handler, http.MethodGet, "/api/v1/orders?account_id="+itoa(paperID)+"&status=rejected", nil)
+	if rejected.Code != http.StatusOK {
+		t.Fatalf("rejected filter failed: %d %s", rejected.Code, rejected.Body.String())
+	}
+	if !bytes.Contains(rejected.Body.Bytes(), []byte(`"total":0`)) {
+		t.Fatalf("unexpected rejected response: %s", rejected.Body.String())
+	}
+}

@@ -19,7 +19,7 @@ import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
-import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { RiskNotice } from '@/components/risk-notice'
 import { ModeBadge } from '@/components/status-badges'
@@ -159,6 +159,7 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
       <Dialog open={mobileOpen} onOpenChange={setMobileOpen}>
         <DialogContent className="left-0 top-0 h-full max-h-none w-[280px] max-w-[85vw] -translate-x-0 -translate-y-0 rounded-none border-0 bg-navy p-0 text-white [&>button]:z-10 [&>button]:text-slate-400 [&>button]:hover:bg-white/10 [&>button]:hover:text-white">
           <DialogTitle className="sr-only">导航菜单</DialogTitle>
+          <DialogDescription className="sr-only">选择要查看的页面</DialogDescription>
           <Navigation view={view} onNavigate={navigate} />
         </DialogContent>
       </Dialog>
@@ -186,21 +187,20 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
             <ThemeToggle />
             <AccountSwitcher />
             {account && <ModeBadge mode={account.mode} className="hidden sm:inline-flex" />}
-            {isLive && account && !account.live_configured && (
-              <Badge variant="danger" className="hidden lg:inline-flex"><ShieldAlert className="h-3 w-3" /> 实盘未配置</Badge>
+            {isLive && account && !account.live_ready && (
+              <Badge variant={account.live_configured ? 'warning' : 'danger'} className="hidden lg:inline-flex"><ShieldAlert className="h-3 w-3" /> {account.live_configured ? '实盘未就绪' : '实盘未配置'}</Badge>
             )}
           </div>
         </header>
 
         <main className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6 sm:py-8 lg:px-8 lg:py-9">
-          {account?.mode === 'live' && !account.live_configured && (
+          {account?.mode === 'live' && !account.live_ready && (
             <div className="mb-5 flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
               <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
               <div>
-                <p className="font-semibold">实盘账户尚未配置交易凭据</p>
+                <p className="font-semibold">{account.live_configured ? '实盘账户凭据未就绪' : '实盘账户尚未配置交易凭据'}</p>
                 <p className="mt-1 text-xs leading-5 text-rose-700">
-                  当前为默认实盘账户，但服务端没有 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code>。
-                  系统会明确拒绝实盘下单，不会静默切换到模拟账户。请在环境变量中配置钱包后重启服务。
+                  {account.live_configured ? <>{account.live_error || '请检查 Funder、CLOB API 凭据与 USDC 授权。'}</> : <>当前为默认实盘账户，但服务端没有 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code>。系统会明确拒绝实盘下单，不会静默切换到模拟账户。请在环境变量中配置钱包后重启服务。</>}
                 </p>
               </div>
             </div>

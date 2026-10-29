@@ -4,6 +4,7 @@ package live
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	clobclient "github.com/Cyvadra/polymarket-clob-client"
+	"github.com/ethereum/go-ethereum/common"
 
 	"pennyharvester/backend/internal/engine"
 )
@@ -55,6 +57,21 @@ func (e *Executor) Signer() string {
 	return e.signer
 }
 
+// Maker returns the wallet that owns the CLOB position. For EOA accounts it is
+// the signer; for proxy, Safe and deposit wallets it is POLYMARKET_FUNDER.
+func (e *Executor) Maker() string {
+	if e == nil {
+		return ""
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ensureClientLocked()
+	if e.client == nil {
+		return ""
+	}
+	return e.client.MakerAddress()
+}
+
 func (e *Executor) ReadyError() string {
 	if e == nil {
 		return "未配置实盘执行器"
@@ -83,19 +100,45 @@ func (e *Executor) ensureClientLocked() {
 		e.initErr = fmt.Errorf("POLYMARKET_SIGNATURE_TYPE 仅支持 0、1、2、3")
 		return
 	}
-	if e.cfg.SignatureType != 0 && strings.TrimSpace(e.cfg.Funder) == "" {
-		e.initErr = fmt.Errorf("非 EOA 签名类型需要设置 POLYMARKET_FUNDER（代理钱包地址）")
+	funder := strings.TrimSpace(e.cfg.Funder)
+	if e.cfg.SignatureType == 0 {
+		if funder != "" {
+			e.initErr = fmt.Errorf("EOA 签名类型不需要 POLYMARKET_FUNDER；请留空，或改用 1/2/3")
+			return
+		}
+	} else {
+		if funder == "" {
+			e.initErr = fmt.Errorf("非 EOA 签名类型需要设置 POLYMARKET_FUNDER（代理钱包地址）")
+			return
+		}
+		if !common.IsHexAddress(funder) {
+			e.initErr = fmt.Errorf("POLYMARKET_FUNDER 不是有效地址")
+			return
+		}
+	}
+	credentialCount := 0
+	for _, value := range []string{e.cfg.APIKey, e.cfg.APISecret, e.cfg.APIPassphrase} {
+		if strings.TrimSpace(value) != "" {
+			credentialCount++
+		}
+	}
+	if credentialCount != 0 && credentialCount != 3 {
+		e.initErr = fmt.Errorf("POLYMARKET_API_KEY、POLYMARKET_API_SECRET、POLYMARKET_API_PASSPHRASE 必须同时设置")
 		return
+	}
+	makerAddress := ""
+	if e.cfg.SignatureType != 0 {
+		makerAddress = funder
 	}
 	cfg := clobclient.Config{
 		PrivateKey:    strings.TrimSpace(e.cfg.PrivateKey),
-		MakerAddress:  strings.TrimSpace(e.cfg.Funder),
+		MakerAddress:  makerAddress,
 		SignatureType: clobclient.SignatureType(e.cfg.SignatureType),
 		Host:          e.cfg.CLOBURL,
 		Timeout:       20 * time.Second,
 		QPS:           10,
 	}
-	if e.cfg.APIKey != "" && e.cfg.APISecret != "" && e.cfg.APIPassphrase != "" {
+	if credentialCount == 3 {
 		cfg.Credentials = &clobclient.Credentials{
 			APIKey: e.cfg.APIKey, Secret: e.cfg.APISecret, Passphrase: e.cfg.APIPassphrase,
 		}
@@ -128,13 +171,17 @@ func (e *Executor) ensure(ctx context.Context) (*clobclient.Client, error) {
 	return client, nil
 }
 
-func (e *Executor) Buy(ctx context.Context, tokenID string, amount, maxPrice float64) (engine.LiveFill, error) {
-	if tokenID == "" || amount <= 0 {
-		return engine.LiveFill{}, fmt.Errorf("%w: token 与金额必须有效", engine.ErrInvalidOrder)
+func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount, maxPrice float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	if tokenID == "" || conditionID == "" || amount <= 0 {
+		return engine.LiveFill{}, fmt.Errorf("%w: token、condition 与金额必须有效", engine.ErrInvalidOrder)
 	}
 	client, err := e.ensure(ctx)
 	if err != nil {
 		return engine.LiveFill{}, err
+	}
+	schedule, err := client.FeeSchedule(ctx, conditionID)
+	if err != nil {
+		return engine.LiveFill{}, fmt.Errorf("读取实盘手续费: %w", err)
 	}
 	order, err := client.MarketBuyOrder(ctx, tokenID, amount, clobclient.OrderTypeFAK)
 	if err != nil {
@@ -147,6 +194,11 @@ func (e *Executor) Buy(ctx context.Context, tokenID string, amount, maxPrice flo
 	if err != nil {
 		return engine.LiveFill{}, fmt.Errorf("签名实盘买单: %w", err)
 	}
+	if onSigned != nil {
+		if err := onSigned(signed.OrderID); err != nil {
+			return engine.LiveFill{}, fmt.Errorf("持久化待确认实盘订单: %w", err)
+		}
+	}
 	response, submitErr := client.SubmitSignedOrder(ctx, signed, clobclient.OrderTypeFAK, false)
 	if submitErr != nil {
 		// A timeout can still mean the exchange accepted the order. Look the
@@ -154,13 +206,14 @@ func (e *Executor) Buy(ctx context.Context, tokenID string, amount, maxPrice flo
 		// silently lost from the local ledger.
 		if detail, lookupErr := client.Order(ctx, signed.OrderID); lookupErr == nil {
 			if fill, ok := fillFromOrder(detail, order.Price); ok {
+				applyFee(schedule, &fill)
 				return fill, nil
 			}
 		}
-		return engine.LiveFill{}, fmt.Errorf("提交实盘买单（订单 %s，结果可能未知）: %w", signed.OrderID, submitErr)
+		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("提交实盘买单（订单 %s，结果可能未知）: %w", signed.OrderID, submitErr)
 	}
 	if response == nil {
-		return engine.LiveFill{}, fmt.Errorf("Polymarket 返回空订单响应")
+		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("Polymarket 返回空订单响应")
 	}
 	if !response.Success {
 		message := strings.TrimSpace(response.ErrorMsg)
@@ -170,7 +223,7 @@ func (e *Executor) Buy(ctx context.Context, tokenID string, amount, maxPrice flo
 		if response.OrderID != "" {
 			message = fmt.Sprintf("%s（订单 %s）", message, response.OrderID)
 		}
-		return engine.LiveFill{}, fmt.Errorf("%s", message)
+		return engine.LiveFill{OrderID: response.OrderID, Status: "rejected"}, fmt.Errorf("%s", message)
 	}
 	fill := engine.LiveFill{OrderID: response.OrderID, Status: response.Status}
 	fill.Cost = parseAmount(response.MakingAmount)
@@ -180,20 +233,108 @@ func (e *Executor) Buy(ctx context.Context, tokenID string, amount, maxPrice flo
 			if detail, lookupErr := client.Order(ctx, response.OrderID); lookupErr == nil {
 				if lookedUp, ok := fillFromOrder(detail, order.Price); ok {
 					lookedUp.OrderID = response.OrderID
+					applyFee(schedule, &lookedUp)
 					return lookedUp, nil
 				}
 			}
 		}
 	}
 	if fill.Shares <= 0 || fill.Cost <= 0 {
-		return fill, fmt.Errorf("实盘订单未成交（状态 %s）", fill.Status)
+		// The exchange accepted the order but the response did not include a
+		// usable match. Treat it as unknown and reconcile instead of
+		// declaring a possible fill rejected.
+		originalStatus := fill.Status
+		if fill.OrderID == "" {
+			fill.OrderID = signed.OrderID
+		}
+		fill.Status = "unknown"
+		return fill, fmt.Errorf("实盘订单未产生可确认成交（原状态 %s）", originalStatus)
 	}
 	fill.Price = fill.Cost / fill.Shares
-	expected := fill.Shares * order.Price
-	if fill.Cost > expected+1e-9 {
-		fill.Fee = fill.Cost - expected
-	}
+	applyFee(schedule, &fill)
 	return fill, nil
+}
+
+// EstimateBuyFee returns the taker fee the exchange would charge for the
+// requested notional at the reference price. It is used for pre-trade cash and
+// exposure checks; the actual fee is recomputed from the fill.
+func (e *Executor) EstimateBuyFee(ctx context.Context, conditionID string, amount, price float64) (float64, error) {
+	if conditionID == "" || amount <= 0 || price <= 0 || price >= 1 {
+		return 0, nil
+	}
+	client, err := e.ensure(ctx)
+	if err != nil {
+		return 0, err
+	}
+	schedule, err := client.FeeSchedule(ctx, conditionID)
+	if err != nil {
+		return 0, err
+	}
+	return feeFromSchedule(schedule, amount/price, price)
+}
+
+// LookupOrder reconciles an order by its signed digest / exchange order ID.
+func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string) (engine.LiveFill, bool, error) {
+	if orderID == "" {
+		return engine.LiveFill{}, false, nil
+	}
+	client, err := e.ensure(ctx)
+	if err != nil {
+		return engine.LiveFill{}, false, err
+	}
+	detail, err := client.Order(ctx, orderID)
+	if err != nil {
+		var apiErr *clobclient.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
+			return engine.LiveFill{}, false, nil
+		}
+		return engine.LiveFill{}, false, err
+	}
+	if detail == nil {
+		return engine.LiveFill{}, false, nil
+	}
+	fill, ok := fillFromOrder(detail, 0)
+	if !ok {
+		return engine.LiveFill{OrderID: orderID, Status: detail.Status}, true, nil
+	}
+	if fill.OrderID == "" {
+		fill.OrderID = orderID
+	}
+	if conditionID != "" {
+		if schedule, scheduleErr := client.FeeSchedule(ctx, conditionID); scheduleErr == nil {
+			applyFee(schedule, &fill)
+		}
+	}
+	return fill, true, nil
+}
+
+func feeFromSchedule(schedule clobclient.FeeSchedule, shares, price float64) (float64, error) {
+	raw, err := schedule.Fee(formatFloat(shares), formatFloat(price), true)
+	if err != nil {
+		return 0, err
+	}
+	fee, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		return 0, fmt.Errorf("解析手续费 %q: %w", raw, err)
+	}
+	return fee, nil
+}
+
+func applyFee(schedule clobclient.FeeSchedule, fill *engine.LiveFill) {
+	if fill == nil || fill.Shares <= 0 || fill.Price <= 0 || fill.Price >= 1 {
+		return
+	}
+	fee, err := feeFromSchedule(schedule, fill.Shares, fill.Price)
+	if err != nil {
+		return
+	}
+	fill.Fee = fee
+	fill.Cost += fee
+	fill.Price = fill.Cost / fill.Shares
+}
+
+func formatFloat(value float64) string {
+	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
 func (e *Executor) Collateral(ctx context.Context) (engine.CashSnapshot, error) {
@@ -208,17 +349,24 @@ func (e *Executor) Collateral(ctx context.Context) (engine.CashSnapshot, error) 
 
 	client, err := e.ensure(ctx)
 	if err != nil {
-		return engine.CashSnapshot{Amount: cached.Amount, At: cached.At, Stale: true}, err
+		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, err
 	}
 	balance, err := client.BalanceAllowance(ctx, "COLLATERAL", "")
 	if err != nil {
-		return engine.CashSnapshot{Amount: cached.Amount, At: cached.At, Stale: true}, fmt.Errorf("读取实盘 USDC 余额: %w", err)
+		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("读取实盘 USDC 余额: %w", err)
 	}
 	units, err := strconv.ParseFloat(strings.TrimSpace(balance.Balance), 64)
 	if err != nil {
-		return engine.CashSnapshot{Amount: cached.Amount, At: cached.At, Stale: true}, fmt.Errorf("解析实盘 USDC 余额 %q: %w", balance.Balance, err)
+		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("解析实盘 USDC 余额 %q: %w", balance.Balance, err)
 	}
-	snapshot := engine.CashSnapshot{Amount: units / 1_000_000, At: time.Now().UTC()}
+	allowanceUnits := 0.0
+	if raw := strings.TrimSpace(balance.Allowance); raw != "" {
+		allowanceUnits, err = strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("解析实盘 USDC 授权额度 %q: %w", balance.Allowance, err)
+		}
+	}
+	snapshot := engine.CashSnapshot{Amount: units / 1_000_000, Allowance: allowanceUnits / 1_000_000, At: time.Now().UTC()}
 	e.mu.Lock()
 	e.cash = snapshot
 	e.cashAt = snapshot.At

@@ -38,6 +38,21 @@ func New(ctx context.Context, repo Repository, provider market.Provider, live Li
 	if err != nil {
 		return nil, err
 	}
+	// Paper accounts created before the baseline was persisted (or legacy
+	// accounts) get the current default once. After that the stored baseline
+	// is authoritative and changing the global default does not rewrite
+	// historical performance.
+	accounts, err := repo.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, account := range accounts {
+		if account.Mode == AccountModePaper && account.BaselineEquity <= 0 {
+			if err := repo.UpdateAccountBaseline(ctx, account.ID, settings.InitialBankroll); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return &Engine{
 		repo: repo, provider: provider, live: live, settings: settings,
 		opportunities: []Opportunity{}, running: true, done: make(chan struct{}),
@@ -166,11 +181,14 @@ func (e *Engine) ResolveAccount(ctx context.Context, id int64) (Account, error) 
 
 func (e *Engine) decorateAccount(account Account) Account {
 	if account.Mode == AccountModePaper && account.BaselineEquity <= 0 {
+		// New() backfills persisted accounts; this is a last-resort display
+		// fallback for a caller that constructed an engine without New.
 		account.BaselineEquity = e.Settings().InitialBankroll
 	}
 	account.LiveConfigured = false
 	account.LiveReady = false
 	account.LiveSigner = ""
+	account.LiveMaker = ""
 	account.LiveError = ""
 	if account.Mode != AccountModeLive {
 		return account
@@ -182,8 +200,20 @@ func (e *Engine) decorateAccount(account Account) Account {
 	account.LiveConfigured = e.live.Configured()
 	account.LiveReady = account.LiveConfigured && e.live.ReadyError() == ""
 	account.LiveSigner = e.live.Signer()
+	account.LiveMaker = e.live.Maker()
 	account.LiveError = e.live.ReadyError()
 	return account
+}
+
+// LiveStatus reports the executor state independently of the currently
+// selected default account.
+func (e *Engine) LiveStatus() (configured, ready bool, message string) {
+	if e.live == nil {
+		return false, false, "未配置实盘执行器"
+	}
+	configured = e.live.Configured()
+	message = e.live.ReadyError()
+	return configured, configured && message == "", message
 }
 
 func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMode) (Account, error) {
@@ -243,6 +273,9 @@ func (e *Engine) UpdateAccount(ctx context.Context, id int64, name *string, auto
 			if e.live == nil || !e.live.Configured() {
 				return Account{}, fmt.Errorf("%w: 配置实盘凭据后才能开启自动交易", ErrLiveUnavailable)
 			}
+			if message := e.live.ReadyError(); message != "" {
+				return Account{}, fmt.Errorf("%w: 实盘凭据未就绪: %s", ErrLiveUnavailable, message)
+			}
 		}
 		account.AutoTrade = *autoTrade
 	}
@@ -278,7 +311,16 @@ func (e *Engine) DeleteAccount(ctx context.Context, id int64) error {
 	return e.repo.DeleteAccount(ctx, id)
 }
 
-func (e *Engine) Scan(ctx context.Context) error {
+// Scan refreshes public data and processes every account, including automatic
+// orders. It is used by the background engine and tests.
+func (e *Engine) Scan(ctx context.Context) error { return e.scan(ctx, true) }
+
+// ScanOnly refreshes public data, marks positions and writes equity snapshots,
+// but never places an order. Manual scans use this so a user who only wants to
+// refresh the radar cannot accidentally trigger live automatic trading.
+func (e *Engine) ScanOnly(ctx context.Context) error { return e.scan(ctx, false) }
+
+func (e *Engine) scan(ctx context.Context, execute bool) error {
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
 
@@ -320,12 +362,28 @@ func (e *Engine) Scan(ctx context.Context) error {
 	}
 	var processingErrors []string
 	for _, account := range accounts {
+		unresolved := 0
+		if account.Mode == AccountModeLive {
+			remaining, err := e.reconcileLiveOrders(ctx, account, byID)
+			unresolved = remaining
+			if err != nil {
+				processingErrors = append(processingErrors, fmt.Sprintf("%s 对账: %v", account.Name, err))
+			}
+		}
 		if err := e.refreshPositions(ctx, account.ID, byID); err != nil {
 			processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+			// Do not place new orders against positions whose marks or
+			// settlement state could not be refreshed.
+			unresolved++
 		}
-		if e.isRunning() && account.AutoTrade {
-			if err := e.autoTrade(ctx, account, opportunities, settings); err != nil {
-				processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+		if execute && e.isRunning() && account.AutoTrade {
+			switch {
+			case unresolved > 0:
+				processingErrors = append(processingErrors, fmt.Sprintf("%s: 存在未对账或未刷新的持仓，跳过本轮自动交易", account.Name))
+			default:
+				if err := e.autoTrade(ctx, account, opportunities, settings); err != nil {
+					processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+				}
 			}
 		}
 		if err := e.snapshot(ctx, account); err != nil {
@@ -380,15 +438,22 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 			position.UnrealizedPNL = 0
 			position.CurrentPrice = settlementPrice
 			payout := position.Shares * settlementPrice
-			if settlementPrice == 1 {
+			switch {
+			case settlementPrice == 1:
 				position.Status = "won"
-			} else {
+			case settlementPrice == 0.5:
+				position.Status = "split"
+			default:
 				position.Status = "lost"
 			}
 			position.RealizedPNL = payout - position.Cost
+			kind := position.Kind
+			if kind == "" {
+				kind = "manual"
+			}
 			order := Order{
 				AccountID: accountID, PositionID: &position.ID, MarketID: position.MarketID, Question: position.Question,
-				Outcome: position.Outcome, TokenID: position.TokenID, Kind: "auto", Type: "settle",
+				Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "settle",
 				Amount: payout, Price: position.CurrentPrice, Shares: position.Shares, Status: "settled",
 				Reason: fmt.Sprintf("依据公开结算数据按 %.4f 结算", settlementPrice), CreatedAt: closedAt,
 			}
@@ -416,18 +481,27 @@ func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities [
 }
 
 func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) error {
-	positions, err := e.repo.ListPositions(ctx, account.ID, "open")
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
 	if err != nil {
 		return err
 	}
 	heldTokens := make(map[string]bool, len(positions))
 	marketExposure := make(map[string]float64)
-	totalExposure := 0.0
+	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
+		if position.Status != "open" {
+			realized += position.RealizedPNL
+			continue
+		}
 		heldTokens[position.TokenID] = true
 		marketExposure[position.MarketID] += position.Cost
 		totalExposure += position.Cost
 	}
+	baseline := account.BaselineEquity
+	if baseline <= 0 {
+		baseline = settings.InitialBankroll
+	}
+	cash := baseline + realized - totalExposure
 	for _, opportunity := range opportunities {
 		if heldTokens[opportunity.TokenID] {
 			continue
@@ -441,10 +515,13 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		if totalExposure+cost > settings.MaxExposure+1e-9 {
 			break
 		}
+		if cost > cash+1e-9 {
+			break
+		}
 		if marketExposure[opportunity.MarketID]+cost > settings.MaxPosition+1e-9 {
 			continue
 		}
-		position, err := e.executePaperBuy(ctx, account.ID, opportunity, "auto", settings.OrderSize)
+		position, err := e.executePaperBuy(ctx, account, opportunity, "auto", settings.OrderSize)
 		if err != nil {
 			// A risk rejection is already logged as an order; it must not stop
 			// the engine from evaluating the remaining candidates this round.
@@ -456,6 +533,7 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		heldTokens[position.TokenID] = true
 		marketExposure[position.MarketID] += position.Cost
 		totalExposure += position.Cost
+		cash -= position.Cost
 	}
 	return nil
 }
@@ -463,6 +541,9 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) error {
 	if e.live == nil || !e.live.Configured() {
 		return fmt.Errorf("%w: 实盘自动交易已开启，但未配置 POLYMARKET_PRIVATE_KEY", ErrLiveUnavailable)
+	}
+	if message := e.live.ReadyError(); message != "" {
+		return fmt.Errorf("%w: 实盘自动交易已开启，但实盘凭据未就绪: %s", ErrLiveUnavailable, message)
 	}
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
 	if err != nil {
@@ -493,15 +574,29 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		if heldTokens[opportunity.TokenID] {
 			continue
 		}
-		budget := settings.OrderSize
-		if totalExposure+budget > settings.MaxExposure+1e-9 {
-			break
-		}
-		if marketExposure[opportunity.MarketID]+budget > settings.MaxPosition+1e-9 {
+		if opportunity.ConditionID == "" {
 			continue
 		}
-		if budget > cash+1e-9 {
-			return fmt.Errorf("%w: 实盘策略资金不足", ErrInvalidOrder)
+		budget := settings.OrderSize
+		estimatedFee, feeErr := e.live.EstimateBuyFee(ctx, opportunity.ConditionID, budget, opportunity.Price)
+		if feeErr != nil {
+			return fmt.Errorf("%w: 估算实盘手续费失败: %v", ErrLiveUnavailable, feeErr)
+		}
+		if estimatedFee < 0 || math.IsNaN(estimatedFee) || math.IsInf(estimatedFee, 0) {
+			return fmt.Errorf("%w: 实盘手续费估算无效", ErrLiveUnavailable)
+		}
+		cost := budget + estimatedFee
+		if totalExposure+cost > settings.MaxExposure+1e-9 {
+			break
+		}
+		if marketExposure[opportunity.MarketID]+cost > settings.MaxPosition+1e-9 {
+			continue
+		}
+		if cost > cash+1e-9 {
+			return fmt.Errorf("%w: 实盘策略资金不足（含预估手续费）", ErrInvalidOrder)
+		}
+		if snapshot.Allowance > 0 && cost > snapshot.Allowance+1e-9 {
+			break
 		}
 		position, err := e.executeLiveBuy(ctx, account, opportunity, "auto", budget)
 		if err != nil {
@@ -546,18 +641,18 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 	if account.Mode == AccountModeLive {
 		return e.executeLiveBuy(ctx, account, opportunity, "manual", request.Amount)
 	}
-	return e.executePaperBuy(ctx, account.ID, opportunity, "manual", request.Amount)
+	return e.executePaperBuy(ctx, account, opportunity, "manual", request.Amount)
 }
 
-func (e *Engine) executePaperBuy(ctx context.Context, accountID int64, opportunity Opportunity, kind string, amount float64) (Position, error) {
+func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64) (Position, error) {
 	settings := e.Settings()
 	fee := amount * settings.FeeBPS / 10000
 	cost := amount + fee
 	fillPrice := opportunity.Price * (1 + settings.SlippageBPS/10000)
 	if fillPrice > settings.MaxPrice || fillPrice >= 1 {
-		return Position{}, e.rejectOrder(ctx, accountID, opportunity, kind, amount, "计入滑点后超过最高买入价", "")
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "计入滑点后超过最高买入价", "")
 	}
-	positions, err := e.repo.ListPositions(ctx, accountID, "all")
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
 	if err != nil {
 		return Position{}, err
 	}
@@ -572,7 +667,11 @@ func (e *Engine) executePaperBuy(ctx context.Context, accountID int64, opportuni
 			realized += position.RealizedPNL
 		}
 	}
-	cash := settings.InitialBankroll + realized - totalExposure
+	baseline := account.BaselineEquity
+	if baseline <= 0 {
+		baseline = settings.InitialBankroll
+	}
+	cash := baseline + realized - totalExposure
 	reason := ""
 	switch {
 	case cost > cash+1e-9:
@@ -583,31 +682,27 @@ func (e *Engine) executePaperBuy(ctx context.Context, accountID int64, opportuni
 		reason = "超过单市场敞口上限"
 	}
 	if reason != "" {
-		return Position{}, e.rejectOrder(ctx, accountID, opportunity, kind, amount, reason, "")
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, reason, "")
 	}
 
 	now := time.Now().UTC()
 	shares := amount / fillPrice
 	position := Position{
-		AccountID: accountID,
+		AccountID: account.ID,
 		MarketID:  opportunity.MarketID, ConditionID: opportunity.ConditionID,
 		Question: opportunity.Question, Outcome: opportunity.Outcome, TokenID: opportunity.TokenID,
-		Side: "BUY", EntryPrice: fillPrice, CurrentPrice: opportunity.Price,
+		Side: "BUY", Kind: kind, EntryPrice: fillPrice, CurrentPrice: opportunity.Price,
 		Shares: shares, Cost: cost, Fee: fee, Status: "open", OpenedAt: now,
 		EndDate: opportunity.EndDate, UnrealizedPNL: opportunity.Price*shares - cost,
 	}
-	position, err = e.repo.CreatePosition(ctx, position)
-	if err != nil {
-		return Position{}, err
-	}
-	_, err = e.repo.CreateOrder(ctx, Order{
-		AccountID: accountID, PositionID: &position.ID, MarketID: position.MarketID, Question: position.Question,
+	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
+		AccountID: account.ID, MarketID: position.MarketID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
 		Amount: amount, Price: fillPrice, Shares: shares, Status: "filled",
 		Reason: "模拟成交；未发送任何真实订单", CreatedAt: now,
 	})
 	if err != nil {
-		return Position{}, fmt.Errorf("持仓已保存，但订单日志写入失败: %w", err)
+		return Position{}, err
 	}
 	return position, nil
 }
@@ -616,6 +711,14 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	if e.live == nil || !e.live.Configured() {
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
 			"实盘未配置：请设置 POLYMARKET_PRIVATE_KEY 后重启服务", "")
+	}
+	if message := e.live.ReadyError(); message != "" {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
+			"实盘未就绪："+message, "")
+	}
+	if opportunity.ConditionID == "" {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
+			"缺少 condition_id，无法加载实盘手续费", "")
 	}
 	settings := e.Settings()
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
@@ -642,25 +745,66 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法读取实盘 USDC 余额："+cashErr.Error(), "")
 		return Position{}, fmt.Errorf("%w: 无法读取实盘 USDC 余额: %v", ErrLiveUnavailable, cashErr)
 	}
+	estimatedFee, feeErr := e.live.EstimateBuyFee(ctx, opportunity.ConditionID, amount, opportunity.Price)
+	if feeErr != nil {
+		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法估算实盘手续费："+feeErr.Error(), "")
+		return Position{}, fmt.Errorf("%w: 无法估算实盘手续费: %v", ErrLiveUnavailable, feeErr)
+	}
+	if estimatedFee < 0 || math.IsNaN(estimatedFee) || math.IsInf(estimatedFee, 0) {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘手续费估算无效", "")
+	}
+	totalCost := amount + estimatedFee
 	cash := math.Min(strategyCash, snapshot.Amount)
 	switch {
-	case amount > cash+1e-9:
-		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘策略资金不足", "")
-	case totalExposure+amount > settings.MaxExposure+1e-9:
-		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过总敞口上限", "")
-	case marketExposure+amount > settings.MaxPosition+1e-9:
-		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过单市场敞口上限", "")
+	case totalCost > cash+1e-9:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘策略资金不足（含预估手续费）", "")
+	case snapshot.Allowance > 0 && totalCost > snapshot.Allowance+1e-9:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘 USDC 授权额度不足，请先在 Polymarket 完成授权", "")
+	case totalExposure+totalCost > settings.MaxExposure+1e-9:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过总敞口上限（含预估手续费）", "")
+	case marketExposure+totalCost > settings.MaxPosition+1e-9:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过单市场敞口上限（含预估手续费）", "")
 	}
 
-	fill, err := e.live.Buy(ctx, opportunity.TokenID, amount, settings.MaxPrice)
+	var pending Order
+	fill, err := e.live.Buy(ctx, opportunity.TokenID, opportunity.ConditionID, amount, settings.MaxPrice, func(orderID string) error {
+		created, createErr := e.repo.CreateOrder(ctx, Order{
+			AccountID: account.ID, MarketID: opportunity.MarketID, Question: opportunity.Question,
+			Outcome: opportunity.Outcome, TokenID: opportunity.TokenID, Kind: kind, Type: "buy",
+			Amount: amount, Price: opportunity.Price, Status: "pending",
+			Reason: "实盘订单已签名，等待成交回报", ExternalID: orderID, CreatedAt: time.Now().UTC(),
+		})
+		if createErr == nil {
+			pending = created
+		}
+		return createErr
+	})
 	if err != nil {
-		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘下单失败："+err.Error(), "")
+		if pending.ID != 0 {
+			status, reason := "rejected", "实盘下单失败："+err.Error()
+			explicitRejection := strings.EqualFold(fill.Status, "rejected") || strings.EqualFold(fill.Status, "canceled") ||
+				strings.EqualFold(fill.Status, "cancelled") || strings.EqualFold(fill.Status, "expired")
+			if strings.EqualFold(fill.Status, "unknown") || (fill.OrderID != "" && !explicitRejection) {
+				status, reason = "unknown", "实盘订单结果未知，等待对账："+err.Error()
+			}
+			_ = e.repo.MarkOrderStatus(ctx, pending.ID, status, reason)
+		} else {
+			_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘下单失败："+err.Error(), "")
+		}
 		if errors.Is(err, ErrInvalidOrder) {
 			return Position{}, err
 		}
 		return Position{}, fmt.Errorf("%w: 实盘下单失败: %v", ErrUpstream, err)
 	}
 	if fill.Shares <= 0 || fill.Cost <= 0 {
+		if pending.ID != 0 {
+			status := "rejected"
+			if strings.EqualFold(fill.Status, "unknown") {
+				status = "unknown"
+			}
+			_ = e.repo.MarkOrderStatus(ctx, pending.ID, status, "实盘订单未产生成交（状态 "+fill.Status+"）")
+			return Position{}, fmt.Errorf("%w: 实盘订单未产生成交（状态 %s）", ErrUpstream, fill.Status)
+		}
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
 			"实盘订单未产生成交", fill.OrderID)
 	}
@@ -669,24 +813,123 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		AccountID: account.ID,
 		MarketID:  opportunity.MarketID, ConditionID: opportunity.ConditionID,
 		Question: opportunity.Question, Outcome: opportunity.Outcome, TokenID: opportunity.TokenID,
-		Side: "BUY", EntryPrice: fill.Price, CurrentPrice: opportunity.Price,
+		Side: "BUY", Kind: kind, EntryPrice: fill.Price, CurrentPrice: opportunity.Price,
 		Shares: fill.Shares, Cost: fill.Cost, Fee: fill.Fee, Status: "open", OpenedAt: now,
 		EndDate: opportunity.EndDate, UnrealizedPNL: opportunity.Price*fill.Shares - fill.Cost,
 	}
-	position, err = e.repo.CreatePosition(ctx, position)
-	if err != nil {
-		return Position{}, err
+	if pending.ID != 0 {
+		position, err = e.repo.FinalizeLiveBuy(ctx, pending.ID, position, fill)
+		if err != nil {
+			return Position{}, fmt.Errorf("实盘成交已确认，但本地账务写入失败: %w", err)
+		}
+		return position, nil
 	}
-	_, err = e.repo.CreateOrder(ctx, Order{
-		AccountID: account.ID, PositionID: &position.ID, MarketID: position.MarketID, Question: position.Question,
+	// Defensive fallback for an executor that does not call onSigned. The
+	// real implementation always persists the pending order first.
+	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
+		AccountID: account.ID, MarketID: position.MarketID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
 		Amount: fill.Cost, Price: fill.Price, Shares: fill.Shares, Status: "filled",
 		Reason: "Polymarket CLOB 实盘成交", ExternalID: fill.OrderID, CreatedAt: now,
 	})
 	if err != nil {
-		return Position{}, fmt.Errorf("实盘持仓已保存，但订单日志写入失败: %w", err)
+		return Position{}, fmt.Errorf("实盘成交已确认，但本地账务写入失败: %w", err)
 	}
 	return position, nil
+}
+
+// reconcileLiveOrders resolves signed orders whose submit response was lost or
+// whose CLOB status was still unknown. It returns the number of orders that
+// remain unresolved; callers must not auto-trade that account while it is > 0.
+func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, markets map[string]market.Market) (int, error) {
+	orders, err := e.repo.ListUnresolvedOrders(ctx, account.ID)
+	if err != nil {
+		return 0, err
+	}
+	if len(orders) == 0 {
+		return 0, nil
+	}
+	if e.live == nil || !e.live.Configured() {
+		return len(orders), fmt.Errorf("实盘未配置，无法对账 %d 笔待确认订单", len(orders))
+	}
+	if message := e.live.ReadyError(); message != "" {
+		return len(orders), fmt.Errorf("实盘未就绪，无法对账: %s", message)
+	}
+	var errs []string
+	remaining := 0
+	for _, order := range orders {
+		if order.ExternalID == "" {
+			remaining++
+			continue
+		}
+		item, ok := markets[order.MarketID]
+		if !ok {
+			item, err = e.provider.Get(ctx, order.MarketID)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("订单 %s 读取市场失败: %v", order.ExternalID, err))
+				remaining++
+				continue
+			}
+		}
+		fill, found, lookupErr := e.live.LookupOrder(ctx, order.ExternalID, item.ConditionID)
+		if lookupErr != nil {
+			errs = append(errs, fmt.Sprintf("订单 %s 对账失败: %v", order.ExternalID, lookupErr))
+			remaining++
+			continue
+		}
+		if !found {
+			if time.Since(order.CreatedAt) >= 2*time.Minute {
+				if markErr := e.repo.MarkOrderStatus(ctx, order.ID, "rejected", "CLOB 未找到该订单，按未成交处理"); markErr != nil {
+					errs = append(errs, markErr.Error())
+					remaining++
+				}
+			} else {
+				remaining++
+			}
+			continue
+		}
+		if fill.Shares > 0 && fill.Cost > 0 {
+			outcome, outcomeOK := item.OutcomeByToken(order.TokenID)
+			if !outcomeOK {
+				errs = append(errs, fmt.Sprintf("订单 %s 的 token 已不在市场中", order.ExternalID))
+				remaining++
+				continue
+			}
+			openedAt := order.CreatedAt
+			if openedAt.IsZero() {
+				openedAt = time.Now().UTC()
+			}
+			kind := order.Kind
+			if kind == "" {
+				kind = "manual"
+			}
+			position := Position{
+				AccountID: account.ID, MarketID: order.MarketID, ConditionID: item.ConditionID,
+				Question: order.Question, Outcome: order.Outcome, TokenID: order.TokenID,
+				Side: "BUY", Kind: kind, EntryPrice: fill.Price, CurrentPrice: outcome.Price,
+				Shares: fill.Shares, Cost: fill.Cost, Fee: fill.Fee, Status: "open", OpenedAt: openedAt,
+				EndDate: item.EndDate, UnrealizedPNL: outcome.Price*fill.Shares - fill.Cost,
+			}
+			if _, finalizeErr := e.repo.FinalizeLiveBuy(ctx, order.ID, position, fill); finalizeErr != nil {
+				errs = append(errs, fmt.Sprintf("订单 %s 对账写入失败: %v", order.ExternalID, finalizeErr))
+				remaining++
+			}
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(fill.Status)) {
+		case "canceled", "cancelled", "rejected", "expired":
+			if markErr := e.repo.MarkOrderStatus(ctx, order.ID, "rejected", "实盘订单未成交："+fill.Status); markErr != nil {
+				errs = append(errs, markErr.Error())
+				remaining++
+			}
+		default:
+			remaining++
+		}
+	}
+	if len(errs) > 0 {
+		return remaining, errors.New(strings.Join(errs, "; "))
+	}
+	return remaining, nil
 }
 
 func (e *Engine) rejectOrder(ctx context.Context, accountID int64, opportunity Opportunity, kind string, amount float64, reason, externalID string) error {
@@ -707,9 +950,16 @@ func (e *Engine) Positions(ctx context.Context, accountID int64, status string) 
 	return PositionList{Items: items, Total: len(items)}, err
 }
 
-func (e *Engine) Orders(ctx context.Context, accountID int64, limit int) (OrderList, error) {
-	items, err := e.repo.ListOrders(ctx, accountID, limit)
-	return OrderList{Items: items, Total: len(items)}, err
+func (e *Engine) Orders(ctx context.Context, accountID int64, status string, limit, offset int) (OrderList, error) {
+	items, err := e.repo.ListOrders(ctx, accountID, status, limit, offset)
+	if err != nil {
+		return OrderList{}, err
+	}
+	total, err := e.repo.CountOrders(ctx, accountID, status)
+	if err != nil {
+		return OrderList{}, err
+	}
+	return OrderList{Items: items, Total: int(total)}, nil
 }
 
 func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, error) {
@@ -733,16 +983,23 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 		} else {
 			metrics.SettledPositions++
 			metrics.RealizedPNL += position.RealizedPNL
-			if position.Status == "won" {
+			switch position.Status {
+			case "won":
 				wins++
+			case "split":
+				metrics.SplitPositions++
 			}
 		}
 	}
 	metrics.TotalPNL = metrics.RealizedPNL + metrics.UnrealizedPNL
 	if account.Mode == AccountModePaper {
-		metrics.Cash = settings.InitialBankroll + metrics.RealizedPNL - metrics.OpenExposure
+		baseline := account.BaselineEquity
+		if baseline <= 0 {
+			baseline = settings.InitialBankroll
+		}
+		metrics.Cash = baseline + metrics.RealizedPNL - metrics.OpenExposure
 		metrics.Equity = metrics.Cash + marketValue
-		metrics.InitialBankroll = settings.InitialBankroll
+		metrics.InitialBankroll = baseline
 		if metrics.InitialBankroll > 0 {
 			metrics.TotalReturn = metrics.TotalPNL / metrics.InitialBankroll
 		}
@@ -773,10 +1030,11 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 			metrics.WalletCashStale = true
 		}
 	}
-	if metrics.SettledPositions > 0 {
-		metrics.WinRate = float64(wins) / float64(metrics.SettledPositions)
+	decided := metrics.SettledPositions - metrics.SplitPositions
+	if decided > 0 {
+		metrics.WinRate = float64(wins) / float64(decided)
 	}
-	metrics.TotalOrders, err = e.repo.CountOrders(ctx, account.ID)
+	metrics.TotalOrders, err = e.repo.CountOrders(ctx, account.ID, "all")
 	if err != nil {
 		return Dashboard{}, err
 	}

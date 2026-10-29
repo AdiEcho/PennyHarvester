@@ -181,7 +181,7 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
 export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
   const { account, accountId, isLoading: accountLoading } = useAccount()
   const fetchDashboard = useCallback((signal: AbortSignal) => api.dashboard(accountId, signal), [accountId])
-  const fetchOrders = useCallback((signal: AbortSignal) => api.orders(accountId, 6, signal), [accountId])
+  const fetchOrders = useCallback((signal: AbortSignal) => api.orders(accountId, 'all', 6, 0, signal), [accountId])
   const dashboard = usePolling(fetchDashboard, { enabled: Boolean(accountId) })
   const orders = usePolling(fetchOrders, { enabled: Boolean(accountId) })
   const data = dashboard.data
@@ -222,8 +222,8 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
                 </div>
                 <div className="flex items-center gap-3 rounded-xl p-3.5">
                   <div className={cn('rounded-lg p-2', isLive ? 'bg-amber-50 text-amber-700' : 'bg-blue-50 text-blue-600')}>{isLive ? <Radio className="h-4 w-4" /> : <Database className="h-4 w-4" />}</div>
-                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">{isLive ? '实盘账户' : '账户'}</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.account.live_signer || undefined}>{isLive ? (data.account.live_configured ? (data.account.live_signer || '已配置') : '未配置私钥') : data.account.name}</p></div>
-                  {isLive && <Badge variant={data.account.live_configured ? 'success' : 'danger'}>{data.account.live_configured ? '已配置' : '未配置'}</Badge>}
+                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">{isLive ? '实盘账户' : '账户'}</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.account.live_maker || data.account.live_signer || undefined}>{isLive ? (data.account.live_ready ? (data.account.live_maker || data.account.live_signer || '已就绪') : data.account.live_configured ? '凭据未就绪' : '未配置私钥') : data.account.name}</p></div>
+                  {isLive && <Badge variant={data.account.live_ready ? 'success' : data.account.live_configured ? 'warning' : 'danger'}>{data.account.live_ready ? '已就绪' : data.account.live_configured ? '未就绪' : '未配置'}</Badge>}
                 </div>
                 <div className="flex items-center gap-3 rounded-xl p-3.5">
                   <div className="rounded-lg bg-blue-50 p-2 text-blue-600"><Database className="h-4 w-4" /></div>
@@ -232,15 +232,15 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
                 <dl className="space-y-3 border-t border-slate-100 px-1 pt-4 text-xs">
                   <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-1.5 text-slate-500"><Clock3 className="h-3.5 w-3.5" />最近扫描</dt><dd className="text-slate-700">{formatDate(data.engine.last_scan_at)}</dd></div>
                   <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-1.5 text-slate-500"><RefreshCw className="h-3.5 w-3.5" />最近同步</dt><dd className="text-slate-700">{formatDate(data.source.last_sync_at)}</dd></div>
-                  <div className="flex items-center justify-between gap-4"><dt className="text-slate-500">已结算 / 胜率</dt><dd className="text-slate-700">{formatNumber(data.metrics.settled_positions, 0)} / {formatPercent(data.metrics.win_rate, 1)}</dd></div>
+                  <div className="flex items-center justify-between gap-4"><dt className="text-slate-500">已结算 / 胜率</dt><dd className="text-slate-700">{formatNumber(data.metrics.settled_positions, 0)} 结算{data.metrics.split_positions > 0 ? ` · ${formatNumber(data.metrics.split_positions, 0)} 分摊` : ''} / {data.metrics.settled_positions - data.metrics.split_positions > 0 ? formatPercent(data.metrics.win_rate, 1) : '—'}</dd></div>
                 </dl>
-                {isLive && !data.account.live_configured && (
+                {isLive && !data.account.live_ready && (
                   <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
                     <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>实盘未配置：设置 <code className="rounded bg-amber-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启。当前不会发出任何真实订单。</span>
+                    <span>{data.account.live_configured ? <>实盘凭据未就绪：{data.account.live_error || '请检查钱包、Funder 与 CLOB 凭据配置。'}</> : <>实盘未配置：设置 <code className="rounded bg-amber-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启。当前不会发出任何真实订单。</>}</span>
                   </div>
                 )}
-                {data.account.live_error && <div className="mt-4 break-words rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs leading-5 text-rose-700"><span className="font-medium">实盘错误：</span>{data.account.live_error}</div>}
+                {data.account.live_error && data.account.live_ready && <div className="mt-4 break-words rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs leading-5 text-rose-700"><span className="font-medium">实盘错误：</span>{data.account.live_error}</div>}
                 {data.engine.last_error && <div className="mt-4 break-words rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs leading-5 text-rose-700"><span className="font-medium">引擎错误：</span>{data.engine.last_error}</div>}
               </div>
             ) : <ErrorState compact message={dashboard.error || '暂无状态数据。'} onRetry={dashboard.refresh} />}

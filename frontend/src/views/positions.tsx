@@ -16,6 +16,7 @@ const tabs: { value: PositionStatus | 'all'; label: string }[] = [
   { value: 'all', label: '全部' },
   { value: 'open', label: '持有中' },
   { value: 'won', label: '已获胜' },
+  { value: 'split', label: '分摊退款' },
   { value: 'lost', label: '未获胜' },
 ]
 

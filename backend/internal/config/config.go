@@ -60,7 +60,9 @@ func envInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(raw)
 	if err != nil {
-		return fallback
+		// -1 is deliberately invalid so the live executor reports a clear
+		// configuration error instead of silently falling back to EOA.
+		return -1
 	}
 	return parsed
 }
