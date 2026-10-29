@@ -1,0 +1,188 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Light mode mirrors Tailwind's default scales. The .dark block below remaps
+     the same variables so existing utility classes adapt without extra variants. */
+  --canvas: 245 245 241;
+  --ink: 23 33 31;
+  --navy: 16 35 45;
+  --surface: 255 255 255;
+
+  --slate-50: 248 250 252;
+  --slate-100: 241 245 249;
+  --slate-200: 226 232 240;
+  --slate-300: 203 213 225;
+  --slate-400: 148 163 184;
+  --slate-500: 100 116 139;
+  --slate-600: 71 85 105;
+  --slate-700: 51 65 85;
+  --slate-800: 30 41 59;
+  --slate-900: 15 23 42;
+  --slate-950: 2 6 23;
+
+  --emerald-50: 236 253 245;
+  --emerald-100: 209 250 229;
+  --emerald-200: 167 243 208;
+  --emerald-300: 110 231 183;
+  --emerald-400: 52 211 153;
+  --emerald-500: 16 185 129;
+  --emerald-600: 5 150 105;
+  --emerald-700: 4 120 87;
+  --emerald-800: 6 95 70;
+  --emerald-900: 6 78 59;
+
+  --rose-50: 255 241 242;
+  --rose-100: 255 228 230;
+  --rose-200: 254 205 211;
+  --rose-300: 253 164 175;
+  --rose-400: 251 113 133;
+  --rose-500: 244 63 94;
+  --rose-600: 225 29 72;
+  --rose-700: 190 18 60;
+  --rose-800: 159 18 57;
+  --rose-900: 136 19 55;
+
+  --amber-50: 255 251 235;
+  --amber-100: 254 243 199;
+  --amber-200: 253 230 138;
+  --amber-300: 252 211 77;
+  --amber-400: 251 191 36;
+  --amber-500: 245 158 11;
+  --amber-600: 217 119 6;
+  --amber-700: 180 83 9;
+  --amber-800: 146 64 14;
+  --amber-900: 120 53 15;
+
+  --blue-50: 239 246 255;
+  --blue-100: 219 234 254;
+  --blue-200: 191 219 254;
+  --blue-300: 147 197 253;
+  --blue-400: 96 165 250;
+  --blue-500: 59 130 246;
+  --blue-600: 37 99 235;
+  --blue-700: 29 78 216;
+  --blue-800: 30 64 175;
+  --blue-900: 30 58 138;
+
+  --shadow-card: 0 1px 2px rgba(16, 35, 45, 0.025), 0 8px 24px rgba(16, 35, 45, 0.025);
+  --shadow-float: 0 18px 50px rgba(16, 35, 45, 0.16);
+  --chart-surface: #ffffff;
+  --chart-grid: #e8e9e5;
+  --chart-muted: #8a918e;
+  --series-equity: #2a78d6;
+  --selection-bg: 217 249 157;
+  --selection-ink: 16 35 45;
+
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color-scheme: light;
+  color: rgb(var(--ink));
+  background: rgb(var(--canvas));
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+.dark {
+  --canvas: 7 14 19;
+  --ink: 229 238 243;
+  --navy: 11 22 30;
+  --surface: 15 27 35;
+
+  --slate-50: 18 32 41;
+  --slate-100: 24 41 52;
+  --slate-200: 34 55 68;
+  --slate-300: 72 98 113;
+  --slate-400: 125 148 163;
+  --slate-500: 158 178 190;
+  --slate-600: 183 199 209;
+  --slate-700: 205 218 226;
+  --slate-800: 223 233 239;
+  --slate-900: 237 244 248;
+  --slate-950: 248 251 253;
+
+  --emerald-50: 10 48 39;
+  --emerald-100: 20 78 62;
+  --emerald-200: 28 105 84;
+  --emerald-300: 110 231 183;
+  --emerald-400: 52 211 153;
+  --emerald-500: 16 185 129;
+  --emerald-600: 52 211 153;
+  --emerald-700: 110 231 183;
+  --emerald-800: 167 243 208;
+  --emerald-900: 209 250 229;
+
+  --rose-50: 48 16 26;
+  --rose-100: 70 21 35;
+  --rose-200: 120 36 57;
+  --rose-300: 253 164 175;
+  --rose-400: 251 113 133;
+  --rose-500: 244 63 94;
+  --rose-600: 251 113 133;
+  --rose-700: 253 164 175;
+  --rose-800: 254 205 211;
+  --rose-900: 255 228 230;
+
+  --amber-50: 46 32 9;
+  --amber-100: 70 48 11;
+  --amber-200: 120 82 18;
+  --amber-300: 252 211 77;
+  --amber-400: 251 191 36;
+  --amber-500: 245 158 11;
+  --amber-600: 251 191 36;
+  --amber-700: 252 211 77;
+  --amber-800: 253 230 138;
+  --amber-900: 254 243 199;
+
+  --blue-50: 13 33 58;
+  --blue-100: 18 50 86;
+  --blue-200: 37 80 138;
+  --blue-300: 147 197 253;
+  --blue-400: 96 165 250;
+  --blue-500: 59 130 246;
+  --blue-600: 96 165 250;
+  --blue-700: 147 197 253;
+  --blue-800: 191 219 254;
+  --blue-900: 219 234 254;
+
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.03), 0 12px 32px rgba(0, 0, 0, 0.18);
+  --shadow-float: 0 24px 70px rgba(0, 0, 0, 0.55);
+  --chart-surface: #0f1b23;
+  --chart-grid: #223744;
+  --chart-muted: #7d94a3;
+  --series-equity: #5ea0f0;
+  --selection-bg: 54 83 20;
+  --selection-ink: 236 252 203;
+
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { min-width: 320px; background: rgb(var(--canvas)); }
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: rgb(var(--canvas));
+  color: rgb(var(--ink));
+  transition: background-color 180ms ease, color 180ms ease;
+}
+button, input { font: inherit; }
+button { -webkit-tap-highlight-color: transparent; }
+a { color: inherit; }
+::selection { background: rgb(var(--selection-bg)); color: rgb(var(--selection-ink)); }
+
+.recharts-wrapper, .recharts-surface { outline: none; }
+.recharts-cartesian-axis-tick-value { font-variant-numeric: tabular-nums; }
+
+.scrollbar-thin { scrollbar-width: thin; scrollbar-color: rgb(var(--slate-300)) transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

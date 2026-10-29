@@ -1,0 +1,194 @@
+package api_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"time"
+
+	"pennyharvester/backend/internal/api"
+	"pennyharvester/backend/internal/engine"
+	"pennyharvester/backend/internal/market"
+	"pennyharvester/backend/internal/store"
+
+	"github.com/gin-gonic/gin"
+)
+
+type fixtureProvider struct {
+	markets map[string]market.Market
+}
+
+func (f *fixtureProvider) Name() string { return "fixture" }
+
+func (f *fixtureProvider) ListOpen(context.Context, int) ([]market.Market, error) {
+	items := []market.Market{}
+	for _, item := range f.markets {
+		if !item.Closed {
+			items = append(items, item)
+		}
+	}
+	return items, nil
+}
+
+func (f *fixtureProvider) Get(_ context.Context, id string) (market.Market, error) {
+	item, ok := f.markets[id]
+	if !ok {
+		return market.Market{}, errors.New("market not found")
+	}
+	return item, nil
+}
+
+func testProvider() *fixtureProvider {
+	return &fixtureProvider{markets: map[string]market.Market{
+		"test-1": {
+			ID: "test-1", ConditionID: "condition-test-1", Question: "API test market",
+			Slug: "api-test-market", Active: true, Liquidity: 25000, Volume: 90000,
+			EndDate: time.Now().UTC().AddDate(0, 0, 3),
+			Outcomes: []market.Outcome{
+				{Name: "Yes", TokenID: "yes", Price: 0.98},
+				{Name: "No", TokenID: "no", Price: 0.02},
+			},
+		},
+	}}
+}
+
+func setupRouter(t *testing.T) (http.Handler, *engine.Engine) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	repository, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repository.Close() })
+	instance, err := engine.New(context.Background(), repository, testProvider(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return api.NewRouter(instance, ""), instance
+}
+
+func accountID(t *testing.T, handler http.Handler, mode engine.AccountMode) int64 {
+	t.Helper()
+	response := request(t, handler, http.MethodGet, "/api/v1/accounts", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("accounts failed: %d %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Items []engine.Account `json:"items"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range payload.Items {
+		if account.Mode == mode {
+			return account.ID
+		}
+	}
+	t.Fatalf("no %s account in %s", mode, response.Body.String())
+	return 0
+}
+
+func request(t *testing.T, handler http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var payload bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&payload).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(method, path, &payload)
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	return response
+}
+
+func TestHealthAndPaperOrderAPI(t *testing.T) {
+	handler, _ := setupRouter(t)
+	health := request(t, handler, http.MethodGet, "/api/v1/health", nil)
+	if health.Code != http.StatusOK || !bytes.Contains(health.Body.Bytes(), []byte(`"default_account_mode":"live"`)) {
+		t.Fatalf("unexpected health response: %d %s", health.Code, health.Body.String())
+	}
+	paperID := accountID(t, handler, engine.AccountModePaper)
+	order := request(t, handler, http.MethodPost, "/api/v1/accounts/"+itoa(paperID)+"/orders", map[string]any{
+		"market_id": "test-1", "outcome": "Yes", "token_id": "yes", "amount": 100,
+	})
+	if order.Code != http.StatusCreated {
+		t.Fatalf("paper order failed: %d %s", order.Code, order.Body.String())
+	}
+	dashboard := request(t, handler, http.MethodGet, "/api/v1/dashboard?account_id="+itoa(paperID), nil)
+	if dashboard.Code != http.StatusOK || !bytes.Contains(dashboard.Body.Bytes(), []byte(`"open_positions":1`)) {
+		t.Fatalf("unexpected dashboard: %d %s", dashboard.Code, dashboard.Body.String())
+	}
+}
+
+func TestToggleAcceptsFalseAndRejectsBadSettings(t *testing.T) {
+	handler, _ := setupRouter(t)
+	toggle := request(t, handler, http.MethodPost, "/api/v1/engine/toggle", map[string]any{"running": false})
+	if toggle.Code != http.StatusOK || !bytes.Contains(toggle.Body.Bytes(), []byte(`"running":false`)) {
+		t.Fatalf("unexpected toggle response: %d %s", toggle.Code, toggle.Body.String())
+	}
+	settings := engine.DefaultSettings()
+	settings.MaxPrice = 1
+	response := request(t, handler, http.MethodPut, "/api/v1/settings", settings)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid settings accepted: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRejectsMismatchedToken(t *testing.T) {
+	handler, _ := setupRouter(t)
+	paperID := accountID(t, handler, engine.AccountModePaper)
+	response := request(t, handler, http.MethodPost, "/api/v1/accounts/"+itoa(paperID)+"/orders", map[string]any{
+		"market_id": "test-1", "outcome": "No", "token_id": "yes", "amount": 100,
+	})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched outcome accepted: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLiveOrderRequiresConfiguration(t *testing.T) {
+	handler, _ := setupRouter(t)
+	liveID := accountID(t, handler, engine.AccountModeLive)
+	response := request(t, handler, http.MethodPost, "/api/v1/accounts/"+itoa(liveID)+"/orders", map[string]any{
+		"market_id": "test-1", "outcome": "Yes", "token_id": "yes", "amount": 100,
+	})
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected live unavailable, got %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAccountCreationAndDefaultSwitch(t *testing.T) {
+	handler, _ := setupRouter(t)
+	created := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
+		"name": "策略测试", "mode": "paper",
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create account failed: %d %s", created.Code, created.Body.String())
+	}
+	var account engine.Account
+	if err := json.Unmarshal(created.Body.Bytes(), &account); err != nil {
+		t.Fatal(err)
+	}
+	updated := request(t, handler, http.MethodPatch, "/api/v1/accounts/"+itoa(account.ID), map[string]any{
+		"name": "策略测试 2", "auto_trade": true, "is_default": true,
+	})
+	if updated.Code != http.StatusOK || !bytes.Contains(updated.Body.Bytes(), []byte(`"is_default":true`)) {
+		t.Fatalf("update account failed: %d %s", updated.Code, updated.Body.String())
+	}
+	secondLive := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
+		"name": "第二个实盘", "mode": "live",
+	})
+	if secondLive.Code != http.StatusConflict {
+		t.Fatalf("second live account should conflict: %d %s", secondLive.Code, secondLive.Body.String())
+	}
+}
+
+func itoa(value int64) string {
+	return strconv.FormatInt(value, 10)
+}

@@ -31,3 +31,13 @@ go.work.sum
 # Editor/IDE
 .idea/
 # .vscode/
+
+# Local application data and builds
+backend/data/
+backend/bin/
+backend/server
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+*.log
+.DS_Store
