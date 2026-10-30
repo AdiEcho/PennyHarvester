@@ -33,6 +33,36 @@ func TestGammaClientParsesEncodedArrays(t *testing.T) {
 	}
 }
 
+func TestGammaClientMarketsLocaleRequestsTranslatedText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/markets" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("locale"); got != "zh" {
+			t.Errorf("locale = %q, want zh", got)
+		}
+		if ids := r.URL.Query()["id"]; len(ids) != 2 || ids[0] != "42" || ids[1] != "43" {
+			t.Errorf("ids = %v, want [42 43]", ids)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{
+			"id":"42","conditionId":"condition-42","question":"会结算吗？","slug":"will-it-resolve",
+			"outcomes":"[\"是\",\"否\"]","outcomePrices":"[\"0.98\",\"0.02\"]",
+			"clobTokenIds":"[\"token-yes\",\"token-no\"]","endDate":"2099-01-01T00:00:00Z",
+			"liquidity":"25000","volume":"90000","active":true,"closed":false
+		}]`))
+	}))
+	defer server.Close()
+	client := NewGammaClient(server.URL, nil)
+	items, err := client.MarketsLocale(context.Background(), []string{"42", "43"}, "zh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Question != "会结算吗？" || items[0].Outcomes[0].Name != "是" {
+		t.Fatalf("unexpected localized market: %+v", items)
+	}
+}
+
 func TestWinnerRequiresTerminalResolution(t *testing.T) {
 	item := binaryForTest(0.99, 0.01)
 	item.Closed = true

@@ -102,3 +102,10 @@ type Provider interface {
 	Get(ctx context.Context, id string) (Market, error)
 	Name() string
 }
+
+// LocalizedProvider is implemented by providers that can return the same
+// markets with Polymarket's localized question and outcome labels. Locale
+// values follow Polymarket's API convention, for example "zh" or "en".
+type LocalizedProvider interface {
+	MarketsLocale(ctx context.Context, ids []string, locale string) ([]Market, error)
+}

@@ -329,6 +329,32 @@ type LiveEnvironment struct {
 	APIPassphraseSet bool   `json:"api_passphrase_set"`
 }
 
+// LiveProbe is the result of checking candidate live credentials against the
+// CLOB. It never carries the private key or the L2 secret; the API key is
+// masked because it is an identifier, not a password.
+type LiveProbe struct {
+	Signer        string  `json:"signer"`
+	Maker         string  `json:"maker"`
+	APIKey        string  `json:"api_key"`
+	Source        string  `json:"source"`
+	Mode          string  `json:"mode"`
+	SignatureType int     `json:"signature_type"`
+	Cash          float64 `json:"cash"`
+	Allowance     float64 `json:"allowance"`
+	LatencyMS     float64 `json:"latency_ms"`
+}
+
+// RelayerProbe is the result of checking a Relayer API key. A relayer key only
+// authenticates gasless wallet batches; it never places a CLOB order, so this
+// check proves the credential works without touching trading.
+type RelayerProbe struct {
+	Signer    string  `json:"signer"`
+	Address   string  `json:"address"`
+	APIKey    string  `json:"api_key"`
+	KeyCount  int     `json:"key_count"`
+	LatencyMS float64 `json:"latency_ms"`
+}
+
 // SystemRuntime is the effective, read-only view of the runtime settings. It
 // is not persisted; it is assembled from the provider and live executor.
 type SystemRuntime struct {
@@ -359,12 +385,32 @@ type liveSettingsRuntime interface {
 	Environment() LiveEnvironment
 }
 
+// liveProbeRuntime is implemented by executors that can validate candidate
+// credentials against the CLOB without placing an order.
+type liveProbeRuntime interface {
+	Probe(context.Context, LiveSettings, string) (LiveProbe, error)
+}
+
+// relayerProbeRuntime is implemented by executors that can validate a Relayer
+// API key. It is optional because the relayer is not part of order placement.
+type relayerProbeRuntime interface {
+	ProbeRelayer(context.Context, LiveSettings, string, string, string) (RelayerProbe, error)
+}
+
+// funderDiscovery is implemented by executors that can ask the CLOB which
+// proxy / deposit wallets belong to a signer.
+type funderDiscovery interface {
+	DiscoverFunder(context.Context, LiveSettings, string) ([]string, error)
+}
+
 type Opportunity struct {
 	MarketID    string    `json:"market_id"`
 	ConditionID string    `json:"condition_id"`
 	Question    string    `json:"question"`
+	QuestionZH  string    `json:"question_zh"`
 	Slug        string    `json:"slug"`
 	Outcome     string    `json:"outcome"`
+	OutcomeZH   string    `json:"outcome_zh"`
 	TokenID     string    `json:"token_id"`
 	Price       float64   `json:"price"`
 	Liquidity   float64   `json:"liquidity"`

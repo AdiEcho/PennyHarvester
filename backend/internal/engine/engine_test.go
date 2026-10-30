@@ -15,8 +15,9 @@ import (
 )
 
 type fakeProvider struct {
-	markets map[string]market.Market
-	err     error
+	markets   map[string]market.Market
+	localized map[string]market.Market
+	err       error
 }
 
 func (f *fakeProvider) Name() string { return "test" }
@@ -41,6 +42,19 @@ func (f *fakeProvider) Get(_ context.Context, id string) (market.Market, error) 
 		return market.Market{}, errors.New("not found")
 	}
 	return item, nil
+}
+
+func (f *fakeProvider) MarketsLocale(_ context.Context, ids []string, locale string) ([]market.Market, error) {
+	if locale != "zh" || f.localized == nil {
+		return nil, nil
+	}
+	items := make([]market.Market, 0, len(ids))
+	for _, id := range ids {
+		if item, ok := f.localized[id]; ok {
+			items = append(items, item)
+		}
+	}
+	return items, nil
 }
 
 type fakeLive struct {
@@ -206,6 +220,33 @@ func TestScanFiltersAndSettlesPaperPosition(t *testing.T) {
 	}
 	if dashboard.Metrics.Cash <= 10000 || dashboard.Metrics.OpenPositions != 0 || dashboard.Metrics.WinRate != 1 {
 		t.Fatalf("unexpected metrics: %+v", dashboard.Metrics)
+	}
+}
+
+func TestScanAddsPolymarketChineseText(t *testing.T) {
+	en := binary("eligible", 0.98, 20000, 2)
+	zh := binary("eligible", 0.98, 20000, 2)
+	zh.Question = "会如期结算吗？"
+	zh.Outcomes[0].Name = "是"
+	zh.Outcomes[1].Name = "否"
+	provider := &fakeProvider{
+		markets:   map[string]market.Market{"eligible": en},
+		localized: map[string]market.Market{"eligible": zh},
+	}
+	instance, _ := newTestEngine(t, provider, nil)
+	if err := instance.ScanOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	opportunities := instance.Opportunities()
+	if opportunities.Total != 1 {
+		t.Fatalf("unexpected opportunities: %+v", opportunities)
+	}
+	item := opportunities.Items[0]
+	if item.QuestionZH != zh.Question {
+		t.Fatalf("question_zh = %q, want %q", item.QuestionZH, zh.Question)
+	}
+	if item.OutcomeZH != "是" || item.Outcome != "Yes" {
+		t.Fatalf("unexpected outcomes: canonical=%q zh=%q", item.Outcome, item.OutcomeZH)
 	}
 }
 
@@ -674,6 +715,9 @@ type runtimeLive struct {
 	clobURL     string
 	defaultCLOB string
 	settings    engine.LiveSettings
+	probeURL    string
+	probeErr    error
+	relayerKey  string
 }
 
 func (l *runtimeLive) UpdateSettings(settings engine.LiveSettings, clobURL string) error {
@@ -764,5 +808,121 @@ func TestUpdateSystemSettingsAppliesEndpointsAndLiveOverrides(t *testing.T) {
 	invalid.Live.PrivateKey = "not-a-key"
 	if err := instance.UpdateSystemSettings(ctx, invalid); err == nil {
 		t.Fatal("an invalid private key must be rejected")
+	}
+}
+
+func (l *runtimeLive) Probe(_ context.Context, settings engine.LiveSettings, clobURL string) (engine.LiveProbe, error) {
+	l.settings = settings
+	l.probeURL = clobURL
+	if l.probeErr != nil {
+		return engine.LiveProbe{}, l.probeErr
+	}
+	return engine.LiveProbe{
+		Signer: "0x0000000000000000000000000000000000000001",
+		Maker:  "0x0000000000000000000000000000000000000002",
+		APIKey: "abcd1234…", Source: "derived",
+		Cash: 42, Allowance: 42, LatencyMS: 12,
+	}, nil
+}
+
+func (l *runtimeLive) ProbeRelayer(_ context.Context, settings engine.LiveSettings, clobURL, apiKey, address string) (engine.RelayerProbe, error) {
+	l.settings = settings
+	l.probeURL = clobURL
+	l.relayerKey = apiKey
+	return engine.RelayerProbe{
+		Signer:  "0x0000000000000000000000000000000000000001",
+		Address: address, APIKey: "01967c03…", KeyCount: 2, LatencyMS: 8,
+	}, nil
+}
+
+func (l *runtimeLive) DiscoverFunder(_ context.Context, settings engine.LiveSettings, clobURL string) ([]string, error) {
+	l.settings = settings
+	l.probeURL = clobURL
+	return []string{"0x0000000000000000000000000000000000000003"}, nil
+}
+
+func TestDiscoverFunderUsesStoredSigner(t *testing.T) {
+	ctx := context.Background()
+	live := &runtimeLive{fakeLive: &fakeLive{}}
+	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, live)
+	key := "0x" + strings.Repeat("1", 64)
+	if err := instance.UpdateSystemSettings(ctx, engine.SystemSettings{
+		Proxy: netproxy.DefaultConfig(),
+		Live:  engine.LiveSettings{PrivateKey: key, SignatureType: intPointer(0)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wallets, err := instance.DiscoverFunder(ctx, instance.SystemSettings().Live.Redacted(), "https://clob.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wallets) != 1 || live.settings.PrivateKey != key {
+		t.Fatalf("unexpected discovery: %v %+v", wallets, live.settings)
+	}
+}
+
+func TestProbeLiveRestoresStoredSecrets(t *testing.T) {
+	ctx := context.Background()
+	live := &runtimeLive{fakeLive: &fakeLive{}}
+	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, live)
+
+	key := "0x" + strings.Repeat("1", 64)
+	stored := engine.SystemSettings{
+		Proxy: netproxy.DefaultConfig(),
+		Live: engine.LiveSettings{
+			PrivateKey: key, SignatureType: intPointer(0),
+			APIKey: "stored-key", APISecret: "stored-secret", APIPassphrase: "stored-passphrase",
+		},
+	}
+	if err := instance.UpdateSystemSettings(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	// The browser only ever sees masked secrets; echoing them back must not
+	// wipe the stored values before the probe runs.
+	masked := stored.Live.Redacted()
+	probe, err := instance.ProbeLive(ctx, masked, "https://clob.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.Cash != 42 || probe.Source != "derived" {
+		t.Fatalf("unexpected probe: %+v", probe)
+	}
+	if live.settings.APISecret != "stored-secret" || live.settings.APIPassphrase != "stored-passphrase" {
+		t.Fatalf("masked secrets were not restored: %+v", live.settings)
+	}
+	if live.probeURL != "https://clob.example.com" {
+		t.Fatalf("probe CLOB URL = %q", live.probeURL)
+	}
+}
+
+func TestProbeLiveRejectsPartialCredentials(t *testing.T) {
+	live := &runtimeLive{fakeLive: &fakeLive{}}
+	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, live)
+	_, err := instance.ProbeLive(context.Background(), engine.LiveSettings{APIKey: "only-key"}, "")
+	if err == nil || !errors.Is(err, engine.ErrInvalidSettings) {
+		t.Fatalf("partial credentials must be rejected as invalid settings: %v", err)
+	}
+}
+
+func TestProbeRelayerUsesStoredSignerSettings(t *testing.T) {
+	ctx := context.Background()
+	live := &runtimeLive{fakeLive: &fakeLive{}}
+	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, live)
+	key := "0x" + strings.Repeat("1", 64)
+	if err := instance.UpdateSystemSettings(ctx, engine.SystemSettings{
+		Proxy: netproxy.DefaultConfig(),
+		Live:  engine.LiveSettings{PrivateKey: key, SignatureType: intPointer(0)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := instance.ProbeRelayer(ctx, instance.SystemSettings().Live.Redacted(), "https://clob.example.com", "relayer-key", "0x0000000000000000000000000000000000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.KeyCount != 2 || live.relayerKey != "relayer-key" {
+		t.Fatalf("unexpected relayer probe: %+v key=%q", probe, live.relayerKey)
+	}
+	if live.settings.PrivateKey != key {
+		t.Fatalf("stored private key was not restored: %+v", live.settings)
 	}
 }

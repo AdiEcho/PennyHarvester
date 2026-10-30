@@ -20,6 +20,7 @@ import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import type { Opportunity } from '@/types'
 import { formatCompactCurrency, formatCurrency, formatFullDate, formatNumber, formatPercent, formatPrice } from '@/lib/format'
+import { marketOutcome, marketQuestion, marketURL, persistMarketLanguage, readMarketLanguage, type MarketLanguage } from '@/lib/market-language'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/toast'
 import { Badge } from '@/components/ui/badge'
@@ -29,6 +30,7 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/compone
 import { EmptyState, ErrorState, LoadingBlock } from '@/components/ui/feedback'
 import { Input } from '@/components/ui/input'
 import { InlineError, PageHeader } from '@/components/page-header'
+import { MarketLanguageSelect } from '@/components/market-language-select'
 import { RiskNotice } from '@/components/risk-notice'
 
 function MarketLink({ url, compact = false }: { url: string; compact?: boolean }) {
@@ -40,15 +42,15 @@ function MarketLink({ url, compact = false }: { url: string; compact?: boolean }
   )
 }
 
-function OpportunityCard({ item, onBuy, isLive }: { item: Opportunity; onBuy: (item: Opportunity) => void; isLive: boolean }) {
+function OpportunityCard({ item, onBuy, isLive, language }: { item: Opportunity; onBuy: (item: Opportunity) => void; isLive: boolean; language: MarketLanguage }) {
   return (
     <Card className="p-4">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          <div className="mb-2 flex items-center gap-2"><Badge variant="info">{item.outcome}</Badge><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
-          <h3 className="text-sm font-medium leading-6 text-slate-900">{item.question}</h3>
+          <div className="mb-2 flex items-center gap-2"><Badge variant="info">{marketOutcome(item, language)}</Badge><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
+          <h3 className="text-sm font-medium leading-6 text-slate-900">{marketQuestion(item, language)}</h3>
         </div>
-        <MarketLink url={item.url} compact />
+        <MarketLink url={marketURL(item.url, language)} compact />
       </div>
       <div className="mt-4 grid grid-cols-2 gap-3 rounded-xl bg-slate-50 p-3">
         <div><p className="text-[11px] text-slate-500">指示价格</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPrice(item.price)}</p></div>
@@ -67,6 +69,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const isLive = account?.mode === 'live'
   const liveReady = !isLive || Boolean(account?.live_ready)
   const [query, setQuery] = useState('')
+  const [marketLanguage, setMarketLanguage] = useState<MarketLanguage>(readMarketLanguage)
   const [selected, setSelected] = useState<Opportunity | null>(null)
   const [amount, setAmount] = useState('')
   const [confirmed, setConfirmed] = useState(false)
@@ -84,11 +87,15 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     orderController.current?.abort()
   }, [])
 
+  useEffect(() => {
+    persistMarketLanguage(marketLanguage)
+  }, [marketLanguage])
+
   const filtered = useMemo(() => {
     const keyword = query.trim().toLocaleLowerCase()
     if (!keyword) return data?.items || []
     return (data?.items || []).filter((item) =>
-      [item.question, item.outcome, item.slug, item.market_id].some((value) => value.toLocaleLowerCase().includes(keyword)),
+      [item.question, item.question_zh || '', item.outcome, item.outcome_zh || '', item.slug, item.market_id].some((value) => value.toLocaleLowerCase().includes(keyword)),
     )
   }, [data, query])
 
@@ -147,7 +154,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
 
   return (
     <>
-      <PageHeader eyebrow={isLive ? 'LIVE OPPORTUNITY RADAR' : 'OPPORTUNITY RADAR'} title="机会雷达" description={isLive ? '筛选公开市场价格偏离。点击实盘买入会把订单提交到 Polymarket CLOB，请务必确认金额与盘口深度。' : '筛选公开市场的价格偏离，以理论收益辅助研究，不构成结算承诺。'} actions={<Button variant="primary" onClick={scan} loading={scanning}><Radar className={cn('h-4 w-4', !scanning && 'text-emerald-200 dark:text-emerald-950')} />{scanning ? '正在扫描…' : '立即扫描'}</Button>} />
+      <PageHeader eyebrow={isLive ? 'LIVE OPPORTUNITY RADAR' : 'OPPORTUNITY RADAR'} title="机会雷达" description={isLive ? '筛选公开市场价格偏离。点击实盘买入会把订单提交到 Polymarket CLOB，请务必确认金额与盘口深度。' : '筛选公开市场的价格偏离，以理论收益辅助研究，不构成结算承诺。'} actions={<><MarketLanguageSelect value={marketLanguage} onChange={setMarketLanguage} /><Button variant="primary" onClick={scan} loading={scanning}><Radar className={cn('h-4 w-4', !scanning && 'text-emerald-200 dark:text-emerald-950')} />{scanning ? '正在扫描…' : '立即扫描'}</Button></>} />
       {error && data && <InlineError message={error} onRetry={refresh} />}
 
       <Card className="mb-4 p-4 sm:p-5">
@@ -166,6 +173,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           <span>毛收益 = (1 − 价格) / 价格</span>
           <span>到期时间按本地时区显示</span>
           <span>立即扫描仅刷新行情，不会自动下单</span>
+          <span>{marketLanguage === 'zh' ? '市场问题与方向使用 Polymarket 中文翻译' : '市场问题与方向显示 Polymarket 英文原文'}</span>
           {data && <span className="sm:ml-auto">来源 {data.source} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
         </div>
       </Card>
@@ -185,19 +193,19 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
                 <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>
                   {filtered.map((item) => (
                     <tr key={`${item.market_id}-${item.token_id}`} className="group hover:bg-slate-50/70">
-                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={item.question}>{item.question}</p><div className="mt-1.5 flex items-center gap-2"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{item.outcome}</Badge><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
+                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex items-center gap-2"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
                       <td className="px-4 py-4 text-right font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</td>
                       <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
                       <td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatCompactCurrency(item.liquidity)}</td>
                       <td className="px-4 py-4 text-right"><span className="tabular-nums text-slate-700">{formatNumber(item.days_to_end, 1)} 天</span><p className="mt-1 whitespace-nowrap text-[11px] tabular-nums text-slate-400">{formatFullDate(item.end_date)}</p></td>
-                      <td className="px-5 py-4"><div className="flex items-center justify-end gap-1"><MarketLink url={item.url} compact /><Button size="sm" variant="secondary" className={isLive ? 'text-rose-700 group-hover:border-rose-200 group-hover:bg-rose-50 group-hover:text-rose-800' : 'group-hover:border-emerald-200 group-hover:bg-emerald-50 group-hover:text-emerald-800'} onClick={() => openBuy(item)}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button></div></td>
+                      <td className="px-5 py-4"><div className="flex items-center justify-end gap-1"><MarketLink url={marketURL(item.url, marketLanguage)} compact /><Button size="sm" variant="secondary" className={isLive ? 'text-rose-700 group-hover:border-rose-200 group-hover:bg-rose-50 group-hover:text-rose-800' : 'group-hover:border-emerald-200 group-hover:bg-emerald-50 group-hover:text-emerald-800'} onClick={() => openBuy(item)}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button></div></td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           </Card>
-          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} onBuy={openBuy} isLive={isLive} />)}</div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} onBuy={openBuy} isLive={isLive} language={marketLanguage} />)}</div>
         </>
       )}
 
@@ -210,8 +218,8 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               <DialogDescription className="mt-2">{isLive ? '按下确认后，系统会立即向 Polymarket 提交真实买单。成交价由当前订单簿决定，可能与下方指示价格不同。' : '仅在 PennyHarvester 内记录虚拟头寸，用于验证策略与风控规则。'}</DialogDescription>
             </div>
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-              <p className="pr-4 text-sm font-medium leading-6 text-slate-900">{selected.question}</p>
-              <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{selected.outcome}</Badge><span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
+              <p className="pr-4 text-sm font-medium leading-6 text-slate-900">{marketQuestion(selected, marketLanguage)}</p>
+              <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
             </div>
             <div>
               <div className="mb-2 flex items-center justify-between"><label htmlFor="paper-amount" className="text-sm font-medium text-slate-700">{isLive ? '实盘投入金额' : '投入虚拟金额'}</label><span className="text-xs text-slate-400">USD</span></div>

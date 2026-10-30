@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	clobclient "github.com/Cyvadra/polymarket-clob-client"
+	"github.com/ethereum/go-ethereum/crypto"
 
 	"pennyharvester/backend/internal/config"
 	"pennyharvester/backend/internal/engine"
@@ -303,5 +304,196 @@ func TestUpdateSettingsMergesOverridesAndRejectsInvalid(t *testing.T) {
 	}
 	if err := executor.ReadyError(); err != "" {
 		t.Fatalf("explicit L2 credentials should be ready: %s", err)
+	}
+}
+
+func TestProbeDerivesCredentialsWithoutTouchingExecutor(t *testing.T) {
+	var derived bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/derive-api-key":
+			derived = true
+			if r.Header.Get("POLY_SIGNATURE") == "" {
+				http.Error(w, `{"error":"missing L1 signature"}`, http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"apiKey":"11111111-2222-3333-4444-555555555555","secret":"c2VjcmV0","passphrase":"pass"}`))
+		case "/balance-allowance":
+			_, _ = w.Write([]byte(`{"balance":"12500000","allowance":"9000000"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       "https://default-clob.example",
+	})
+	if err := executor.ReadyError(); err != "" {
+		t.Fatalf("base config should be ready: %s", err)
+	}
+
+	probe, err := executor.Probe(context.Background(), engine.LiveSettings{}, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !derived {
+		t.Fatal("the probe must derive L2 credentials from the private key")
+	}
+	if probe.Source != "derived" {
+		t.Fatalf("source = %q, want derived", probe.Source)
+	}
+	if probe.APIKey != "11111111…" {
+		t.Fatalf("api key must be masked, got %q", probe.APIKey)
+	}
+	if probe.Cash != 12.5 || probe.Allowance != 9 {
+		t.Fatalf("unexpected collateral snapshot: %+v", probe)
+	}
+	if probe.Signer == "" || !strings.EqualFold(probe.Signer, probe.Maker) {
+		t.Fatalf("EOA maker must equal the signer: %+v", probe)
+	}
+	// Probing must not repoint the running executor at the candidate host.
+	if executor.EffectiveCLOBURL() != "https://default-clob.example" {
+		t.Fatalf("probe changed the effective CLOB URL: %q", executor.EffectiveCLOBURL())
+	}
+}
+
+func TestProbeReportsRejectedCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/balance-allowance" {
+			http.Error(w, `{"error":"invalid api key"}`, http.StatusUnauthorized)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       "https://default-clob.example",
+	})
+	_, err := executor.Probe(context.Background(), engine.LiveSettings{
+		APIKey:        "bad-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("bad-secret")),
+		APIPassphrase: "bad-passphrase",
+	}, server.URL)
+	if err == nil {
+		t.Fatal("an unauthenticated balance read must fail the probe")
+	}
+	if !strings.Contains(err.Error(), "USDC") && !strings.Contains(err.Error(), "401") {
+		t.Fatalf("unexpected probe error: %v", err)
+	}
+}
+
+func TestFunderMustNotBeTheSigner(t *testing.T) {
+	key := "0x" + strings.Repeat("1", 64)
+	privateKey, err := crypto.HexToECDSA(strings.Repeat("1", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := crypto.PubkeyToAddress(privateKey.PublicKey).Hex()
+	executor := New(Config{PrivateKey: key, SignatureType: 3, Funder: signer})
+	if !strings.Contains(executor.ReadyError(), "不能等于") {
+		t.Fatalf("using the signer as funder must be rejected: %s", executor.ReadyError())
+	}
+}
+
+func TestProbeRelayerChecksKeyOwnerAndSigner(t *testing.T) {
+	const relayerKey = "01967c03-b8c8-7000-8f68-8b8eaec6fd3d"
+	privateKey, err := crypto.HexToECDSA(strings.Repeat("1", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := crypto.PubkeyToAddress(privateKey.PublicKey).Hex()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/relayer/api/keys" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("RELAYER_API_KEY") != relayerKey || !strings.EqualFold(r.Header.Get("RELAYER_API_KEY_ADDRESS"), signer) {
+			http.Error(w, `{"error":"invalid authorization"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"apiKey":"` + relayerKey + `","address":"` + signer + `"}]`))
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 3,
+		Funder:        "0x0000000000000000000000000000000000000003",
+		CLOBURL:       "https://clob.example.com",
+		RelayerURL:    server.URL,
+	})
+	probe, err := executor.ProbeRelayer(context.Background(), engine.LiveSettings{}, "", relayerKey, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.KeyCount != 1 || !strings.EqualFold(probe.Address, signer) || probe.APIKey != "01967c03…" {
+		t.Fatalf("unexpected relayer probe: %+v", probe)
+	}
+
+	// The key is bound to the signer, so any other address must be rejected
+	// before a request is even made.
+	if _, err := executor.ProbeRelayer(context.Background(), engine.LiveSettings{}, "", relayerKey, "0x0000000000000000000000000000000000000009"); err == nil || !strings.Contains(err.Error(), "不一致") {
+		t.Fatalf("a mismatched signer address must fail: %v", err)
+	}
+
+	// A syntactically valid but unknown key must not be reported as working.
+	otherKey := "01967c03-b8c8-7000-8f68-8b8eaec6fd99"
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"apiKey":"` + relayerKey + `","address":"` + signer + `"}]`))
+	})
+	if _, err := executor.ProbeRelayer(context.Background(), engine.LiveSettings{}, "", otherKey, signer); err == nil || !strings.Contains(err.Error(), "不包含") {
+		t.Fatalf("an unknown key must be reported: %v", err)
+	}
+}
+
+func TestDiscoverFunderWorksBeforeFunderIsKnown(t *testing.T) {
+	const proxyWallet = "0x0000000000000000000000000000000000000003"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/get-proxy-wallets" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("POLY_SIGNATURE") == "" {
+			http.Error(w, `{"error":"missing L1 signature"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// The CLOB may repeat an address; the caller only wants it once.
+		_, _ = w.Write([]byte(`{"proxy-wallets":["` + proxyWallet + `","` + proxyWallet + `"]}`))
+	}))
+	defer server.Close()
+
+	// Signature type 3 without a funder is not order-ready, but discovery must
+	// still work: that is how the operator learns the funder in the first place.
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 3,
+		CLOBURL:       "https://default-clob.example",
+	})
+	wallets, err := executor.DiscoverFunder(context.Background(), engine.LiveSettings{}, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wallets) != 1 || !strings.EqualFold(wallets[0], proxyWallet) {
+		t.Fatalf("unexpected wallets: %v", wallets)
+	}
+
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"proxy-wallets":[]}`))
+	}))
+	defer empty.Close()
+	wallets, err = executor.DiscoverFunder(context.Background(), engine.LiveSettings{}, empty.URL)
+	if err != nil || len(wallets) != 0 {
+		t.Fatalf("an empty list must not be an error: %v %v", wallets, err)
 	}
 }

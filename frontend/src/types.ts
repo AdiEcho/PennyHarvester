@@ -81,8 +81,10 @@ export interface Opportunity {
   market_id: string
   condition_id: string
   question: string
+  question_zh?: string
   slug: string
   outcome: string
+  outcome_zh?: string
   token_id: string
   price: number
   liquidity: number
@@ -192,6 +194,36 @@ export interface LiveSettings {
   api_key: string
   api_secret: string
   api_passphrase: string
+}
+
+export interface LiveProbeResult {
+  ok: boolean
+  error?: string
+  signer?: string
+  maker?: string
+  api_key?: string
+  source?: string
+  mode?: 'eoa' | 'proxy'
+  signature_type?: number
+  cash?: number
+  allowance?: number
+  latency_ms?: number
+}
+
+export interface RelayerProbeResult {
+  ok: boolean
+  error?: string
+  signer?: string
+  address?: string
+  api_key?: string
+  key_count?: number
+  latency_ms?: number
+}
+
+export interface FunderDiscoveryResult {
+  ok: boolean
+  error?: string
+  wallets?: string[]
 }
 
 export interface LiveEnvironment {

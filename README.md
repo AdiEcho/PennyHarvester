@@ -28,6 +28,7 @@
 
 ### 1. 机会雷达与行情过滤
 - **公开行情接入**：对接 Polymarket Gamma 只读行情接口，兼容标准 JSON 数组与 JSON 字符串编码数组字段。
+- **中文市场文案**：机会雷达提供「中文 / English」市场语言选择，默认中文。中文直接读取 Polymarket Gamma 的 `locale=zh` 翻译，市场问题与方向（如「是 / 否」）与 Polymarket 中文站保持一致；切换语言不会改变工作台界面语言。
 - **多维条件筛选**：针对二元市场（Binary Markets），按参考价格区间、剩余到期天数、最低流动性自动过滤尾盘机会。
 - **行情异常保护**：当上游行情不可用或结算数据异常时，系统会保持现有持仓状态不变并明确报错，绝不使用占位数据或猜测结果替代真实行情。
 
@@ -185,17 +186,50 @@ npm run dev
 export POLYMARKET_PRIVATE_KEY=0x...          # 可选：钱包签名私钥
 export POLYMARKET_SIGNATURE_TYPE=0           # 0=EOA，1=Proxy，2=Safe，3=Deposit/Poly1271
 export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式必须留空
-# export POLYMARKET_API_KEY=...              # 可选：若已有 CLOB L2 凭据可直接指定
+# export POLYMARKET_API_KEY=...              # 可选：复用已有的 CLOB L2 凭据（不是 Relayer API Key）
 # export POLYMARKET_API_SECRET=...
 # export POLYMARKET_API_PASSPHRASE=...
 ```
 
+- **不要用 Relayer API Key 当 CLOB 凭据**：在 polymarket.com「Settings → API Keys」创建的是一对 **Relayer API Key**（一串 UUID）与**地址**，它只用于经 relayer 免 gas 提交链上交易（赎回等），不能用于 CLOB 下单。CLOB 的 L2 凭据是 `apiKey` / `secret` / `passphrase` 三元组，Polymarket 网页不会展示它，只能由钱包私钥通过 L1 签名向 `POST /auth/api-key` 或 `GET /auth/derive-api-key` 创建/派生。因此本系统推荐把网页中的三项 L2 字段**全部留空**，由私钥自动派生；只有你在外部脚本里另行创建并希望复用时才需要填写。Relayer 密钥里的地址是签名 EOA 地址，可用它核对「检测凭据」结果中的 Signer 是否一致（Funder 则是 Polymarket 账户的 Proxy / Deposit 钱包地址，两者不同）。
+- **Relayer 不是一种登录方式（官方接口已确认）**：[`POST /submit`](https://docs.polymarket.com/api-reference/relayer/submit-a-transaction) 的请求体必填 `from`、`proxyWallet`、`nonce`、`signature`、`signatureParams`、`type`；`RELAYER_API_KEY` 与 `RELAYER_API_KEY_ADDRESS` 两个请求头只负责鉴权，其中 `RELAYER_API_KEY_ADDRESS` 必须等于密钥所有者（即签名者 EOA）地址。也就是说 relayer 只代付 gas 并转发**已签名**的钱包批次，任何模式下都离不开私钥，本系统不存在「仅用账号登录即可交易」的路径。
+- **Relayer 密钥验证**：代理钱包模式下可在网页填写 Relayer API Key（UUID）与签名者地址，用 `POST /system/relayer/test` 调用 `GET /relayer/api/keys` 校验：先本地比对签名者地址与私钥地址，再确认该地址的密钥列表包含这把 Key。检测不保存密钥、不提交任何交易；密钥目前仅用于将来的免 gas 赎回（本系统暂不代赎回）。
+
+#### 两种钱包模式
+
+网页「钱包模式」选择器对应两套字段要求，后端用 `signature_type` 区分（`0` = EOA，`1/2/3` = 代理钱包）：
+
+| 模式 | 适用账户 | 私钥作用 | Funder | 赎回 gas |
+| --- | --- | --- | --- | --- |
+| **自托管 EOA**（`0`） | 自己持有的钱包，资金就在该地址 | 签名 + 持有资金（Signer = Maker） | **必须留空** | 自付 POL |
+| **Polymarket 代理钱包**（`1`/`2`/`3`） | polymarket.com 注册的 Proxy / Safe / Deposit 钱包 | 仅签名（控制该钱包的 EOA） | **必填**，且不能等于私钥地址 | 可经 relayer 免 gas（本系统暂不代赎回） |
+
+- `1` = 旧版 Magic/Google Proxy，`2` = 旧版外部签名钱包的 Safe，`3` = Deposit Wallet（2026-05 之后新注册账号的默认类型）。
+- **邮箱 / Magic 登录的账号无法导出私钥**（由 Polymarket 托管），因此不能直接用于本系统实盘；需要另用一个能导出私钥的钱包，或把资金转到由自己私钥控制的地址。
+- 保存前会做本地校验：EOA 模式带 Funder、代理模式缺 Funder、Funder 等于私钥地址都会直接拒绝，避免订单签给一个没有余额的地址。
+
+#### 邮箱登录账号如何实盘
+
+邮箱 / Google 登录的 Polymarket 账号由 Magic 托管私钥（MPC），网页上的下单是 Magic 在浏览器内完成签名，**私钥无法导出**。本系统需要本地签名，所以无法直接用这类账号下单。可行路径：
+
+1. **迁移到可导出私钥的钱包（推荐）**
+   - 新建或导入一个 MetaMask / Rabby 等钱包（记下私钥）。
+   - 在 polymarket.com（邮箱账号）里把 USDC 提现到这个新地址，提现由 Magic 在浏览器签名，无需导出私钥。
+   - 用新钱包登录一次 polymarket.com，让平台为它部署 Deposit 钱包（类型 `3`）。
+   - 在本系统选「Polymarket 代理钱包」，填新钱包私钥，点 Funder 旁的「自动获取」（或从个人菜单复制 Deposit 钱包地址），类型选 `3`。
+   - 不想用 Polymarket 智能钱包也可以选「自托管 EOA」：USDC 直接在新地址上，但需自行完成 USDC 授权（自付 Polygon gas）。
+2. **Session Key（官方 beta，仅 Deposit 钱包）**：Deposit Wallet 所有者可以授权一个独立 EOA 签名者代为交易（可按 venue 限定、180 天过期、不能提现），参见 [Session Keys](https://docs.polymarket.com/trading/session-keys)。但授权本身仍需 owner 私钥签名 + Builder API Key + relayer，且订单需要 session-key 签名包装，本系统当前 SDK 未实现，暂不支持。
+3. **不要尝试“导出” Magic 私钥**：没有公开接口，也违反平台条款。
+
+> 迁移后是新的钱包 / 新账户，旧账号的持仓与余额需在网页里自行赎回、提现；本系统不代赎回。
+
 - **网页凭据的存储方式**：私钥、L2 Secret 与 Passphrase 以 AES-256-GCM 加密写入 SQLite；密钥文件默认位于数据库旁（`<DATABASE_PATH>.key`，权限 `0600`）。请将数据库与密钥文件一同备份；丢失密钥将无法解密已保存的凭据。网页与 API 永远不会返回明文私钥。
 - 若未手动提供 L2 API 凭据，系统会在首次执行实盘操作时自动通过私钥派生。
+- **保存前先验证**：网页「系统设置 → 实盘交易凭据」提供「检测凭据」按钮（`POST /system/live/test`），它会用当前表单（未保存也可）派生 L2 凭据并读取抵押余额与授权额度，返回 Signer / Maker / 掩码后的 API Key。该检测只读、不落库、不下单，可用于确认私钥与 Funder、签名类型是否匹配。
 - **开发者码（Builder Code）已内置**：`backend/internal/config/config.go` 中硬编码了 `BuilderCode`（及仅供识别的 `BuilderAddress`），实盘订单在签名前会写入该 `builder` 字段，用于把成交归因到对应 builder 档案并参与分佣。该值为公开标识，不是密钥，也不需要环境变量配置。
 - 请使用专用的小额热钱包，**切勿将私钥提交至 Git 仓库**；网页保存的私钥也应按同等敏感级别保护数据库与密钥文件。
 - **实盘资金口径说明**：实盘账户的「策略可用资金」计算公式为 `首次同步的钱包 USDC 基准 + 已实现盈亏 − 当前未平仓成本`，同时界面会并列展示链上真实的「钱包 USDC 余额」。该核算方式假设该钱包专用于本策略；若同一钱包内还有你在 Polymarket 手动交易的其他仓位，策略账面可用资金会与钱包真实余额产生偏差。
-- **Signer 与 Maker 说明**：实盘账户的下单地址（`maker`）可能是 EOA 签名地址本身，也可能是 `POLYMARKET_FUNDER` 指向的 Proxy / Safe 代理钱包，参数设置页会分别展示两者。注意：**使用 EOA 模式（`POLYMARKET_SIGNATURE_TYPE=0`）时，请务必将 `POLYMARKET_FUNDER` 留空**。
+- **Signer 与 Maker 说明**：`Signer` 是私钥对应的地址，`Maker` 是持仓与资金所在地址。自托管 EOA 模式下两者相同；代理钱包模式下 `Maker` 等于 `POLYMARKET_FUNDER`。参数设置页与「检测凭据」结果会分别展示两者。
 
 ---
 
@@ -213,7 +247,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POLYMARKET_SIGNATURE_TYPE` | `0` | 签名类型的可选回退值：`0` EOA、`1` Proxy、`2` Safe、`3` Deposit/Poly1271 |
 | `POLYMARKET_FUNDER` | 空 | 非 EOA 签名类型对应的代理/Safe 钱包地址的可选回退值；EOA 模式必须留空（兼容旧变量名 `POLYMARKET_MAKER_ADDRESS`） |
 | `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | CLOB 交易地址的默认值；可在网页「系统设置」中覆盖 |
-| `POLYMARKET_API_KEY` | 空 | 可选，复用已有的 CLOB L2 API Key；也可在网页中填写 |
+| `POLYMARKET_API_KEY` | 空 | 可选，复用已有的 CLOB L2 API Key（**不是** polymarket.com 设置页的 Relayer API Key）；也可在网页中填写 |
 | `POLYMARKET_API_SECRET` | 空 | 可选，复用已有的 CLOB L2 API Secret；也可在网页中加密保存 |
 | `POLYMARKET_API_PASSPHRASE` | 空 | 可选，复用已有的 CLOB L2 API Passphrase；也可在网页中加密保存 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 仅当代理模式为「跟随环境变量」（默认）时生效；由 Go 标准库在首次请求时读取并缓存 |
@@ -237,13 +271,16 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `PATCH` | `/accounts/:id` | 修改账户名称、自动交易开关或设为默认账户 |
 | `DELETE` | `/accounts/:id` | 删除指定模拟账户（级联清除其持仓、订单与净值记录） |
 | `GET` | `/dashboard?account_id=1` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照 |
-| `GET` | `/opportunities` | 获取最近一次成功扫描筛选出的市场机会列表 |
+| `GET` | `/opportunities` | 获取最近一次成功扫描筛选出的市场机会列表；每项同时返回原始 `question` / `outcome` 与 Polymarket 中文翻译 `question_zh` / `outcome_zh` |
 | `POST` | `/scan` | 手动触发扫描：默认仅刷新行情、持仓盯市与净值，不自动下单；附加 `?execute=true` 时同步执行自动交易 |
 | `GET` | `/positions?account_id=1&status=open` | 查询持仓列表，`status` 支持 `all / open / won / lost / split` |
 | `GET` | `/orders?account_id=1&status=all&limit=100&offset=0` | 查询订单记录，`status` 支持 `all / filled / settled / rejected / pending / unknown / unresolved` |
 | `GET / PUT` | `/settings` | 读取或更新全局策略筛选条件与风控参数 |
 | `GET / PUT` | `/system` | 读取或更新系统设置（Gamma / CLOB 地址、实盘凭据、网络出口代理）；私钥、L2 Secret、Passphrase 与代理密码在响应中自动掩码。请求体支持按分区部分更新：`proxy`、`data_source`、`live` 可单独提交；提交 `live` 时请带上该分区的完整字段，掩码值会自动还原为已保存的密钥 |
 | `POST` | `/system/proxy/test` | 使用请求体中的代理配置探测 `https://clob.polymarket.com/time`，不保存设置 |
+| `POST` | `/system/live/test` | 用请求体中的实盘凭据（`live` 与 `clob_base_url`，掩码值自动还原）做只读验证：派生 L2 凭据并读取余额/授权，返回 Signer、Maker、掩码 API Key 与耗时；不保存设置、不下单 |
+| `POST` | `/system/relayer/test` | 验证 Relayer API Key：`relayer_api_key` + `relayer_address`（需与私钥地址一致），调用 `GET /relayer/api/keys` 确认密钥有效；不保存、不提交交易 |
+| `POST` | `/system/live/funder` | 用私钥做 L1 鉴权，向 CLOB 查询该签名地址关联的 Proxy / Deposit 钱包，返回 `wallets`；不保存设置 |
 | `GET` | `/auth/status` | 查询是否需要登录与当前会话是否有效（无需登录即可访问） |
 | `POST` | `/auth/login` | 使用访问密码登录，成功后在 `ph_session` Cookie 中下发会话 |
 | `POST` | `/auth/logout` | 退出登录并吊销当前会话 |

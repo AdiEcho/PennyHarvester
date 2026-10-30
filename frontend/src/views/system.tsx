@@ -21,12 +21,16 @@ import { cn } from '@/lib/utils'
 import { useToast } from '@/components/toast'
 import type {
   DataSourceSettings,
+  LiveEnvironment,
+  LiveProbeResult,
   LiveSettings,
   ProxyConfig,
   ProxyMode,
   ProxyTestResult,
+  RelayerProbeResult,
   SystemSettings,
 } from '@/types'
+import { formatCurrency } from '@/lib/format'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -85,23 +89,41 @@ function urlError(value: string): string | null {
   }
 }
 
-function liveValidation(draft: LiveSettings): string | null {
+// The live configuration has two shapes. An EOA signs and holds funds with the
+// same key; a Polymarket proxy/deposit wallet only lets the key sign, while the
+// collateral lives in the funder address. The UI switches fields and hints on
+// this mode instead of asking the operator to know signature type numbers.
+function effectiveSignatureType(draft: LiveSettings, environment: LiveEnvironment): number {
+  return draft.signature_type ?? environment.signature_type
+}
+
+function walletMode(draft: LiveSettings, environment: LiveEnvironment): 'eoa' | 'proxy' {
+  return effectiveSignatureType(draft, environment) === 0 ? 'eoa' : 'proxy'
+}
+
+function liveValidation(draft: LiveSettings, environment: LiveEnvironment): string | null {
   const key = draft.private_key.trim()
   if (key && key !== REDACTED_SECRET && !/^0x[0-9a-fA-F]{64}$/.test(key)) {
     return '私钥必须是 0x 开头的 64 位十六进制字符串。'
   }
   const funder = draft.funder.trim()
+  const effectiveFunder = funder || environment.funder.trim()
   if (funder && !/^0x[0-9a-fA-F]{40}$/.test(funder)) {
     return 'Funder 必须是有效的 0x 地址。'
   }
-  if (draft.signature_type === 0 && funder) {
-    return 'EOA 签名类型必须将 Funder 留空。'
+  if (walletMode(draft, environment) === 'eoa' && effectiveFunder) {
+    return funder
+      ? '自托管 EOA 模式下 Funder 必须留空。'
+      : '自托管 EOA 模式要求 Funder 留空，但环境变量中仍配置了 Funder；请移除 POLYMARKET_FUNDER 后重启。'
+  }
+  if (walletMode(draft, environment) === 'proxy' && !effectiveFunder) {
+    return '代理钱包模式需要填写 Funder（Polymarket 账户里的代理 / Deposit 钱包地址）。'
   }
   const credentials = [draft.api_key.trim(), draft.api_secret.trim(), draft.api_passphrase.trim()]
   const anySet = credentials.some(Boolean)
   const allSet = credentials.every(Boolean)
   if (anySet && !allSet) {
-    return 'L2 API Key、Secret、Passphrase 必须同时填写或同时留空。'
+    return 'L2 API Key、Secret、Passphrase 必须同时填写或同时留空。若你只有 polymarket.com 生成的 Relayer API Key（UUID + 地址），请把这三项全部留空，系统会用私钥自动派生 CLOB 凭据。'
   }
   return null
 }
@@ -166,24 +188,115 @@ function EndpointSection({ system, draft, dirty, saving, busy, onChange, onDisca
   )
 }
 
-function LiveTradingSection({ system, draft, dirty, saving, busy, onChange, onReset, onSave }: {
+function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, onChange, onReset, onSave }: {
   system: SystemSettings
   draft: LiveSettings
   dirty: boolean
   saving: boolean
   busy: boolean
+  clobBaseURL: string
   onChange: (patch: Partial<LiveSettings>) => void
   onReset: () => void
   onSave: () => void
 }) {
+  const { toast } = useToast()
+  const [testing, setTesting] = useState(false)
+  const [probe, setProbe] = useState<LiveProbeResult | null>(null)
+  const [relayerKey, setRelayerKey] = useState('')
+  const [relayerAddress, setRelayerAddress] = useState('')
+  const [relayerTesting, setRelayerTesting] = useState(false)
+  const [relayerProbe, setRelayerProbe] = useState<RelayerProbeResult | null>(null)
+  const [discoveringFunder, setDiscoveringFunder] = useState(false)
+  // Any edit invalidates the previous result so a stale "passed" badge cannot
+  // be mistaken for a check of the current form values.
+  useEffect(() => {
+    setProbe(null)
+    setRelayerProbe(null)
+  }, [draft])
   const runtime = system.runtime
   const environment = runtime.live_environment
   const statusVariant = runtime.live_ready ? 'success' : runtime.live_configured ? 'warning' : 'default'
   const statusLabel = runtime.live_ready ? '凭据本地校验通过' : runtime.live_configured ? '已配置但未就绪' : '未配置实盘凭据'
-  const signatureValue = draft.signature_type === null ? 'inherit' : String(draft.signature_type)
+  const mode = walletMode(draft, environment)
+  const proxyType = effectiveSignatureType(draft, environment) === 0 ? 3 : effectiveSignatureType(draft, environment)
   const clearCredentials = () => onChange({ api_key: '', api_secret: '', api_passphrase: '' })
   const environmentCredentialsSet = environment.api_key_set && environment.api_secret_set && environment.api_passphrase_set
   const environmentCredentialsPartial = (environment.api_key_set || environment.api_secret_set || environment.api_passphrase_set) && !environmentCredentialsSet
+
+  const discoverFunder = async () => {
+    setDiscoveringFunder(true)
+    try {
+      const result = await api.discoverFunder(draft, clobBaseURL)
+      if (!result.ok) {
+        toast({ title: '未能自动获取 Funder', description: result.error || '请检查私钥与 CLOB 地址。', variant: 'error' })
+        return
+      }
+      const wallets = result.wallets ?? []
+      if (wallets.length === 0) {
+        toast({
+          title: 'CLOB 未返回关联钱包',
+          description: '请先在 polymarket.com 用这个私钥对应的钱包登录一次，让平台为它创建 Deposit 钱包；或从个人菜单复制地址后手动填入。',
+          variant: 'info',
+        })
+        return
+      }
+      onChange({ funder: wallets[0] })
+      toast({
+        title: '已填入 Funder',
+        description: wallets.length > 1 ? `共 ${wallets.length} 个关联钱包，已填入第一个：${wallets[0]}` : wallets[0],
+        variant: 'success',
+      })
+    } catch (caught) {
+      toast({ title: '查询失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+    } finally {
+      setDiscoveringFunder(false)
+    }
+  }
+
+  const testRelayer = async () => {
+    setRelayerTesting(true)
+    setRelayerProbe(null)
+    try {
+      const result = await api.testRelayer(draft, clobBaseURL, relayerKey.trim(), relayerAddress.trim())
+      setRelayerProbe(result)
+      toast({
+        title: result.ok ? 'Relayer 密钥有效' : 'Relayer 密钥检测失败',
+        description: result.ok
+          ? `签名者 ${result.address} · 该地址下共 ${result.key_count ?? 0} 把密钥`
+          : result.error || '请检查密钥、签名者地址与网络出口。',
+        variant: result.ok ? 'success' : 'error',
+      })
+    } catch (caught) {
+      toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+    } finally {
+      setRelayerTesting(false)
+    }
+  }
+
+  const testCredentials = async () => {
+    const validation = liveValidation(draft, environment)
+    if (validation) {
+      toast({ title: '无法检测', description: validation, variant: 'error' })
+      return
+    }
+    setTesting(true)
+    setProbe(null)
+    try {
+      const result = await api.testLive(draft, clobBaseURL)
+      setProbe(result)
+      toast({
+        title: result.ok ? '实盘凭据可用' : '实盘凭据检测失败',
+        description: result.ok
+          ? `Signer ${result.signer} · 抵押余额 ${formatCurrency(result.cash ?? 0)}`
+          : result.error || '请检查私钥、Funder、签名类型与网络出口。',
+        variant: result.ok ? 'success' : 'error',
+      })
+    } catch (caught) {
+      toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+    } finally {
+      setTesting(false)
+    }
+  }
 
   return (
     <Section
@@ -208,10 +321,51 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, onChange, onRe
         </div>
       </div>
 
+      <div className="mt-5">
+        <p className="text-sm font-medium text-slate-700">钱包模式</p>
+        <p className="mt-1 text-xs leading-4 text-slate-400">决定资金在哪里、以及 CLOB 如何校验签名。两种模式都需要私钥，仅用 Relayer API Key 无法下单。</p>
+        <div className="mt-2 grid gap-3 sm:grid-cols-2">
+          <button
+            type="button"
+            aria-pressed={mode === 'eoa'}
+            onClick={() => onChange({ signature_type: 0, funder: '' })}
+            className={cn(
+              'rounded-xl border p-4 text-left transition',
+              mode === 'eoa' ? 'border-emerald-300 bg-emerald-50/70 ring-1 ring-emerald-200' : 'border-slate-200 bg-white hover:border-slate-300',
+            )}
+          >
+            <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+              <Wallet className="h-4 w-4 text-slate-500" />自托管 EOA
+              {mode === 'eoa' && <CheckCircle2 className="ml-auto h-4 w-4 text-emerald-500" />}
+            </span>
+            <span className="mt-1 block text-xs leading-5 text-slate-500">私钥地址就是资金地址（Signer = Maker），不需要 Funder。链上赎回需自付 Polygon gas。</span>
+          </button>
+          <button
+            type="button"
+            aria-pressed={mode === 'proxy'}
+            onClick={() => onChange({ signature_type: proxyType })}
+            className={cn(
+              'rounded-xl border p-4 text-left transition',
+              mode === 'proxy' ? 'border-emerald-300 bg-emerald-50/70 ring-1 ring-emerald-200' : 'border-slate-200 bg-white hover:border-slate-300',
+            )}
+          >
+            <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+              <ShieldCheck className="h-4 w-4 text-slate-500" />Polymarket 代理钱包
+              {mode === 'proxy' && <CheckCircle2 className="ml-auto h-4 w-4 text-emerald-500" />}
+            </span>
+            <span className="mt-1 block text-xs leading-5 text-slate-500">私钥只负责签名，USDC 与持仓在 Funder（Proxy / Safe / Deposit）地址。下单仍由私钥签名后提交 CLOB。</span>
+          </button>
+        </div>
+        <p className="mt-2 text-xs leading-5 text-slate-400">邮箱 / Magic 登录的账号私钥由 Polymarket 托管、无法导出，不能直接用于本系统实盘；请改用可导出私钥的钱包（步骤见 README「邮箱登录账号如何实盘」）。</p>
+      </div>
+
       <div className="mt-5 grid gap-x-5 gap-y-5 lg:grid-cols-3">
-        <div className="lg:col-span-2">
+        <div className={mode === 'proxy' ? 'lg:col-span-2' : 'lg:col-span-3'}>
           <label htmlFor="live-private-key" className="text-sm font-medium text-slate-700">钱包私钥</label>
-          <p className="mt-1 min-h-8 text-xs leading-4 text-slate-400">等同于钱包资产控制权。建议使用专用小额热钱包；留空则沿用环境变量或保持未配置。</p>
+          <p className="mt-1 min-h-8 text-xs leading-4 text-slate-400">
+            {mode === 'eoa' ? '等同于钱包资产控制权。建议使用专用小额热钱包。' : '只用于签名，不直接持有资金；请使用控制该代理钱包的 EOA 私钥。'}
+            留空则沿用环境变量或保持未配置。
+          </p>
           <div className="mt-2 flex gap-2">
             <Input
               id="live-private-key"
@@ -231,43 +385,53 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, onChange, onRe
           {draft.private_key === REDACTED_SECRET && <p className="mt-1.5 text-xs text-slate-400">已保存的私钥不会回显。直接输入新值会覆盖，点击「清除」可恢复环境变量。</p>}
         </div>
 
-        <div>
-          <label htmlFor="live-signature-type" className="text-sm font-medium text-slate-700">签名类型</label>
-          <p className="mt-1 min-h-8 text-xs leading-4 text-slate-400">0=EOA，1=Proxy，2=Safe，3=Deposit/Poly1271。留空沿用环境变量（当前环境默认 {environment.signature_type}）。</p>
-          <Select value={signatureValue} onValueChange={(value) => onChange({ signature_type: value === 'inherit' ? null : Number(value) })}>
-            <SelectTrigger id="live-signature-type" className="mt-2">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="inherit">跟随环境变量 / 默认</SelectItem>
-              <SelectItem value="0">0 · EOA（Funder 必须留空）</SelectItem>
-              <SelectItem value="1">1 · Proxy</SelectItem>
-              <SelectItem value="2">2 · Safe</SelectItem>
-              <SelectItem value="3">3 · Deposit / Poly1271</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
+        {mode === 'proxy' && (
+          <div>
+            <label htmlFor="live-signature-type" className="text-sm font-medium text-slate-700">代理钱包类型</label>
+            <p className="mt-1 min-h-8 text-xs leading-4 text-slate-400">1=旧版 Magic/Google Proxy，2=旧版 Safe（MetaMask 等），3=Deposit Wallet（2026-05 之后新注册账号默认）。环境变量默认 {environment.signature_type}。</p>
+            <Select value={String(proxyType)} onValueChange={(value) => onChange({ signature_type: Number(value) })}>
+              <SelectTrigger id="live-signature-type" className="mt-2">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="1">1 · Proxy（旧版 Magic / Google）</SelectItem>
+                <SelectItem value="2">2 · Safe（旧版外部签名钱包）</SelectItem>
+                <SelectItem value="3">3 · Deposit Wallet（当前默认）</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        )}
 
-        <div className="lg:col-span-3">
-          <label htmlFor="live-funder" className="text-sm font-medium text-slate-700">Funder（代理 / Safe 钱包地址）</label>
-          <p className="mt-1 text-xs leading-4 text-slate-400">非 EOA 签名类型必填；EOA 模式必须留空。留空且环境变量有值时沿用环境变量。</p>
-          <Input
-            id="live-funder"
-            value={draft.funder}
-            onChange={(event) => onChange({ funder: event.target.value })}
-            placeholder={environment.funder || '0x...'}
-            spellCheck={false}
-            autoComplete="off"
-            className="mt-2 font-mono text-xs"
-          />
-        </div>
+        {mode === 'proxy' ? (
+          <div className="lg:col-span-3">
+            <label htmlFor="live-funder" className="text-sm font-medium text-slate-700">Funder（代理 / Deposit 钱包地址）</label>
+            <p className="mt-1 text-xs leading-4 text-slate-400">Polymarket 账户里显示的钱包地址，也是 USDC 与持仓所在地址。必须填写，且不能等于上面的私钥地址。</p>
+            <div className="mt-2 flex gap-2">
+              <Input
+                id="live-funder"
+                value={draft.funder}
+                onChange={(event) => onChange({ funder: event.target.value })}
+                placeholder={environment.funder || '0x...'}
+                spellCheck={false}
+                autoComplete="off"
+                className="font-mono text-xs"
+              />
+              <Button variant="secondary" size="sm" onClick={() => void discoverFunder()} loading={discoveringFunder} disabled={busy}>自动获取</Button>
+            </div>
+            <p className="mt-1.5 text-xs leading-4 text-slate-400">「自动获取」向 CLOB 查询该私钥关联的 Proxy / Deposit 钱包，不会保存也不会下单。旧版 Proxy 钱包通常能查到；Deposit 钱包若查不到，请从 Polymarket 个人菜单复制。</p>
+          </div>
+        ) : (
+          <div className="lg:col-span-3 rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs leading-5 text-slate-500">
+            自托管 EOA：资金、持仓与签名都在同一个地址上，Funder 必须留空。赎回需要自付 Polygon gas，本系统不代赎回。
+          </div>
+        )}
       </div>
 
       <div className="mt-6 border-t border-slate-100 pt-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className="text-sm font-semibold text-slate-800">CLOB L2 API 凭据（可选）</p>
-            <p className="mt-1 text-xs leading-5 text-slate-400">三项必须同时填写或同时留空。留空时系统会优先复用环境变量，否则在首次实盘操作时用私钥自动派生。</p>
+            <p className="text-sm font-semibold text-slate-800">CLOB L2 API 凭据（通常留空）</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">三项必须同时填写或同时留空。留空时系统会用私钥自动派生。注意：polymarket.com「Settings → API Keys」里生成的是 <span className="font-medium text-slate-600">Relayer API Key</span>（一串 UUID + 地址），只用于免 gas 的中继交易，<span className="font-medium text-slate-600">不是</span>这里的 CLOB 凭据，请勿填入。</p>
           </div>
           <Button variant="ghost" size="sm" onClick={clearCredentials} disabled={!draft.api_key && !draft.api_secret && !draft.api_passphrase}>清除 L2 凭据</Button>
         </div>
@@ -278,7 +442,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, onChange, onRe
               id="live-api-key"
               value={draft.api_key}
               onChange={(event) => onChange({ api_key: event.target.value })}
-              placeholder={environment.api_key_set ? '环境变量已提供' : '可选'}
+              placeholder={environment.api_key_set ? '环境变量已提供' : '通常留空（自动派生）'}
               spellCheck={false}
               autoComplete="off"
               className="mt-2 font-mono text-xs"
@@ -292,7 +456,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, onChange, onRe
               value={draft.api_secret}
               onChange={(event) => onChange({ api_secret: event.target.value })}
               onFocus={(event) => { if (event.currentTarget.value === REDACTED_SECRET) event.currentTarget.select() }}
-              placeholder={environment.api_secret_set ? '环境变量已提供' : '可选'}
+              placeholder={environment.api_secret_set ? '环境变量已提供' : '通常留空（自动派生）'}
               spellCheck={false}
               autoComplete="off"
               className="mt-2 font-mono text-xs"
@@ -306,14 +470,76 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, onChange, onRe
               value={draft.api_passphrase}
               onChange={(event) => onChange({ api_passphrase: event.target.value })}
               onFocus={(event) => { if (event.currentTarget.value === REDACTED_SECRET) event.currentTarget.select() }}
-              placeholder={environment.api_passphrase_set ? '环境变量已提供' : '可选'}
+              placeholder={environment.api_passphrase_set ? '环境变量已提供' : '通常留空（自动派生）'}
               spellCheck={false}
               autoComplete="off"
               className="mt-2 font-mono text-xs"
             />
           </div>
         </div>
+        <p className="mt-3 text-xs leading-5 text-slate-400">CLOB 的 Key / Secret / Passphrase 不会在 Polymarket 网页上展示，只能由私钥派生。Relayer API Key 的用途是经 relayer 免 gas 提交链上交易（赎回、转账等，仍需私钥签名），本系统当前不代赎回，因此无需填写；它的地址可用来核对下方检测结果里的 Signer。</p>
       </div>
+
+      {mode === 'proxy' && (
+        <div className="mt-6 border-t border-slate-100 pt-5">
+          <div>
+            <p className="text-sm font-semibold text-slate-800">Relayer API Key（可选，仅链上免 gas 操作）</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">
+              polymarket.com「Settings → API Keys」生成的 UUID 与签名者地址。它只负责鉴权：官方 <code className="rounded bg-slate-100 px-1">/submit</code> 请求体仍必须带 <code className="rounded bg-slate-100 px-1">signature</code> / <code className="rounded bg-slate-100 px-1">nonce</code>（由私钥签名），因此不能下单。本系统当前不代赎回，这里只做验证，不会保存。
+            </p>
+          </div>
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            <Input
+              value={relayerKey}
+              onChange={(event) => { setRelayerKey(event.target.value); setRelayerProbe(null) }}
+              placeholder="01a18d94-7b45-7bc6-..."
+              spellCheck={false}
+              autoComplete="off"
+              aria-label="Relayer API Key"
+              className="font-mono text-xs"
+            />
+            <Input
+              value={relayerAddress}
+              onChange={(event) => { setRelayerAddress(event.target.value); setRelayerProbe(null) }}
+              placeholder={probe?.signer || '0x...（签名者地址，不是 Funder）'}
+              spellCheck={false}
+              autoComplete="off"
+              aria-label="Relayer 签名者地址"
+              className="font-mono text-xs"
+            />
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <Button variant="secondary" size="sm" onClick={() => void testRelayer()} loading={relayerTesting} disabled={busy || !relayerKey.trim() || !relayerAddress.trim()}>验证 Relayer 密钥</Button>
+            <p className="text-xs leading-5 text-slate-400">地址必须等于私钥地址（Signer）；填成 Funder 会返回 401。</p>
+          </div>
+          {relayerProbe && (
+            <div className={cn('mt-3 rounded-xl border px-4 py-3 text-xs leading-5', relayerProbe.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-rose-200 bg-rose-50 text-rose-700')} role="status">
+              {relayerProbe.ok ? (
+                <p className="break-words">Relayer 密钥有效 · 签名者 {relayerProbe.address} · 该地址下 {relayerProbe.key_count ?? 0} 把密钥 · Key {relayerProbe.api_key} · 耗时 {Math.round(relayerProbe.latency_ms ?? 0)} ms</p>
+              ) : (
+                <p className="break-words">{relayerProbe.error || '检测失败。'}</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {probe && (
+        <div className={cn('mt-4 rounded-xl border px-4 py-3 text-xs leading-5', probe.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-rose-200 bg-rose-50 text-rose-700')} role="status">
+          {probe.ok ? (
+            <div className="space-y-1">
+              <p className="font-medium">凭据检测通过 · {probe.mode === 'eoa' ? '自托管 EOA（Signer = Maker）' : `代理钱包（类型 ${probe.signature_type}）`} · {probe.source === 'configured' ? '使用已填写的 L2 凭据' : '已由私钥派生 L2 凭据'} · 耗时 {Math.round(probe.latency_ms ?? 0)} ms</p>
+              <p className="break-all font-mono">Signer {probe.signer}</p>
+              <p className="break-all font-mono">Maker {probe.maker}</p>
+              {probe.mode === 'proxy' && <p>代理钱包模式下 Maker 应等于你填写的 Funder；若不等，说明代理钱包类型或 Funder 填错。</p>}
+              <p>API Key {probe.api_key || '—'} · 抵押余额 {formatCurrency(probe.cash ?? 0)} · 授权额度 {formatCurrency(probe.allowance ?? 0)}</p>
+              {(probe.cash ?? 0) <= 0 && <p className="text-amber-700">抵押余额为 0：请确认 Funder 是该账户真实钱包地址，或该钱包尚未存入 USDC（余额不足时下单会被拒绝）。</p>}
+            </div>
+          ) : (
+            <p className="break-words">{probe.error || '检测失败，请检查私钥、Funder、签名类型与网络出口。'}</p>
+          )}
+        </div>
+      )}
 
       <div className="mt-5 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900">
         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -321,7 +547,8 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, onChange, onRe
       </div>
 
       <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
-        <p className="flex-1 text-xs leading-5 text-slate-400">保存后立即重建 CLOB 客户端；若凭据不完整或地址冲突，保存会被拒绝且旧配置继续生效。</p>
+        <p className="flex-1 text-xs leading-5 text-slate-400">「检测凭据」只做只读验证（派生 L2 凭据 + 读取余额与授权），不会保存设置也不会下单。</p>
+        <Button variant="secondary" onClick={() => void testCredentials()} loading={testing} disabled={busy}>检测凭据</Button>
         <Button variant="secondary" onClick={onReset} disabled={!dirty || busy}><RotateCcw className="h-4 w-4" />放弃更改</Button>
         <Button variant="primary" onClick={onSave} loading={saving} disabled={!dirty || busy}><Save className="h-4 w-4" />保存实盘设置</Button>
       </div>
@@ -453,8 +680,8 @@ export function SystemView() {
   }
 
   const saveLive = () => {
-    if (!liveDraft) return
-    const validation = liveValidation(liveDraft)
+    if (!liveDraft || !system) return
+    const validation = liveValidation(liveDraft, system.runtime.live_environment)
     if (validation) {
       toast({ title: '实盘设置未保存', description: validation, variant: 'error' })
       return
@@ -528,6 +755,7 @@ export function SystemView() {
               dirty={liveDirty}
               saving={savingSection === 'live'}
               busy={savingSection !== null}
+              clobBaseURL={dataDraft?.clob_base_url ?? ''}
               onChange={updateLive}
               onReset={resetLive}
               onSave={saveLive}

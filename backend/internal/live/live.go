@@ -26,6 +26,9 @@ type Config struct {
 	Funder        string
 	SignatureType int
 	CLOBURL       string
+	// RelayerURL points at the gasless relayer. It is used for credential
+	// checks only; orders always go through the CLOB.
+	RelayerURL    string
 	APIKey        string
 	APISecret     string
 	APIPassphrase string
@@ -62,6 +65,7 @@ func New(cfg Config) *Executor {
 	cfg.APISecret = strings.TrimSpace(cfg.APISecret)
 	cfg.APIPassphrase = strings.TrimSpace(cfg.APIPassphrase)
 	cfg.CLOBURL = strings.TrimRight(strings.TrimSpace(cfg.CLOBURL), "/")
+	cfg.RelayerURL = strings.TrimRight(strings.TrimSpace(cfg.RelayerURL), "/")
 	builderCode, builderErr := normalizeBuilderCode(cfg.BuilderCode)
 	return &Executor{base: cfg, cfg: cfg, builderCode: builderCode, builderErr: builderErr}
 }
@@ -135,9 +139,28 @@ func (e *Executor) UpdateSettings(settings engine.LiveSettings, clobBaseURL stri
 	if e == nil {
 		return nil
 	}
-	settings = settings.Normalize()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	effective, err := e.resolveLocked(settings, clobBaseURL)
+	if err != nil {
+		return err
+	}
+	if sameLiveConfig(e.cfg, effective) {
+		return nil
+	}
+	e.cfg = effective
+	e.client = nil
+	e.initErr = nil
+	e.credentials = nil
+	e.cash = engine.CashSnapshot{}
+	e.cashAt = time.Time{}
+	return nil
+}
+
+// resolveLocked merges web-managed overrides onto the startup configuration
+// without touching the running executor. Callers must hold e.mu.
+func (e *Executor) resolveLocked(settings engine.LiveSettings, clobBaseURL string) (Config, error) {
+	settings = settings.Normalize()
 	effective := e.base
 	effective.Proxy = e.cfg.Proxy
 	if clob := strings.TrimRight(strings.TrimSpace(clobBaseURL), "/"); clob != "" {
@@ -159,7 +182,7 @@ func (e *Executor) UpdateSettings(settings engine.LiveSettings, clobBaseURL stri
 		}
 	}
 	if credentialCount != 0 && credentialCount != 3 {
-		return fmt.Errorf("POLYMARKET_API_KEY、POLYMARKET_API_SECRET、POLYMARKET_API_PASSPHRASE 必须同时设置")
+		return Config{}, fmt.Errorf("POLYMARKET_API_KEY、POLYMARKET_API_SECRET、POLYMARKET_API_PASSPHRASE 必须同时设置")
 	}
 	if credentialCount == 3 {
 		effective.APIKey = settings.APIKey
@@ -167,18 +190,143 @@ func (e *Executor) UpdateSettings(settings engine.LiveSettings, clobBaseURL stri
 		effective.APIPassphrase = settings.APIPassphrase
 	}
 	if err := validateEffectiveConfig(effective, e.builderErr); err != nil {
-		return err
+		return Config{}, err
 	}
-	if sameLiveConfig(e.cfg, effective) {
-		return nil
+	return effective, nil
+}
+
+// Probe validates candidate credentials against the CLOB without placing an
+// order or disturbing the running executor: it derives (or checks) the L2
+// credentials and reads the wallet's collateral balance. The CLOB answers both
+// calls only when the private key, signature type and funder are consistent,
+// so a success here means the next order will not fail on authentication.
+func (e *Executor) Probe(ctx context.Context, settings engine.LiveSettings, clobBaseURL string) (engine.LiveProbe, error) {
+	if e == nil {
+		return engine.LiveProbe{}, fmt.Errorf("未配置实盘执行器")
 	}
-	e.cfg = effective
-	e.client = nil
-	e.initErr = nil
-	e.credentials = nil
-	e.cash = engine.CashSnapshot{}
-	e.cashAt = time.Time{}
-	return nil
+	e.mu.Lock()
+	effective, err := e.resolveLocked(settings, clobBaseURL)
+	e.mu.Unlock()
+	if err != nil {
+		return engine.LiveProbe{}, err
+	}
+	probe := New(effective)
+	start := time.Now()
+	if _, err := probe.ensure(ctx); err != nil {
+		return engine.LiveProbe{}, err
+	}
+	snapshot, err := probe.Collateral(ctx)
+	if err != nil {
+		return engine.LiveProbe{}, err
+	}
+	probe.mu.Lock()
+	credentials := probe.credentials
+	probe.mu.Unlock()
+	source := "derived"
+	if strings.TrimSpace(effective.APIKey) != "" {
+		source = "configured"
+	}
+	apiKey := ""
+	if credentials != nil {
+		apiKey = maskAPIKey(credentials.APIKey)
+	}
+	return engine.LiveProbe{
+		Signer:        probe.Signer(),
+		Maker:         probe.Maker(),
+		APIKey:        apiKey,
+		Source:        source,
+		Mode:          walletMode(effective.SignatureType),
+		SignatureType: effective.SignatureType,
+		Cash:          snapshot.Amount,
+		Allowance:     snapshot.Allowance,
+		LatencyMS:     float64(time.Since(start).Microseconds()) / 1000,
+	}, nil
+}
+
+// Wallet modes split the two ways a Polymarket account can hold funds. The
+// mode decides which addresses matter: an EOA is its own maker, while a proxy
+// wallet is owned by the signer but holds the collateral.
+const (
+	WalletModeEOA   = "eoa"
+	WalletModeProxy = "proxy"
+)
+
+func walletMode(signatureType int) string {
+	if signatureType == 0 {
+		return WalletModeEOA
+	}
+	return WalletModeProxy
+}
+
+// DiscoverFunder asks the CLOB which proxy / deposit wallets belong to the
+// configured signer. It only needs L1 authentication, so it works before a
+// funder is known — which is exactly when the operator needs it.
+func (e *Executor) DiscoverFunder(ctx context.Context, settings engine.LiveSettings, clobBaseURL string) ([]string, error) {
+	if e == nil {
+		return nil, fmt.Errorf("未配置实盘执行器")
+	}
+	cfg, err := e.resolveSigner(settings, clobBaseURL)
+	if err != nil {
+		return nil, err
+	}
+	client, err := newClobClient(cfg, nil)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 Polymarket CLOB 客户端: %w", err)
+	}
+	wallets, err := client.ProxyWallets(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("查询 Polymarket 关联钱包: %w", err)
+	}
+	seen := make(map[string]bool, len(wallets))
+	out := make([]string, 0, len(wallets))
+	for _, wallet := range wallets {
+		wallet = normalizeKeyPrefix(strings.TrimSpace(wallet))
+		if !common.IsHexAddress(wallet) {
+			continue
+		}
+		key := strings.ToLower(wallet)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, wallet)
+	}
+	return out, nil
+}
+
+// resolveSigner merges only the signer fields so wallet discovery is not
+// blocked by an unknown or still-empty funder.
+func (e *Executor) resolveSigner(settings engine.LiveSettings, clobBaseURL string) (Config, error) {
+	settings = settings.Normalize()
+	e.mu.Lock()
+	cfg := e.base
+	cfg.Proxy = e.cfg.Proxy
+	e.mu.Unlock()
+	if clob := strings.TrimRight(strings.TrimSpace(clobBaseURL), "/"); clob != "" {
+		cfg.CLOBURL = clob
+	}
+	if settings.PrivateKey != "" {
+		cfg.PrivateKey = settings.PrivateKey
+	}
+	cfg.SignatureType = 0
+	cfg.Funder = ""
+	cfg.APIKey, cfg.APISecret, cfg.APIPassphrase = "", "", ""
+	if strings.TrimSpace(cfg.PrivateKey) == "" {
+		return Config{}, fmt.Errorf("未配置 POLYMARKET_PRIVATE_KEY")
+	}
+	if _, err := crypto.HexToECDSA(strings.TrimPrefix(strings.TrimSpace(cfg.PrivateKey), "0x")); err != nil {
+		return Config{}, fmt.Errorf("POLYMARKET_PRIVATE_KEY 无效: %w", err)
+	}
+	return cfg, nil
+}
+
+// maskAPIKey keeps the leading bytes of the UUID so the operator can match the
+// value against the CLOB dashboard without exposing the whole credential.
+func maskAPIKey(value string) string {
+	if len(value) <= 8 {
+		return value
+	}
+	return value[:8] + "…"
 }
 
 // EffectiveCLOBURL returns the CLOB endpoint currently used by the executor.
@@ -224,13 +372,16 @@ func validateEffectiveConfig(cfg Config, builderErr error) error {
 		return builderErr
 	}
 	key := strings.TrimSpace(cfg.PrivateKey)
+	signer := ""
 	if key != "" {
 		if !strings.HasPrefix(strings.ToLower(key), "0x") {
 			return fmt.Errorf("POLYMARKET_PRIVATE_KEY 必须以 0x 开头")
 		}
-		if _, err := crypto.HexToECDSA(strings.TrimPrefix(key, "0x")); err != nil {
+		privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(key, "0x"))
+		if err != nil {
 			return fmt.Errorf("POLYMARKET_PRIVATE_KEY 无效: %w", err)
 		}
+		signer = crypto.PubkeyToAddress(privateKey.PublicKey).Hex()
 	}
 	if cfg.SignatureType < 0 || cfg.SignatureType > 3 {
 		return fmt.Errorf("POLYMARKET_SIGNATURE_TYPE 仅支持 0、1、2、3")
@@ -241,10 +392,16 @@ func validateEffectiveConfig(cfg Config, builderErr error) error {
 	}
 	if cfg.SignatureType == 0 {
 		if funder != "" {
-			return fmt.Errorf("EOA 签名类型不需要 POLYMARKET_FUNDER；请留空，或改用 1/2/3")
+			return fmt.Errorf("EOA 签名类型不需要 POLYMARKET_FUNDER；请留空，或改用代理钱包模式（签名类型 1/2/3）")
 		}
 	} else if key != "" && funder == "" {
-		return fmt.Errorf("非 EOA 签名类型需要设置 POLYMARKET_FUNDER（代理钱包地址）")
+		return fmt.Errorf("代理钱包模式需要设置 POLYMARKET_FUNDER（Polymarket 账户里的代理 / Deposit 钱包地址）")
+	}
+	// The funder must be the smart wallet that holds the collateral, never the
+	// signer itself; otherwise orders are signed for an address that has no
+	// balance and every fill fails after the order is already on the wire.
+	if signer != "" && funder != "" && strings.EqualFold(signer, funder) {
+		return fmt.Errorf("POLYMARKET_FUNDER 不能等于私钥对应的签名地址 %s；请填写 Polymarket 账户里的代理 / Deposit 钱包地址", signer)
 	}
 	credentialCount := 0
 	for _, value := range []string{cfg.APIKey, cfg.APISecret, cfg.APIPassphrase} {
@@ -282,51 +439,58 @@ func (e *Executor) ensureClientLocked() {
 		e.initErr = err
 		return
 	}
-	funder := strings.TrimSpace(e.cfg.Funder)
-	credentialCount := 0
-	for _, value := range []string{e.cfg.APIKey, e.cfg.APISecret, e.cfg.APIPassphrase} {
-		if strings.TrimSpace(value) != "" {
-			credentialCount++
-		}
-	}
-	makerAddress := ""
-	if e.cfg.SignatureType != 0 {
-		makerAddress = funder
-	}
-	cfg := clobclient.Config{
-		PrivateKey:    strings.TrimSpace(e.cfg.PrivateKey),
-		MakerAddress:  makerAddress,
-		SignatureType: clobclient.SignatureType(e.cfg.SignatureType),
-		Host:          e.cfg.CLOBURL,
-		Timeout:       20 * time.Second,
-		QPS:           10,
-	}
-	if credentialCount == 3 {
-		cfg.Credentials = &clobclient.Credentials{
-			APIKey: e.cfg.APIKey, Secret: e.cfg.APISecret, Passphrase: e.cfg.APIPassphrase,
-		}
-	} else if e.credentials != nil {
-		// Reuse credentials derived before the client was rebuilt for a new
-		// proxy, instead of hitting the CLOB credential endpoint again.
-		cfg.Credentials = e.credentials
-	}
-	if e.cfg.Proxy != nil {
-		if e.cfg.Proxy.Config().Mode == netproxy.ModeOff {
-			// The SDK has no "ignore the environment" switch, so it gets a
-			// prebuilt client that connects directly. Reads and orders then
-			// share one pool, which only happens in this opt-out mode.
-			cfg.HTTPClient = e.cfg.Proxy.HTTPClient(20 * time.Second)
-		} else {
-			cfg.ProxyURL = e.cfg.Proxy.ProxyURL()
-		}
-	}
-	client, err := clobclient.New(cfg)
+	client, err := newClobClient(e.cfg, e.credentials)
 	if err != nil {
 		e.initErr = fmt.Errorf("初始化 Polymarket CLOB 客户端: %w", err)
 		return
 	}
 	e.client = client
 	e.signer = client.Address()
+}
+
+// newClobClient builds a CLOB client for cfg, sharing the outbound proxy with
+// market data. credentials may be nil; the client then derives them on first
+// use.
+func newClobClient(cfg Config, credentials *clobclient.Credentials) (*clobclient.Client, error) {
+	funder := strings.TrimSpace(cfg.Funder)
+	makerAddress := ""
+	if cfg.SignatureType != 0 {
+		makerAddress = funder
+	}
+	sdkCfg := clobclient.Config{
+		PrivateKey:    strings.TrimSpace(cfg.PrivateKey),
+		MakerAddress:  makerAddress,
+		SignatureType: clobclient.SignatureType(cfg.SignatureType),
+		Host:          cfg.CLOBURL,
+		Timeout:       20 * time.Second,
+		QPS:           10,
+	}
+	credentialCount := 0
+	for _, value := range []string{cfg.APIKey, cfg.APISecret, cfg.APIPassphrase} {
+		if strings.TrimSpace(value) != "" {
+			credentialCount++
+		}
+	}
+	if credentialCount == 3 {
+		sdkCfg.Credentials = &clobclient.Credentials{
+			APIKey: cfg.APIKey, Secret: cfg.APISecret, Passphrase: cfg.APIPassphrase,
+		}
+	} else if credentials != nil {
+		// Reuse credentials derived before the client was rebuilt for a new
+		// proxy, instead of hitting the CLOB credential endpoint again.
+		sdkCfg.Credentials = credentials
+	}
+	if cfg.Proxy != nil {
+		if cfg.Proxy.Config().Mode == netproxy.ModeOff {
+			// The SDK has no "ignore the environment" switch, so it gets a
+			// prebuilt client that connects directly. Reads and orders then
+			// share one pool, which only happens in this opt-out mode.
+			sdkCfg.HTTPClient = cfg.Proxy.HTTPClient(20 * time.Second)
+		} else {
+			sdkCfg.ProxyURL = cfg.Proxy.ProxyURL()
+		}
+	}
+	return clobclient.New(sdkCfg)
 }
 
 // ReloadProxy drops the cached CLOB client so the next call rebuilds its HTTP

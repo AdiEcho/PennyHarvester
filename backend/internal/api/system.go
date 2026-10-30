@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -125,6 +126,102 @@ func (h *Handler) testProxy(c *gin.Context) {
 		result["error"] = "上游返回 " + response.Status
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// testLive validates the live credentials in the request body (falling back to
+// the stored values) against the CLOB. It derives the L2 credentials and reads
+// the collateral balance, so it proves the wallet, funder and signature type
+// agree without placing an order or persisting anything.
+func (h *Handler) testLive(c *gin.Context) {
+	var request struct {
+		Live        engine.LiveSettings `json:"live"`
+		CLOBBaseURL string              `json:"clob_base_url"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "实盘凭据测试请求无效: " + err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	probe, err := h.engine.ProbeLive(ctx, request.Live, request.CLOBBaseURL)
+	if err != nil {
+		status := http.StatusOK
+		if errors.Is(err, engine.ErrInvalidSettings) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"ok": false, "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":             true,
+		"signer":         probe.Signer,
+		"maker":          probe.Maker,
+		"api_key":        probe.APIKey,
+		"source":         probe.Source,
+		"mode":           probe.Mode,
+		"signature_type": probe.SignatureType,
+		"cash":           probe.Cash,
+		"allowance":      probe.Allowance,
+		"latency_ms":     probe.LatencyMS,
+	})
+}
+
+// testRelayer verifies a Relayer API key against the relayer's key list. It
+// does not save the key and cannot place an order: relaying only broadcasts
+// wallet batches that the signer has already signed.
+func (h *Handler) testRelayer(c *gin.Context) {
+	var request struct {
+		Live          engine.LiveSettings `json:"live"`
+		CLOBBaseURL   string              `json:"clob_base_url"`
+		RelayerAPIKey string              `json:"relayer_api_key"`
+		RelayerAddr   string              `json:"relayer_address"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Relayer 凭据测试请求无效: " + err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	probe, err := h.engine.ProbeRelayer(ctx, request.Live, request.CLOBBaseURL, request.RelayerAPIKey, request.RelayerAddr)
+	if err != nil {
+		status := http.StatusOK
+		if errors.Is(err, engine.ErrInvalidSettings) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"ok": false, "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":         true,
+		"signer":     probe.Signer,
+		"address":    probe.Address,
+		"api_key":    probe.APIKey,
+		"key_count":  probe.KeyCount,
+		"latency_ms": probe.LatencyMS,
+	})
+}
+
+// discoverFunder asks the CLOB which proxy / deposit wallets belong to the
+// signer in the request body. It saves nothing and needs no funder, so the
+// settings page can fill the field for a wallet that was just connected to
+// polymarket.com.
+func (h *Handler) discoverFunder(c *gin.Context) {
+	var request struct {
+		Live        engine.LiveSettings `json:"live"`
+		CLOBBaseURL string              `json:"clob_base_url"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Funder 查询请求无效: " + err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	wallets, err := h.engine.DiscoverFunder(ctx, request.Live, request.CLOBBaseURL)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"ok": false, "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "wallets": wallets})
 }
 
 func envPresent(key string) bool {

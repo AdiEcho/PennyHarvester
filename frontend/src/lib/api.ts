@@ -6,7 +6,9 @@ import type {
   Dashboard,
   DataSourceSettings,
   Engine,
+  FunderDiscoveryResult,
   Health,
+  LiveProbeResult,
   LiveSettings,
   OpportunitiesResponse,
   OrderStatusFilter,
@@ -16,6 +18,7 @@ import type {
   PositionsResponse,
   ProxyConfig,
   ProxyTestResult,
+  RelayerProbeResult,
   Settings,
   SystemSettings,
 } from '@/types'
@@ -119,6 +122,35 @@ export const api = {
   ) => request<SystemSettings>('/system', { method: 'PUT', body, signal }),
   testProxy: (proxy: ProxyConfig, signal?: AbortSignal) =>
     request<ProxyTestResult>('/system/proxy/test', { method: 'POST', body: { proxy }, signal }),
+  testLive: (live: LiveSettings, clobBaseURL: string, signal?: AbortSignal) =>
+    request<LiveProbeResult>('/system/live/test', {
+      method: 'POST',
+      body: { live, clob_base_url: clobBaseURL },
+      signal,
+    }),
+  testRelayer: (
+    live: LiveSettings,
+    clobBaseURL: string,
+    relayerAPIKey: string,
+    relayerAddress: string,
+    signal?: AbortSignal,
+  ) =>
+    request<RelayerProbeResult>('/system/relayer/test', {
+      method: 'POST',
+      body: {
+        live,
+        clob_base_url: clobBaseURL,
+        relayer_api_key: relayerAPIKey,
+        relayer_address: relayerAddress,
+      },
+      signal,
+    }),
+  discoverFunder: (live: LiveSettings, clobBaseURL: string, signal?: AbortSignal) =>
+    request<FunderDiscoveryResult>('/system/live/funder', {
+      method: 'POST',
+      body: { live, clob_base_url: clobBaseURL },
+      signal,
+    }),
   toggleEngine: (running: boolean, signal?: AbortSignal) =>
     request<Engine>('/engine/toggle', { method: 'POST', body: { running }, signal }),
   scan: (signal?: AbortSignal, execute = false) =>

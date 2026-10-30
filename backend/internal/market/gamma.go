@@ -143,6 +143,43 @@ func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, erro
 	return markets, nil
 }
 
+// MarketsLocale fetches a batch of markets with Polymarket's localized text.
+// Gamma applies the locale to user-generated fields such as question and
+// outcomes; ids are batched to stay within the API's identifier limit.
+func (g *GammaClient) MarketsLocale(ctx context.Context, ids []string, locale string) ([]Market, error) {
+	locale = strings.TrimSpace(locale)
+	if locale == "" || len(ids) == 0 {
+		return nil, nil
+	}
+	markets := make([]Market, 0, len(ids))
+	for start := 0; start < len(ids); start += 100 {
+		end := start + 100
+		if end > len(ids) {
+			end = len(ids)
+		}
+		query := url.Values{"locale": {locale}}
+		for _, id := range ids[start:end] {
+			if id != "" {
+				query.Add("id", id)
+			}
+		}
+		if len(query["id"]) == 0 {
+			continue
+		}
+		var raw []gammaMarket
+		if err := g.getJSON(ctx, "/markets?"+query.Encode(), &raw); err != nil {
+			return nil, err
+		}
+		for _, item := range raw {
+			parsed, err := parseGammaMarket(item)
+			if err == nil {
+				markets = append(markets, parsed)
+			}
+		}
+	}
+	return markets, nil
+}
+
 func (g *GammaClient) Get(ctx context.Context, id string) (Market, error) {
 	var raw gammaMarket
 	if err := g.getJSON(ctx, "/markets/"+url.PathEscape(id), &raw); err != nil {

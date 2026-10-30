@@ -346,3 +346,28 @@ func TestProxyTestReportsFailure(t *testing.T) {
 		t.Fatalf("expected a failed probe, got %s", result.Body.String())
 	}
 }
+
+func TestLiveProbeRejectsPartialCredentials(t *testing.T) {
+	handler, _ := newSystemRouter(t)
+	response := request(t, handler, http.MethodPost, "/api/v1/system/live/test", map[string]any{
+		"live": map[string]any{"api_key": "only-key"},
+	})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("partial credentials must be rejected: %d %s", response.Code, response.Body.String())
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte("必须同时填写")) {
+		t.Fatalf("unexpected error body: %s", response.Body.String())
+	}
+}
+
+func TestRelayerProbeRejectsInvalidLiveSettings(t *testing.T) {
+	handler, _ := newSystemRouter(t)
+	response := request(t, handler, http.MethodPost, "/api/v1/system/relayer/test", map[string]any{
+		"live":            map[string]any{"api_key": "only-key"},
+		"relayer_api_key": "01967c03-b8c8-7000-8f68-8b8eaec6fd3d",
+		"relayer_address": "0x0000000000000000000000000000000000000001",
+	})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid live settings must be rejected: %d %s", response.Code, response.Body.String())
+	}
+}

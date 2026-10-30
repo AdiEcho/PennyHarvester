@@ -185,6 +185,47 @@ func (e *Engine) UpdateSystemSettings(ctx context.Context, settings SystemSettin
 	return nil
 }
 
+// ProbeLive checks candidate live credentials against the CLOB without saving
+// them or placing an order. The browser echoes masked secrets back, so they are
+// restored from the stored settings first.
+func (e *Engine) ProbeLive(ctx context.Context, settings LiveSettings, clobBaseURL string) (LiveProbe, error) {
+	settings = settings.MergeSecret(e.SystemSettings().Live).Normalize()
+	if err := settings.Validate(); err != nil {
+		return LiveProbe{}, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
+	probe, ok := e.live.(liveProbeRuntime)
+	if !ok || probe == nil {
+		return LiveProbe{}, fmt.Errorf("当前实盘执行器不支持凭据检测")
+	}
+	return probe.Probe(ctx, settings, clobBaseURL)
+}
+
+// ProbeRelayer checks a Relayer API key without submitting anything. Relayer
+// keys only authenticate gasless wallet batches; they cannot place orders.
+func (e *Engine) ProbeRelayer(ctx context.Context, settings LiveSettings, clobBaseURL, apiKey, address string) (RelayerProbe, error) {
+	settings = settings.MergeSecret(e.SystemSettings().Live).Normalize()
+	if err := settings.Validate(); err != nil {
+		return RelayerProbe{}, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
+	probe, ok := e.live.(relayerProbeRuntime)
+	if !ok || probe == nil {
+		return RelayerProbe{}, fmt.Errorf("当前实盘执行器不支持 Relayer 凭据检测")
+	}
+	return probe.ProbeRelayer(ctx, settings, clobBaseURL, apiKey, address)
+}
+
+// DiscoverFunder returns the proxy / deposit wallets the CLOB associates with
+// the configured signer. It works before a funder is set, so the settings page
+// can fill the field instead of asking the operator to copy an address.
+func (e *Engine) DiscoverFunder(ctx context.Context, settings LiveSettings, clobBaseURL string) ([]string, error) {
+	settings = settings.MergeSecret(e.SystemSettings().Live).Normalize()
+	discovery, ok := e.live.(funderDiscovery)
+	if !ok || discovery == nil {
+		return nil, fmt.Errorf("当前实盘执行器不支持自动获取 Funder")
+	}
+	return discovery.DiscoverFunder(ctx, settings, clobBaseURL)
+}
+
 // applyRuntimeSettings applies proxy, data-source and live credentials in
 // order. If a later step fails, earlier steps are rolled back to previous.
 func (e *Engine) applyRuntimeSettings(settings SystemSettings) error {
@@ -466,6 +507,40 @@ func (e *Engine) scan(ctx context.Context, execute bool) error {
 		}
 		return opportunities[i].EndDate.Before(opportunities[j].EndDate)
 	})
+
+	// Polymarket exposes Chinese question and outcome labels through the Gamma
+	// locale parameter. Fetch them only for the markets that passed the filters
+	// so the radar matches the Chinese Polymarket UI without doubling the
+	// paginated market scan. A translation failure must not break trading; the
+	// original English text remains available as a fallback.
+	if localizedProvider, ok := e.provider.(market.LocalizedProvider); ok && len(opportunities) > 0 {
+		ids := make([]string, 0, len(opportunities))
+		seen := make(map[string]bool, len(opportunities))
+		for _, opportunity := range opportunities {
+			if !seen[opportunity.MarketID] {
+				seen[opportunity.MarketID] = true
+				ids = append(ids, opportunity.MarketID)
+			}
+		}
+		if localized, localizedErr := localizedProvider.MarketsLocale(ctx, ids, "zh"); localizedErr == nil {
+			byID := make(map[string]market.Market, len(localized))
+			for _, item := range localized {
+				byID[item.ID] = item
+			}
+			for i := range opportunities {
+				localizedItem, ok := byID[opportunities[i].MarketID]
+				if !ok {
+					continue
+				}
+				if localizedItem.Question != "" {
+					opportunities[i].QuestionZH = localizedItem.Question
+				}
+				if outcome, ok := localizedItem.OutcomeByToken(opportunities[i].TokenID); ok && outcome.Name != "" {
+					opportunities[i].OutcomeZH = outcome.Name
+				}
+			}
+		}
+	}
 
 	e.mu.Lock()
 	e.opportunities = opportunities
