@@ -28,17 +28,17 @@ import { ThemeToggle } from '@/components/theme-toggle'
 export type View = 'dashboard' | 'opportunities' | 'positions' | 'orders' | 'settings'
 
 const navigation: { id: View; label: string; icon: LucideIcon; section?: string }[] = [
-  { id: 'dashboard', label: '总览', icon: LayoutDashboard, section: '工作台' },
+  { id: 'dashboard', label: '账户总览', icon: LayoutDashboard, section: '工作台' },
   { id: 'opportunities', label: '机会雷达', icon: Binoculars },
-  { id: 'positions', label: '持仓', icon: WalletCards },
+  { id: 'positions', label: '我的持仓', icon: WalletCards },
   { id: 'orders', label: '订单记录', icon: BookOpenCheck },
   { id: 'settings', label: '参数设置', icon: Settings2, section: '系统' },
 ]
 
 const viewNames: Record<View, string> = {
-  dashboard: '总览',
+  dashboard: '账户总览',
   opportunities: '机会雷达',
-  positions: '持仓',
+  positions: '我的持仓',
   orders: '订单记录',
   settings: '参数设置',
 }
@@ -52,7 +52,7 @@ function Brand() {
       </div>
       <div>
         <div className="text-[15px] font-semibold tracking-[-0.02em] text-white">PennyHarvester</div>
-        <div className="mt-0.5 text-[11px] tracking-wide text-slate-400">Polymarket 策略执行台</div>
+        <div className="mt-0.5 text-[11px] tracking-wide text-slate-400">Polymarket 尾盘策略工作台</div>
       </div>
     </div>
   )
@@ -92,14 +92,14 @@ function Navigation({ view, onNavigate }: { view: View; onNavigate: (view: View)
         <div className={cn('rounded-2xl border p-4', isLive ? 'border-amber-400/20 bg-amber-400/[0.07]' : 'border-white/[0.08] bg-white/[0.045]')}>
           <div className={cn('flex items-center gap-2', isLive ? 'text-amber-300' : 'text-brand-lime')}>
             {isLive ? <Radio className="h-4 w-4" /> : <FlaskConical className="h-4 w-4" />}
-            <span className="text-xs font-semibold">{isLive ? '真实资金环境' : '纯模拟环境'}</span>
+            <span className="text-xs font-semibold">{isLive ? '实盘交易模式' : '模拟演练模式'}</span>
           </div>
           <p className="mt-2 text-[11px] leading-5 text-slate-400">
-            {isLive ? <>订单将提交至 Polymarket CLOB<br />请自行承担资金风险</> : <>公共行情数据<br />虚拟资金 · 无真实交易</>}
+            {isLive ? <>直接连接 Polymarket 真实盘口<br />使用真实 USDC 下单交易</> : <>同步 Polymarket 实时公开行情<br />使用虚拟资金，不会真实下单</>}
           </p>
           <div className="mt-3 flex items-center gap-1.5 text-[10px] text-slate-500">
             {isLive ? <ShieldAlert className="h-3.5 w-3.5" /> : <ShieldCheck className="h-3.5 w-3.5" />}
-            {isLive ? '非投资建议，务必先小金额验证' : '研究用途，并非投资建议'}
+            {isLive ? '注意资金安全，建议先小额试跑' : '零成本验证策略，不构成投资建议'}
           </div>
         </div>
       </div>
@@ -171,17 +171,17 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
           </button>
           <div className="min-w-0 lg:hidden">
             <div className="truncate text-sm font-semibold">{viewNames[view]}</div>
-            <div className="mt-0.5 truncate text-[10px] text-slate-400">策略执行台</div>
+            <div className="mt-0.5 truncate text-[10px] text-slate-400">尾盘策略工作台</div>
           </div>
           <div className="hidden items-center gap-2 text-sm lg:flex">
-            <span className="text-slate-400">{isLive ? '实盘执行' : '模拟研究'}</span>
+            <span className="text-slate-400">{isLive ? '实盘交易' : '模拟演练'}</span>
             <span className="text-slate-300">/</span>
             <span className="font-medium text-slate-800">{viewNames[view]}</span>
           </div>
           <div className="ml-auto flex items-center gap-2 sm:gap-3">
             <div className="hidden items-center gap-2 text-xs text-slate-500 xl:flex" title={healthError || undefined}>
               <span className={cn('h-2 w-2 rounded-full', connected ? 'bg-emerald-500' : healthError ? 'bg-rose-500' : 'animate-pulse bg-slate-300')} />
-              {connected ? '服务已连接' : healthError ? '服务未连接' : '正在连接'}
+              {connected ? '服务在线' : healthError ? '连接已断开' : '正在连接…'}
             </div>
             <div className="hidden h-5 w-px bg-slate-200 xl:block" />
             <ThemeToggle />
@@ -198,9 +198,9 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
             <div className="mb-5 flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
               <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
               <div>
-                <p className="font-semibold">{account.live_configured ? '实盘账户凭据未就绪' : '实盘账户尚未配置交易凭据'}</p>
+                <p className="font-semibold">{account.live_configured ? '实盘账户还差一步即可就绪' : '实盘账户尚未配置钱包私钥'}</p>
                 <p className="mt-1 text-xs leading-5 text-rose-700">
-                  {account.live_configured ? <>{account.live_error || '请检查 Funder、CLOB API 凭据与 USDC 授权。'}</> : <>当前为默认实盘账户，但服务端没有 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code>。系统会明确拒绝实盘下单，不会静默切换到模拟账户。请在环境变量中配置钱包后重启服务。</>}
+                  {account.live_configured ? <>{account.live_error || '请检查代理钱包地址（POLYMARKET_FUNDER）、API 凭据以及 Polymarket 上的 USDC 授权状态。'}</> : <>服务端尚未配置 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code>，目前无法提交实盘订单。你可以先在右上角切换到「模拟账户」体验策略，或在服务端配置好钱包私钥后重启服务。</>}
                 </p>
               </div>
             </div>
@@ -209,8 +209,8 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
           <footer className="mt-8 border-t border-slate-200/70 pt-5">
             <RiskNotice />
             <div className="mt-4 flex flex-col gap-1 text-[11px] text-slate-400 sm:flex-row sm:items-center sm:justify-between">
-              <span>{isLive ? 'PennyHarvester · Polymarket 实盘执行' : 'PennyHarvester · Polymarket 模拟研究'}</span>
-              <span className="flex items-center gap-1.5"><Activity className="h-3 w-3" /> 数据每 20 秒在页面可见时更新</span>
+              <span>{isLive ? 'PennyHarvester · Polymarket 实盘交易模式' : 'PennyHarvester · Polymarket 模拟演练模式'}</span>
+              <span className="flex items-center gap-1.5"><Activity className="h-3 w-3" /> 页面开启时每 20 秒自动同步最新数据</span>
             </div>
           </footer>
         </main>

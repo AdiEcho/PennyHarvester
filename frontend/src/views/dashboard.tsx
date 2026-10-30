@@ -99,7 +99,7 @@ function EquityChart({ data, refreshing, mode }: { data: EquityPoint[]; refreshi
       </CardHeader>
       <CardContent>
         {data.length === 0 ? (
-          <EmptyState compact icon={TrendingUp} title="还没有权益记录" description={`后端尚未记录${label}变化。产生交易活动后，曲线会在这里出现。`} />
+          <EmptyState compact icon={TrendingUp} title="暂无资金曲线" description="完成首次市场扫描或产生交易后，这里会自动绘出你的账户净值变化趋势。" />
         ) : view === 'table' ? (
           <div className="scrollbar-thin max-h-[310px] overflow-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-sm">
@@ -149,30 +149,30 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
         icon={CircleDollarSign}
         accent
         loading={loading}
-        detail={metrics ? <span className={cn('inline-flex items-center gap-1 font-medium', pnlClass(metrics.total_return))}>{metrics.total_return >= 0 ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}{formatPercent(metrics.total_return, 2, true)} <span className="font-normal text-slate-400">较{isLive ? '实盘基准' : '初始资金'}</span></span> : '等待账户数据'}
+        detail={metrics ? <span className={cn('inline-flex items-center gap-1 font-medium', pnlClass(metrics.total_return))}>{metrics.total_return >= 0 ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}{formatPercent(metrics.total_return, 2, true)} <span className="font-normal text-slate-400">较{isLive ? '初始基准' : '初始本金'}</span></span> : '正在加载账户数据'}
       />
       <StatCard
-        label={isLive ? '策略可用现金' : '可用虚拟现金'}
+        label={isLive ? '策略可用资金' : '可用虚拟资金'}
         value={metrics ? formatCurrency(metrics.cash) : '—'}
         icon={Wallet}
         loading={loading}
         detail={metrics ? (isLive
-          ? <span>钱包 USDC <span className="font-medium tabular-nums text-slate-700">{formatCurrency(metrics.wallet_cash)}</span>{metrics.wallet_cash_stale && <span className="text-amber-600"> · 缓存/暂不可用</span>}</span>
-          : `初始虚拟资金 ${formatCurrency(metrics.initial_bankroll)}`) : '等待账户数据'}
+          ? <span>钱包 USDC <span className="font-medium tabular-nums text-slate-700">{formatCurrency(metrics.wallet_cash)}</span>{metrics.wallet_cash_stale && <span className="text-amber-600"> · 暂显上次余额</span>}</span>
+          : `初始本金 ${formatCurrency(metrics.initial_bankroll)}`) : '正在加载账户数据'}
       />
       <StatCard
-        label="累计损益"
+        label="累计盈亏"
         value={metrics ? formatCurrency(metrics.total_pnl, true) : '—'}
         icon={Banknote}
         loading={loading}
-        detail={metrics ? <span>已实现 <span className={pnlClass(metrics.realized_pnl)}>{formatCurrency(metrics.realized_pnl, true)}</span> · 未实现 <span className={pnlClass(metrics.unrealized_pnl)}>{formatCurrency(metrics.unrealized_pnl, true)}</span></span> : '等待账户数据'}
+        detail={metrics ? <span>已实现 <span className={pnlClass(metrics.realized_pnl)}>{formatCurrency(metrics.realized_pnl, true)}</span> · 浮动 <span className={pnlClass(metrics.unrealized_pnl)}>{formatCurrency(metrics.unrealized_pnl, true)}</span></span> : '正在加载账户数据'}
       />
       <StatCard
-        label="持仓敞口"
+        label="当前持仓投入"
         value={metrics ? formatCurrency(metrics.open_exposure) : '—'}
         icon={Layers3}
         loading={loading}
-        detail={metrics ? `${formatNumber(metrics.open_positions, 0)} 个未平仓头寸` : '等待账户数据'}
+        detail={metrics ? `${formatNumber(metrics.open_positions, 0)} 个持有中仓位` : '正在加载账户数据'}
       />
     </div>
   )
@@ -195,8 +195,8 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
         eyebrow={isLive ? 'LIVE PORTFOLIO' : 'PAPER PORTFOLIO'}
         title={`${account?.name || '账户'}总览`}
         description={isLive
-          ? '实盘账户：订单会发送到 Polymarket CLOB。请先用小金额验证，并确认钱包与授权状态。'
-          : '模拟账户：使用独立虚拟资金验证策略，不会发送任何真实订单。'}
+          ? '实时掌握实盘资金、持仓盈亏与系统状态。当前账户的买单会直接通过真实钱包提交到 Polymarket。'
+          : '使用独立虚拟资金同步真实行情，零成本验证策略表现，不会发出任何真实订单。'}
         actions={<Button variant="secondary" onClick={() => { dashboard.refresh(); orders.refresh() }} disabled={dashboard.isRefreshing}><RefreshCw className={cn('h-4 w-4', dashboard.isRefreshing && 'animate-spin')} />刷新数据</Button>}
       />
       {dashboard.error && data && <InlineError message={dashboard.error} onRetry={dashboard.refresh} />}
@@ -209,7 +209,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
 
         <Card>
           <CardHeader className="flex-row items-start justify-between space-y-0">
-            <div><CardTitle>运行状态</CardTitle><CardDescription className="mt-1">{isLive ? '实盘执行器与公共数据源' : '模拟引擎与公共数据源'}</CardDescription></div>
+            <div><CardTitle>系统状态</CardTitle><CardDescription className="mt-1">后台自动扫描与行情连接情况</CardDescription></div>
             {data && <Badge variant={data.engine.running ? 'success' : 'default'}><span className={cn('h-1.5 w-1.5 rounded-full', data.engine.running ? 'bg-emerald-500' : 'bg-slate-400')} />{data.engine.running ? '运行中' : '已暂停'}</Badge>}
           </CardHeader>
           <CardContent>
@@ -217,27 +217,27 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
               <div className="space-y-1">
                 <div className="flex items-center gap-3 rounded-xl bg-slate-50 p-3.5">
                   <div className={cn('rounded-lg p-2', data.engine.running ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-500')}><Activity className="h-4 w-4" /></div>
-                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">{isLive ? '实盘扫描/执行引擎' : '模拟扫描引擎'}</p><p className="mt-0.5 text-sm font-medium text-slate-800">{data.engine.running ? '自动扫描已开启' : '自动扫描已暂停'}</p></div>
-                  <span className="text-xs tabular-nums text-slate-500">{formatNumber(data.engine.scan_count, 0)} 次</span>
+                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">市场扫描引擎</p><p className="mt-0.5 text-sm font-medium text-slate-800">{data.engine.running ? '自动扫描已开启' : '自动扫描已暂停'}</p></div>
+                  <span className="text-xs tabular-nums text-slate-500">已扫 {formatNumber(data.engine.scan_count, 0)} 次</span>
                 </div>
                 <div className="flex items-center gap-3 rounded-xl p-3.5">
                   <div className={cn('rounded-lg p-2', isLive ? 'bg-amber-50 text-amber-700' : 'bg-blue-50 text-blue-600')}>{isLive ? <Radio className="h-4 w-4" /> : <Database className="h-4 w-4" />}</div>
-                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">{isLive ? '实盘账户' : '账户'}</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.account.live_maker || data.account.live_signer || undefined}>{isLive ? (data.account.live_ready ? (data.account.live_maker || data.account.live_signer || '已就绪') : data.account.live_configured ? '凭据未就绪' : '未配置私钥') : data.account.name}</p></div>
-                  {isLive && <Badge variant={data.account.live_ready ? 'success' : data.account.live_configured ? 'warning' : 'danger'}>{data.account.live_ready ? '已就绪' : data.account.live_configured ? '未就绪' : '未配置'}</Badge>}
+                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">{isLive ? '实盘钱包' : '当前账户'}</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.account.live_maker || data.account.live_signer || undefined}>{isLive ? (data.account.live_ready ? (data.account.live_maker || data.account.live_signer || '已就绪') : data.account.live_configured ? '配置待完善' : '尚未配置私钥') : data.account.name}</p></div>
+                  {isLive && <Badge variant={data.account.live_ready ? 'success' : data.account.live_configured ? 'warning' : 'danger'}>{data.account.live_ready ? '已就绪' : data.account.live_configured ? '待完善' : '未配置'}</Badge>}
                 </div>
                 <div className="flex items-center gap-3 rounded-xl p-3.5">
                   <div className="rounded-lg bg-blue-50 p-2 text-blue-600"><Database className="h-4 w-4" /></div>
-                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">行情来源</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.source.name}>{data.source.name || '未命名数据源'}</p></div>
+                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">行情数据源</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.source.name}>{data.source.name || '默认行情源'}</p></div>
                 </div>
                 <dl className="space-y-3 border-t border-slate-100 px-1 pt-4 text-xs">
                   <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-1.5 text-slate-500"><Clock3 className="h-3.5 w-3.5" />最近扫描</dt><dd className="text-slate-700">{formatDate(data.engine.last_scan_at)}</dd></div>
                   <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-1.5 text-slate-500"><RefreshCw className="h-3.5 w-3.5" />最近同步</dt><dd className="text-slate-700">{formatDate(data.source.last_sync_at)}</dd></div>
-                  <div className="flex items-center justify-between gap-4"><dt className="text-slate-500">已结算 / 胜率</dt><dd className="text-slate-700">{formatNumber(data.metrics.settled_positions, 0)} 结算{data.metrics.split_positions > 0 ? ` · ${formatNumber(data.metrics.split_positions, 0)} 分摊` : ''} / {data.metrics.settled_positions - data.metrics.split_positions > 0 ? formatPercent(data.metrics.win_rate, 1) : '—'}</dd></div>
+                  <div className="flex items-center justify-between gap-4"><dt className="text-slate-500">已结算 / 胜率</dt><dd className="text-slate-700">{formatNumber(data.metrics.settled_positions, 0)} 笔{data.metrics.split_positions > 0 ? `（含 ${formatNumber(data.metrics.split_positions, 0)} 笔平局）` : ''} / {data.metrics.settled_positions - data.metrics.split_positions > 0 ? formatPercent(data.metrics.win_rate, 1) : '—'}</dd></div>
                 </dl>
                 {isLive && !data.account.live_ready && (
                   <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
                     <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>{data.account.live_configured ? <>实盘凭据未就绪：{data.account.live_error || '请检查钱包、Funder 与 CLOB 凭据配置。'}</> : <>实盘未配置：设置 <code className="rounded bg-amber-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启。当前不会发出任何真实订单。</>}</span>
+                    <span>{data.account.live_configured ? <>实盘配置待完善：{data.account.live_error || '请检查钱包、Funder 与 API 凭据设置。'}</> : <>实盘尚未配置：在服务端设置 <code className="rounded bg-amber-100 px-1">POLYMARKET_PRIVATE_KEY</code> 并重启后即可启用实盘。</>}</span>
                   </div>
                 )}
                 {data.account.live_error && data.account.live_ready && <div className="mt-4 break-words rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs leading-5 text-rose-700"><span className="font-medium">实盘错误：</span>{data.account.live_error}</div>}
@@ -250,10 +250,10 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
 
       <Card className="mt-4 overflow-hidden">
         <CardHeader className="flex-row items-center justify-between space-y-0">
-          <div><CardTitle>最近订单</CardTitle><CardDescription className="mt-1">{isLive ? '实盘成交与结算动态' : '模拟成交与结算动态'}</CardDescription></div>
+          <div><CardTitle>最近订单</CardTitle><CardDescription className="mt-1">{isLive ? '最近的实盘买入与到期结算动态' : '最近的模拟买入与到期结算动态'}</CardDescription></div>
           <Button variant="ghost" size="sm" onClick={onOpenOrders}>查看全部<ChevronRight className="h-3.5 w-3.5" /></Button>
         </CardHeader>
-        {orders.isLoading ? <div className="space-y-3 px-6 pb-6">{[1, 2, 3].map((item) => <Skeleton key={item} className="h-12 w-full" />)}</div> : orders.error && !orders.data ? <ErrorState compact message={orders.error} onRetry={orders.refresh} /> : !orders.data?.items.length ? <EmptyState compact title="暂无订单" description={isLive ? '在机会雷达确认一笔实盘买入后，记录会显示在这里。' : '在机会雷达确认一笔模拟买入后，记录会显示在这里。'} /> : (
+        {orders.isLoading ? <div className="space-y-3 px-6 pb-6">{[1, 2, 3].map((item) => <Skeleton key={item} className="h-12 w-full" />)}</div> : orders.error && !orders.data ? <ErrorState compact message={orders.error} onRetry={orders.refresh} /> : !orders.data?.items.length ? <EmptyState compact title="还没有交易记录" description={isLive ? '去「机会雷达」挑选市场下单，或开启自动交易后，订单记录就会显示在这里。' : '去「机会雷达」试下一笔模拟单，或开启自动交易后，订单记录就会显示在这里。'} /> : (
           <>
             <div className="hidden overflow-x-auto sm:block">
               <table className="w-full min-w-[720px] text-left text-sm">
