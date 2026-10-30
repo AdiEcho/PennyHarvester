@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,9 +48,12 @@ type Executor struct {
 	base Config
 	cfg  Config
 
-	mu          sync.Mutex
-	credMu      sync.Mutex
-	client      *clobclient.Client
+	mu     sync.Mutex
+	credMu sync.Mutex
+	client *clobclient.Client
+	// readClient is a credential-free client for public reads such as the
+	// radar quote. It shares the effective CLOB URL and proxy but never signs.
+	readClient  *clobclient.Client
 	initErr     error
 	credentials *clobclient.Credentials
 	cash        engine.CashSnapshot
@@ -150,6 +155,7 @@ func (e *Executor) UpdateSettings(settings engine.LiveSettings, clobBaseURL stri
 	}
 	e.cfg = effective
 	e.client = nil
+	e.readClient = nil
 	e.initErr = nil
 	e.credentials = nil
 	e.cash = engine.CashSnapshot{}
@@ -448,6 +454,27 @@ func (e *Executor) ensureClientLocked() {
 	e.signer = client.Address()
 }
 
+// readClientLocked returns a credential-free CLOB client for public reads. It
+// uses the same CLOB URL and outbound proxy as the trading client but strips
+// every wallet field, so a radar quote works before (or without) live
+// credentials. Callers must hold e.mu.
+func (e *Executor) readClientLocked() (*clobclient.Client, error) {
+	if e.readClient != nil {
+		return e.readClient, nil
+	}
+	cfg := e.cfg
+	cfg.PrivateKey = ""
+	cfg.Funder = ""
+	cfg.SignatureType = 0
+	cfg.APIKey, cfg.APISecret, cfg.APIPassphrase = "", "", ""
+	client, err := newClobClient(cfg, nil)
+	if err != nil {
+		return nil, fmt.Errorf("初始化 Polymarket CLOB 只读客户端: %w", err)
+	}
+	e.readClient = client
+	return client, nil
+}
+
 // newClobClient builds a CLOB client for cfg, sharing the outbound proxy with
 // market data. credentials may be nil; the client then derives them on first
 // use.
@@ -502,6 +529,7 @@ func (e *Executor) ReloadProxy() {
 	}
 	e.mu.Lock()
 	e.client = nil
+	e.readClient = nil
 	e.initErr = nil
 	e.mu.Unlock()
 }
@@ -651,6 +679,120 @@ func (e *Executor) EstimateBuyFee(ctx context.Context, conditionID string, amoun
 	return feeFromSchedule(schedule, amount/price, price)
 }
 
+// Quote estimates the result of a live FAK market buy using the real CLOB ask
+// book and the market's real taker fee schedule. It mirrors MarketBuyOrder's
+// share sizing (worst touched level, tick-ceiled) but prices every level at its
+// own ask, so Notional is the expected making amount rather than the limit
+// price applied to the whole size. It never signs or submits anything. When the
+// book cannot fill the full amount it quotes the available depth and sets
+// FullyFilled=false.
+func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amount float64) (engine.LiveQuote, error) {
+	if e == nil {
+		return engine.LiveQuote{}, fmt.Errorf("未配置实盘执行器")
+	}
+	if strings.TrimSpace(tokenID) == "" || strings.TrimSpace(conditionID) == "" {
+		return engine.LiveQuote{}, fmt.Errorf("token 与 condition 必须有效")
+	}
+	if amount <= 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return engine.LiveQuote{}, fmt.Errorf("买入金额必须为有限正数")
+	}
+	e.mu.Lock()
+	client, err := e.readClientLocked()
+	e.mu.Unlock()
+	if err != nil {
+		return engine.LiveQuote{}, err
+	}
+	book, err := client.OrderBook(ctx, tokenID)
+	if err != nil {
+		return engine.LiveQuote{}, fmt.Errorf("读取实盘订单簿: %w", err)
+	}
+	schedule, err := client.FeeSchedule(ctx, conditionID)
+	if err != nil {
+		return engine.LiveQuote{}, fmt.Errorf("读取实盘手续费: %w", err)
+	}
+
+	type askLevel struct{ price, size float64 }
+	levels := make([]askLevel, 0, len(book.Asks))
+	for _, ask := range book.Asks {
+		price, priceErr := strconv.ParseFloat(ask.Price, 64)
+		size, sizeErr := strconv.ParseFloat(ask.Size, 64)
+		if priceErr != nil || sizeErr != nil || price <= 0 || price >= 1 || size <= 0 {
+			continue
+		}
+		levels = append(levels, askLevel{price: price, size: size})
+	}
+	if len(levels) == 0 {
+		return engine.LiveQuote{}, fmt.Errorf("订单簿没有可用卖盘")
+	}
+	sort.Slice(levels, func(i, j int) bool { return levels[i].price < levels[j].price })
+	available := 0.0
+	for _, level := range levels {
+		available += level.price * level.size
+	}
+
+	// MarketBuyOrder sizes shares from the worst touched level and ceils that
+	// level to the tick size. That limit price is what the risk check compares
+	// against max_price, so keep it separate from the average fill price.
+	budget := amount
+	if available < budget {
+		budget = available
+	}
+	remaining, limitPrice := budget, levels[0].price
+	for _, level := range levels {
+		limitPrice = level.price
+		remaining -= level.price * level.size
+		if remaining <= 0 {
+			break
+		}
+	}
+	tick := 0.01
+	if parsed, tickErr := strconv.ParseFloat(strings.TrimSpace(book.TickSize), 64); tickErr == nil && parsed > 0 {
+		tick = parsed
+	} else if fetched, tickErr := client.TickSize(ctx, tokenID); tickErr == nil && fetched > 0 {
+		tick = fetched
+	}
+	limitPrice = math.Ceil(limitPrice/tick) * tick
+	if limitPrice <= 0 || limitPrice >= 1 {
+		return engine.LiveQuote{}, fmt.Errorf("盘口价格 %.6f 无法成交", limitPrice)
+	}
+	const shareScale = 10_000
+	shares := math.Floor((budget/limitPrice)*shareScale) / shareScale
+	if shares <= 0 {
+		return engine.LiveQuote{}, fmt.Errorf("盘口深度不足，无法买入")
+	}
+	if minShares, minErr := strconv.ParseFloat(strings.TrimSpace(book.MinOrderSize), 64); minErr == nil && minShares > 0 && shares+1e-9 < minShares {
+		return engine.LiveQuote{}, fmt.Errorf("份额 %.4f 低于市场最小下单量 %.4f", shares, minShares)
+	}
+
+	// Walk the book again: a FAK order pays each maker its own ask, not the
+	// limit price for every share.
+	notional, unfilled := 0.0, shares
+	filled := make([]fillLevel, 0, len(levels))
+	for _, level := range levels {
+		take := math.Min(unfilled, level.size)
+		if take <= 0 {
+			break
+		}
+		notional += take * level.price
+		filled = append(filled, fillLevel{shares: take, price: level.price})
+		unfilled -= take
+	}
+	if unfilled > 1e-6 {
+		return engine.LiveQuote{}, fmt.Errorf("盘口深度不足，无法覆盖 %.4f 份", shares)
+	}
+	fillPrice := math.Round((notional/shares)*1e6) / 1e6
+	fee, err := feeFromLevels(schedule, filled)
+	if err != nil {
+		return engine.LiveQuote{}, err
+	}
+	rate, _ := feeRate(schedule)
+	return engine.LiveQuote{
+		BestAsk: levels[0].price, LimitPrice: limitPrice, FillPrice: fillPrice,
+		Shares: shares, Notional: notional, Fee: fee, FeeRate: rate,
+		AvailableNotional: available, FullyFilled: available+1e-9 >= amount,
+	}, nil
+}
+
 // LookupOrder reconciles an order by its signed digest / exchange order ID.
 func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string) (engine.LiveFill, bool, error) {
 	if orderID == "" {
@@ -695,15 +837,26 @@ func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string)
 // being read wrong, and silently booking a smaller fee would overstate PnL.
 const maxFeeRate = 0.10
 
+// feeRate validates and parses a schedule's rate. An empty rate means the
+// market charges no fee.
+func feeRate(schedule clobclient.FeeSchedule) (float64, error) {
+	raw := strings.TrimSpace(schedule.Rate.String())
+	if raw == "" {
+		return 0, nil
+	}
+	rate, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("解析手续费率 %q: %w", raw, err)
+	}
+	if rate < 0 || rate > maxFeeRate {
+		return 0, fmt.Errorf("手续费率 %q 超出 0–%.2f 范围", raw, maxFeeRate)
+	}
+	return rate, nil
+}
+
 func feeFromSchedule(schedule clobclient.FeeSchedule, shares, price float64) (float64, error) {
-	if raw := strings.TrimSpace(schedule.Rate.String()); raw != "" {
-		rate, err := strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return 0, fmt.Errorf("解析手续费率 %q: %w", raw, err)
-		}
-		if rate < 0 || rate > maxFeeRate {
-			return 0, fmt.Errorf("手续费率 %q 超出 0–%.2f 范围", raw, maxFeeRate)
-		}
+	if _, err := feeRate(schedule); err != nil {
+		return 0, err
 	}
 	raw, err := schedule.Fee(formatFloat(shares), formatFloat(price), true)
 	if err != nil {
@@ -722,6 +875,41 @@ func feeFromSchedule(schedule clobclient.FeeSchedule, shares, price float64) (fl
 		return 0, fmt.Errorf("手续费 %.8f 超过名义金额 %.8f 的 %.0f%%", fee, notional, maxFeeRate*100)
 	}
 	return fee, nil
+}
+
+// fillLevel is one ask level consumed by a FAK order.
+type fillLevel struct {
+	shares float64
+	price  float64
+}
+
+// feeFromLevels prices each swept ask as its own fill, which is how the
+// exchange charges a FAK order: every maker match pays the schedule's fee at
+// that match's price.
+func feeFromLevels(schedule clobclient.FeeSchedule, levels []fillLevel) (float64, error) {
+	if _, err := feeRate(schedule); err != nil {
+		return 0, err
+	}
+	total, notional := 0.0, 0.0
+	for _, level := range levels {
+		raw, err := schedule.Fee(formatFloat(level.shares), formatFloat(level.price), true)
+		if err != nil {
+			return 0, err
+		}
+		fee, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil {
+			return 0, fmt.Errorf("解析手续费 %q: %w", raw, err)
+		}
+		if fee < 0 {
+			return 0, fmt.Errorf("手续费不能为负: %q", raw)
+		}
+		total += fee
+		notional += level.shares * level.price
+	}
+	if notional > 0 && total > notional*maxFeeRate+1e-9 {
+		return 0, fmt.Errorf("手续费 %.8f 超过名义金额 %.8f 的 %.0f%%", total, notional, maxFeeRate*100)
+	}
+	return total, nil
 }
 
 // applyFee books the taker fee on top of the fill cost. Polymarket documents a

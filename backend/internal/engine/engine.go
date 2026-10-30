@@ -310,6 +310,68 @@ func (e *Engine) Opportunities() OpportunityList {
 	return OpportunityList{Items: items, Total: len(items), ScannedAt: e.lastSyncAt, Source: e.provider.Name()}
 }
 
+// QuoteOpportunity returns a real-data estimate for one radar row: the ask
+// book and taker fee schedule are read from the CLOB, so NetYield is net of
+// fees and uses the price a FAK order would actually pay instead of the Gamma
+// reference price. It is read-only and available for paper accounts too.
+func (e *Engine) QuoteOpportunity(ctx context.Context, tokenID string, amount float64) (OpportunityQuote, error) {
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return OpportunityQuote{}, fmt.Errorf("%w: token_id 不能为空", ErrInvalidOrder)
+	}
+	if amount < 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return OpportunityQuote{}, fmt.Errorf("%w: 金额必须为有限正数", ErrInvalidOrder)
+	}
+	settings := e.Settings()
+	if amount == 0 {
+		amount = settings.OrderSize
+	}
+
+	e.mu.RLock()
+	var target Opportunity
+	found := false
+	for _, opportunity := range e.opportunities {
+		if opportunity.TokenID == tokenID {
+			target = opportunity
+			found = true
+			break
+		}
+	}
+	e.mu.RUnlock()
+	if !found {
+		return OpportunityQuote{}, fmt.Errorf("%w: 该 token 不在当前雷达列表，请先刷新行情", ErrInvalidOrder)
+	}
+	if e.live == nil {
+		return OpportunityQuote{}, fmt.Errorf("%w: 未配置实盘执行器", ErrLiveUnavailable)
+	}
+
+	quote, err := e.live.Quote(ctx, target.TokenID, target.ConditionID, amount)
+	if err != nil {
+		return OpportunityQuote{}, fmt.Errorf("%w: 读取真实盘口或手续费失败: %v", ErrUpstream, err)
+	}
+	totalCost := quote.Notional + quote.Fee
+	payout := quote.Shares
+	netProfit := payout - totalCost
+	netYield := 0.0
+	if totalCost > 0 {
+		netYield = netProfit / totalCost
+	}
+	grossYield := 0.0
+	if quote.FillPrice > 0 && quote.FillPrice < 1 {
+		grossYield = (1 - quote.FillPrice) / quote.FillPrice
+	}
+	return OpportunityQuote{
+		TokenID: target.TokenID, ConditionID: target.ConditionID, Amount: amount,
+		BestAsk: quote.BestAsk, LimitPrice: quote.LimitPrice, FillPrice: quote.FillPrice,
+		Shares: quote.Shares, Notional: quote.Notional, FeeRate: quote.FeeRate, Fee: quote.Fee,
+		TotalCost: totalCost, Payout: payout, NetProfit: netProfit, NetYield: netYield,
+		GrossYield: grossYield, AvailableNotional: quote.AvailableNotional,
+		FullyFilled:     quote.FullyFilled,
+		ExceedsMaxPrice: quote.LimitPrice > settings.MaxPrice+1e-9, MaxPrice: settings.MaxPrice,
+		QuotedAt: time.Now().UTC(),
+	}, nil
+}
+
 func (e *Engine) Accounts(ctx context.Context) (AccountList, error) {
 	accounts, err := e.repo.ListAccounts(ctx)
 	if err != nil {

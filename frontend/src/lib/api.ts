@@ -13,6 +13,7 @@ import type {
   OpportunitiesResponse,
   OrderStatusFilter,
   OrdersResponse,
+  OpportunityQuote,
   Position,
   PositionStatus,
   PositionsResponse,
@@ -95,6 +96,12 @@ export const api = {
   dashboard: (accountId: number | undefined, signal?: AbortSignal) =>
     request<Dashboard>(withAccount('/dashboard', accountId), { signal }),
   opportunities: (signal?: AbortSignal) => request<OpportunitiesResponse>('/opportunities', { signal }),
+  quoteOpportunity: (tokenId: string, amount?: number, signal?: AbortSignal) =>
+    request<OpportunityQuote>('/opportunities/quote', {
+      method: 'POST',
+      body: amount && amount > 0 ? { token_id: tokenId, amount } : { token_id: tokenId },
+      signal,
+    }),
   positions: (accountId: number | undefined, status: PositionStatus | 'all', signal?: AbortSignal) =>
     request<PositionsResponse>(withAccount(`/positions?status=${status}`, accountId), { signal }),
   orders: (

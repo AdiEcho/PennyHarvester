@@ -144,6 +144,53 @@ func TestEstimateBuyFeeRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestQuoteReadsBookAndFeeWithoutCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/book":
+			_, _ = w.Write([]byte(`{"asset_id":"token-1","market":"condition-1","bids":[],"asks":[{"price":"0.99","size":"100"},{"price":"0.98","size":"100"}],"min_order_size":"5","tick_size":"0.01","neg_risk":false}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// A quote is public market data: it must not require a wallet key.
+	executor := New(Config{CLOBURL: server.URL})
+	if executor.Configured() {
+		t.Fatal("test executor must not be configured")
+	}
+	quote, err := executor.Quote(context.Background(), "token-1", "condition-1", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.BestAsk != 0.98 || quote.LimitPrice != 0.99 {
+		t.Fatalf("unexpected book prices: %+v", quote)
+	}
+	if !quote.FullyFilled || quote.Shares != 101.0101 {
+		t.Fatalf("unexpected full quote: %+v", quote)
+	}
+	// 100 shares fill at 0.98 and only the remainder at 0.99, so the average
+	// execution price sits just above the best ask.
+	if math.Abs(quote.FillPrice-0.9801) > 1e-6 || math.Abs(quote.Notional-98.999999) > 1e-6 {
+		t.Fatalf("every level must be priced at its own ask: %+v", quote)
+	}
+	if quote.Fee <= 0 || quote.Fee >= quote.Notional*maxFeeRate {
+		t.Fatalf("unexpected fee: %+v", quote)
+	}
+
+	partial, err := executor.Quote(context.Background(), "token-1", "condition-1", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.FullyFilled || math.Abs(partial.AvailableNotional-197) > 1e-9 {
+		t.Fatalf("a thin book must quote the available depth: %+v", partial)
+	}
+}
+
 func TestLookupOrderAddsFee(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

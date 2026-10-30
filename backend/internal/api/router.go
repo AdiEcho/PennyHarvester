@@ -42,6 +42,7 @@ func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Auth
 		protected.DELETE("/accounts/:id", h.deleteAccount)
 		protected.GET("/dashboard", h.dashboard)
 		protected.GET("/opportunities", h.opportunities)
+		protected.POST("/opportunities/quote", h.quoteOpportunity)
 		protected.POST("/scan", h.scan)
 		protected.GET("/positions", h.positions)
 		protected.GET("/orders", h.orders)
@@ -171,6 +172,25 @@ func (h *Handler) dashboard(c *gin.Context) {
 
 func (h *Handler) opportunities(c *gin.Context) {
 	c.JSON(http.StatusOK, h.engine.Opportunities())
+}
+
+// quoteOpportunity returns a real ask-book + fee-schedule estimate for one
+// radar row. It is read-only and never places an order.
+func (h *Handler) quoteOpportunity(c *gin.Context) {
+	var request struct {
+		TokenID string  `json:"token_id" binding:"required"`
+		Amount  float64 `json:"amount"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "报价字段无效: " + err.Error()})
+		return
+	}
+	quote, err := h.engine.QuoteOpportunity(c.Request.Context(), request.TokenID, request.Amount)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, quote)
 }
 
 func (h *Handler) scan(c *gin.Context) {

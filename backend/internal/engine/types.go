@@ -423,6 +423,38 @@ type Opportunity struct {
 	URL            string    `json:"url"`
 }
 
+// OpportunityQuote is a read-only, executable estimate for one radar row. It
+// walks the real CLOB ask book and applies the market's real taker fee
+// schedule, so NetYield is what a live FAK buy of Amount would return if the
+// outcome resolves in favour. It never signs or submits an order.
+type OpportunityQuote struct {
+	TokenID     string  `json:"token_id"`
+	ConditionID string  `json:"condition_id"`
+	Amount      float64 `json:"amount"`
+	BestAsk     float64 `json:"best_ask"`
+	// LimitPrice is the worst touched level, tick-ceiled. The live order is
+	// rejected when this exceeds the strategy's max_price, even if the average
+	// fill price is lower.
+	LimitPrice float64 `json:"limit_price"`
+	FillPrice  float64 `json:"fill_price"`
+	Shares     float64 `json:"shares"`
+	Notional   float64 `json:"notional"`
+	FeeRate    float64 `json:"fee_rate"`
+	Fee        float64 `json:"fee"`
+	TotalCost  float64 `json:"total_cost"`
+	Payout     float64 `json:"payout"`
+	NetProfit  float64 `json:"net_profit"`
+	NetYield   float64 `json:"net_yield"`
+	GrossYield float64 `json:"gross_yield"`
+	// AvailableNotional is the USDC depth on the ask side at quote time.
+	AvailableNotional float64 `json:"available_notional"`
+	FullyFilled       bool    `json:"fully_filled"`
+	// ExceedsMaxPrice marks a fill price the strategy's max_price would reject.
+	ExceedsMaxPrice bool      `json:"exceeds_max_price"`
+	MaxPrice        float64   `json:"max_price"`
+	QuotedAt        time.Time `json:"quoted_at"`
+}
+
 type Position struct {
 	ID            int64      `json:"id"`
 	AccountID     int64      `json:"account_id"`
@@ -570,7 +602,26 @@ type LiveExecutor interface {
 	Buy(ctx context.Context, tokenID, conditionID string, amount, maxPrice float64, onSigned func(orderID string) error) (LiveFill, error)
 	LookupOrder(ctx context.Context, orderID, conditionID string) (LiveFill, bool, error)
 	EstimateBuyFee(ctx context.Context, conditionID string, amount, price float64) (float64, error)
+	// Quote reads the real ask book and fee schedule without submitting an
+	// order. It must work without wallet credentials.
+	Quote(ctx context.Context, tokenID, conditionID string, amount float64) (LiveQuote, error)
 	Collateral(ctx context.Context) (CashSnapshot, error)
+}
+
+// LiveQuote is a read-only executable estimate returned by the CLOB adapter.
+// LimitPrice is the worst ask level a FAK buy would touch (tick-ceiled), the
+// same convention MarketBuyOrder uses when it sizes and signs the real order.
+// FillPrice is the expected average execution price after walking every level.
+type LiveQuote struct {
+	BestAsk           float64
+	LimitPrice        float64
+	FillPrice         float64
+	Shares            float64
+	Notional          float64
+	Fee               float64
+	FeeRate           float64
+	AvailableNotional float64
+	FullyFilled       bool
 }
 
 type Repository interface {

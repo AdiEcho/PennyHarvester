@@ -62,6 +62,8 @@ type fakeLive struct {
 	allowance float64
 	fee       float64
 	fill      engine.LiveFill
+	quote     engine.LiveQuote
+	quoteErr  error
 	err       error
 	lookup    map[string]engine.LiveFill
 	reloads   int
@@ -91,6 +93,9 @@ func (f *fakeLive) LookupOrder(_ context.Context, orderID, _ string) (engine.Liv
 }
 func (f *fakeLive) EstimateBuyFee(context.Context, string, float64, float64) (float64, error) {
 	return f.fee, nil
+}
+func (f *fakeLive) Quote(context.Context, string, string, float64) (engine.LiveQuote, error) {
+	return f.quote, f.quoteErr
 }
 func (f *fakeLive) Collateral(context.Context) (engine.CashSnapshot, error) {
 	return engine.CashSnapshot{Amount: f.balance, Allowance: f.allowance, At: time.Now().UTC()}, nil
@@ -162,6 +167,58 @@ func TestDefaultAccountIsLiveAndPaperIsSeparate(t *testing.T) {
 	}
 	if live != 1 || paper < 1 {
 		t.Fatalf("expected one default live and at least one paper account, got %+v", accounts.Items)
+	}
+}
+
+func TestQuoteOpportunityUsesRealBookAndFee(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"eligible": binary("eligible", 0.98, 20000, 2),
+	}}
+	live := &fakeLive{quote: engine.LiveQuote{
+		BestAsk: 0.981, LimitPrice: 0.982, FillPrice: 0.982, Shares: 101.8329, Notional: 99.9999,
+		Fee: 0.09, FeeRate: 0.05, AvailableNotional: 50000, FullyFilled: true,
+	}}
+	instance, _ := newTestEngine(t, provider, live)
+	if err := instance.ScanOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	quote, err := instance.QuoteOpportunity(context.Background(), "eligible-yes", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.Amount != 100 {
+		t.Fatalf("an empty amount should use the configured order size, got %f", quote.Amount)
+	}
+	if quote.FillPrice != 0.982 || quote.Fee != 0.09 || quote.FeeRate != 0.05 {
+		t.Fatalf("real book and fee were not carried through: %+v", quote)
+	}
+	wantCost := 99.9999 + 0.09
+	wantProfit := 101.8329 - wantCost
+	if math.Abs(quote.TotalCost-wantCost) > 1e-9 || math.Abs(quote.NetProfit-wantProfit) > 1e-9 {
+		t.Fatalf("net math must include the taker fee: %+v", quote)
+	}
+	if math.Abs(quote.NetYield-wantProfit/wantCost) > 1e-9 {
+		t.Fatalf("unexpected net yield: %f", quote.NetYield)
+	}
+	if quote.ExceedsMaxPrice {
+		t.Fatalf("0.982 is inside max_price: %+v", quote)
+	}
+
+	// A real fill above the strategy's max_price must be surfaced, because the
+	// live order would be rejected even though the reference price passed.
+	live.quote.FillPrice = 0.995
+	live.quote.LimitPrice = 0.995
+	quote, err = instance.QuoteOpportunity(context.Background(), "eligible-yes", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quote.ExceedsMaxPrice || quote.Amount != 50 {
+		t.Fatalf("a fill above max_price must be flagged: %+v", quote)
+	}
+
+	if _, err := instance.QuoteOpportunity(context.Background(), "missing-token", 0); !errors.Is(err, engine.ErrInvalidOrder) {
+		t.Fatalf("an unknown token must be rejected, got %v", err)
 	}
 }
 

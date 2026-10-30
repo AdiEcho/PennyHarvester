@@ -58,6 +58,10 @@ func testProvider() *fixtureProvider {
 }
 
 func setupRouter(t *testing.T) (http.Handler, *engine.Engine) {
+	return setupRouterWithLive(t, nil)
+}
+
+func setupRouterWithLive(t *testing.T, live engine.LiveExecutor) (http.Handler, *engine.Engine) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	repository, err := store.Open(context.Background(), ":memory:")
@@ -65,11 +69,37 @@ func setupRouter(t *testing.T) (http.Handler, *engine.Engine) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { repository.Close() })
-	instance, err := engine.New(context.Background(), repository, testProvider(), nil, nil)
+	instance, err := engine.New(context.Background(), repository, testProvider(), live, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return api.NewRouter(instance, "", api.NewAuthenticator(repository)), instance
+}
+
+// quoteLive exercises the read-only quote path without any wallet credentials.
+type quoteLive struct{}
+
+func (quoteLive) Configured() bool   { return false }
+func (quoteLive) Signer() string     { return "" }
+func (quoteLive) Maker() string      { return "" }
+func (quoteLive) ReadyError() string { return "未配置 POLYMARKET_PRIVATE_KEY" }
+func (quoteLive) Buy(context.Context, string, string, float64, float64, func(string) error) (engine.LiveFill, error) {
+	return engine.LiveFill{}, errors.New("live execution is not configured")
+}
+func (quoteLive) LookupOrder(context.Context, string, string) (engine.LiveFill, bool, error) {
+	return engine.LiveFill{}, false, nil
+}
+func (quoteLive) EstimateBuyFee(context.Context, string, float64, float64) (float64, error) {
+	return 0, errors.New("live execution is not configured")
+}
+func (quoteLive) Quote(context.Context, string, string, float64) (engine.LiveQuote, error) {
+	return engine.LiveQuote{
+		BestAsk: 0.979, LimitPrice: 0.981, FillPrice: 0.9805, Shares: 101.98,
+		Notional: 99.99, Fee: 0.09, FeeRate: 0.05, AvailableNotional: 5000, FullyFilled: true,
+	}, nil
+}
+func (quoteLive) Collateral(context.Context) (engine.CashSnapshot, error) {
+	return engine.CashSnapshot{}, nil
 }
 
 func accountID(t *testing.T, handler http.Handler, mode engine.AccountMode) int64 {
@@ -131,6 +161,31 @@ func TestHealthAndPaperOrderAPI(t *testing.T) {
 	orders := request(t, handler, http.MethodGet, "/api/v1/orders?account_id="+itoa(paperID)+"&status=all", nil)
 	if orders.Code != http.StatusOK || !bytes.Contains(orders.Body.Bytes(), []byte(`"fee":0.15`)) {
 		t.Fatalf("order fee was not exposed by the API: %d %s", orders.Code, orders.Body.String())
+	}
+}
+
+func TestOpportunityQuoteAPI(t *testing.T) {
+	handler, _ := setupRouterWithLive(t, quoteLive{})
+	scan := request(t, handler, http.MethodPost, "/api/v1/scan", nil)
+	if scan.Code != http.StatusOK {
+		t.Fatalf("scan failed: %d %s", scan.Code, scan.Body.String())
+	}
+	response := request(t, handler, http.MethodPost, "/api/v1/opportunities/quote", map[string]any{"token_id": "yes"})
+	if response.Code != http.StatusOK {
+		t.Fatalf("quote failed: %d %s", response.Code, response.Body.String())
+	}
+	var quote engine.OpportunityQuote
+	if err := json.Unmarshal(response.Body.Bytes(), &quote); err != nil {
+		t.Fatal(err)
+	}
+	if quote.Amount != 100 || quote.Fee != 0.09 || quote.LimitPrice != 0.981 || quote.NetYield <= 0 {
+		t.Fatalf("unexpected quote payload: %+v", quote)
+	}
+	// An unknown token cannot be quoted: the radar is the source of truth for
+	// which condition IDs are eligible.
+	missing := request(t, handler, http.MethodPost, "/api/v1/opportunities/quote", map[string]any{"token_id": "missing"})
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("unknown token should be rejected: %d %s", missing.Code, missing.Body.String())
 	}
 }
 

@@ -104,6 +104,31 @@ export interface OpportunitiesResponse {
   source: string
 }
 
+// OpportunityQuote is a real-data estimate: the ask book and taker fee come
+// from Polymarket's CLOB, not from the Gamma reference price.
+export interface OpportunityQuote {
+  token_id: string
+  condition_id: string
+  amount: number
+  best_ask: number
+  limit_price: number
+  fill_price: number
+  shares: number
+  notional: number
+  fee_rate: number
+  fee: number
+  total_cost: number
+  payout: number
+  net_profit: number
+  net_yield: number
+  gross_yield: number
+  available_notional: number
+  fully_filled: boolean
+  exceeds_max_price: boolean
+  max_price: number
+  quoted_at: string
+}
+
 export type PositionStatus = 'open' | 'won' | 'lost' | 'split'
 
 export interface Position {

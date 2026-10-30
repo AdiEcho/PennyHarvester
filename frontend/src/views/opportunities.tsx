@@ -14,11 +14,12 @@ import {
   ShieldAlert,
   Sparkles,
   X,
+  Zap,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
-import type { Opportunity } from '@/types'
+import type { Opportunity, OpportunityQuote } from '@/types'
 import { formatCompactCurrency, formatCurrency, formatFullDate, formatNumber, formatPercent, formatPrice } from '@/lib/format'
 import { marketOutcome, marketQuestion, marketURL, persistMarketLanguage, readMarketLanguage, type MarketLanguage } from '@/lib/market-language'
 import { cn } from '@/lib/utils'
@@ -42,7 +43,54 @@ function MarketLink({ url, compact = false }: { url: string; compact?: boolean }
   )
 }
 
-function OpportunityCard({ item, onBuy, isLive, language }: { item: Opportunity; onBuy: (item: Opportunity) => void; isLive: boolean; language: MarketLanguage }) {
+interface QuoteState {
+  quote?: OpportunityQuote
+  error?: string
+  loading?: boolean
+}
+
+function quoteAge(quotedAt: string) {
+  const time = new Date(quotedAt).getTime()
+  if (!Number.isFinite(time)) return ''
+  const seconds = Math.max(0, Math.round((Date.now() - time) / 1000))
+  if (seconds < 5) return '刚刚'
+  if (seconds < 60) return `${seconds} 秒前`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分钟前`
+  return `${Math.floor(minutes / 60)} 小时前`
+}
+
+function RealYield({ state, onQuote }: { state?: QuoteState; onQuote: () => void }) {
+  const quote = state?.quote
+  if (state?.loading && !quote) {
+    return <span className="inline-flex items-center gap-1.5 text-xs text-slate-500"><RefreshCw className="h-3.5 w-3.5 animate-spin" />读取盘口…</span>
+  }
+  if (!quote) {
+    return (
+      <div className="flex flex-col items-end gap-1">
+        <Button variant="ghost" size="sm" onClick={onQuote} title="读取 Polymarket 实时订单簿与 FeeSchedule，按参数设置中的单笔金额估算"><Zap className="h-3.5 w-3.5" />获取真实收益</Button>
+        {state?.error && <span className="line-clamp-2 max-w-[210px] text-right text-[11px] leading-4 text-rose-600" title={state.error}>{state.error}</span>}
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-col items-end gap-0.5 text-right">
+      <span className={cn('font-semibold tabular-nums', quote.net_yield > 0 ? 'text-emerald-700' : 'text-rose-700')}>{formatPercent(quote.net_yield, 2, true)}</span>
+      <span className="text-[11px] tabular-nums text-slate-500" title={`限价 ${formatPrice(quote.limit_price)} · 盘口可用 ${formatCurrency(quote.available_notional)}`}>成交均价 {formatPrice(quote.fill_price)} · 费 {formatCurrency(quote.fee)}</span>
+      <span className="flex items-center gap-1 text-[11px] tabular-nums text-slate-400">
+        {formatCurrency(quote.amount)} · {quoteAge(quote.quoted_at)}
+        <button type="button" onClick={onQuote} disabled={state?.loading} className="rounded p-0.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50" title="重新读取真实盘口与手续费" aria-label="刷新真实收益">
+          <RefreshCw className={cn('h-3 w-3', state?.loading && 'animate-spin')} />
+        </button>
+      </span>
+      {quote.exceeds_max_price && <span className="text-[11px] leading-4 text-rose-600">超出最高买入价，实盘会拒单</span>}
+      {!quote.fully_filled && <span className="text-[11px] leading-4 text-amber-600">深度不足，仅可成交 {formatCompactCurrency(quote.available_notional)}</span>}
+      {state?.error && <span className="line-clamp-2 max-w-[210px] text-right text-[11px] leading-4 text-rose-600" title={state.error}>{state.error}</span>}
+    </div>
+  )
+}
+
+function OpportunityCard({ item, onBuy, onQuote, quote, orderSize, isLive, language }: { item: Opportunity; onBuy: (item: Opportunity) => void; onQuote: () => void; quote?: QuoteState; orderSize: number | null; isLive: boolean; language: MarketLanguage }) {
   return (
     <Card className="p-4">
       <div className="flex items-start gap-3">
@@ -55,6 +103,13 @@ function OpportunityCard({ item, onBuy, isLive, language }: { item: Opportunity;
       <div className="mt-4 grid grid-cols-2 gap-3 rounded-xl bg-slate-50 p-3">
         <div><p className="text-[11px] text-slate-500">指示价格</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPrice(item.price)}</p></div>
         <div><p className="text-[11px] text-slate-500">毛收益</p><p className="mt-1 text-sm font-semibold tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</p></div>
+      </div>
+      <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 p-3">
+        <div>
+          <p className="text-[11px] text-slate-500">真实收益（含手续费）</p>
+          <p className="text-[10px] text-slate-400">按单笔 {orderSize ? formatCurrency(orderSize) : '金额'} · 实时盘口 + FeeSchedule</p>
+        </div>
+        <RealYield state={quote} onQuote={onQuote} />
       </div>
       <div className="mt-3 flex items-center justify-between gap-3">
         <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-500"><span>流动性 {formatCompactCurrency(item.liquidity)}</span><span>{formatNumber(item.days_to_end, 1)} 天 · {formatFullDate(item.end_date)} 到期</span></div>
@@ -76,8 +131,11 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const [scanning, setScanning] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [orderError, setOrderError] = useState('')
+  const [quotes, setQuotes] = useState<Record<string, QuoteState>>({})
+  const [orderSize, setOrderSize] = useState<number | null>(null)
   const scanController = useRef<AbortController | null>(null)
   const orderController = useRef<AbortController | null>(null)
+  const quoteControllers = useRef<Map<string, AbortController>>(new Map())
   const { toast } = useToast()
   const fetchOpportunities = useCallback((signal: AbortSignal) => api.opportunities(signal), [])
   const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchOpportunities)
@@ -85,11 +143,21 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   useEffect(() => () => {
     scanController.current?.abort()
     orderController.current?.abort()
+    quoteControllers.current.forEach((controller) => controller.abort())
+    quoteControllers.current.clear()
   }, [])
 
   useEffect(() => {
     persistMarketLanguage(marketLanguage)
   }, [marketLanguage])
+
+  // The real-yield button quotes the configured single-order size. Show it so
+  // the amount is not mistaken for a hardcoded value; it is edited in 参数设置.
+  useEffect(() => {
+    const controller = new AbortController()
+    api.settings(controller.signal).then((settings) => setOrderSize(settings.order_size)).catch(() => {})
+    return () => controller.abort()
+  }, [])
 
   const filtered = useMemo(() => {
     const keyword = query.trim().toLocaleLowerCase()
@@ -101,6 +169,24 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
 
   const numericAmount = Number(amount)
   const validAmount = amount.trim() !== '' && Number.isFinite(numericAmount) && numericAmount > 0
+  const selectedQuote = selected ? quotes[selected.token_id]?.quote : undefined
+
+  const fetchQuote = async (item: Opportunity, quoteAmount?: number) => {
+    quoteControllers.current.get(item.token_id)?.abort()
+    const controller = new AbortController()
+    quoteControllers.current.set(item.token_id, controller)
+    setQuotes((current) => ({ ...current, [item.token_id]: { ...current[item.token_id], loading: true, error: undefined } }))
+    try {
+      const quote = await api.quoteOpportunity(item.token_id, quoteAmount, controller.signal)
+      if (!quoteAmount) setOrderSize(quote.amount)
+      setQuotes((current) => ({ ...current, [item.token_id]: { quote } }))
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === 'AbortError') return
+      setQuotes((current) => ({ ...current, [item.token_id]: { ...current[item.token_id], loading: false, error: caught instanceof Error ? caught.message : '获取真实收益失败，请重试。' } }))
+    } finally {
+      if (quoteControllers.current.get(item.token_id) === controller) quoteControllers.current.delete(item.token_id)
+    }
+  }
 
   const openBuy = (item: Opportunity) => {
     setSelected(item)
@@ -170,7 +256,8 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           </div>
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-slate-100 pt-3 text-[11px] text-slate-400">
-          <span>毛收益 = (1 − 价格) / 价格</span>
+          <span>毛收益 = (1 − 价格) / 价格（未计手续费）</span>
+          <span>真实收益 = 实时盘口成交价 + 真实手续费，按「参数设置 → 单笔金额」{orderSize ? `（${formatCurrency(orderSize)}）` : ''}估算</span>
           <span>到期时间按本地时区显示</span>
           <span>立即扫描仅刷新行情，不会自动下单</span>
           <span>{marketLanguage === 'zh' ? '市场问题与方向优先使用 Polymarket 中文文案' : '市场问题与方向显示 Polymarket 英文原文'}</span>
@@ -186,9 +273,9 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
         <>
           <Card className="hidden overflow-hidden lg:block">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[920px] text-left text-sm">
+              <table className="w-full min-w-[1080px] text-left text-sm">
                 <thead className="border-b border-slate-100 bg-slate-50/70 text-xs text-slate-500">
-                  <tr><th className="px-5 py-3.5 font-medium">市场 / 方向</th><th className="px-4 py-3.5 text-right font-medium">指示价格</th><th className="px-4 py-3.5 text-right font-medium">毛收益</th><th className="px-4 py-3.5 text-right font-medium">流动性</th><th className="px-4 py-3.5 text-right font-medium">到期</th><th className="px-5 py-3.5 text-right font-medium">操作</th></tr>
+                  <tr><th className="px-5 py-3.5 font-medium">市场 / 方向</th><th className="px-4 py-3.5 text-right font-medium">指示价格</th><th className="px-4 py-3.5 text-right font-medium">毛收益</th><th className="px-4 py-3.5 text-right font-medium">真实收益<p className="mt-0.5 text-[10px] font-normal text-slate-400">按单笔 {orderSize ? formatCurrency(orderSize) : '金额'}</p></th><th className="px-4 py-3.5 text-right font-medium">流动性</th><th className="px-4 py-3.5 text-right font-medium">到期</th><th className="px-5 py-3.5 text-right font-medium">操作</th></tr>
                 </thead>
                 <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>
                   {filtered.map((item) => (
@@ -196,6 +283,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
                       <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex items-center gap-2"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
                       <td className="px-4 py-4 text-right font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</td>
                       <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
+                      <td className="px-4 py-4 text-right"><RealYield state={quotes[item.token_id]} onQuote={() => fetchQuote(item)} /></td>
                       <td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatCompactCurrency(item.liquidity)}</td>
                       <td className="px-4 py-4 text-right"><span className="tabular-nums text-slate-700">{formatNumber(item.days_to_end, 1)} 天</span><p className="mt-1 whitespace-nowrap text-[11px] tabular-nums text-slate-400">{formatFullDate(item.end_date)}</p></td>
                       <td className="px-5 py-4"><div className="flex items-center justify-end gap-1"><MarketLink url={marketURL(item.url, marketLanguage)} compact /><Button size="sm" variant="secondary" className={isLive ? 'text-rose-700 group-hover:border-rose-200 group-hover:bg-rose-50 group-hover:text-rose-800' : 'group-hover:border-emerald-200 group-hover:bg-emerald-50 group-hover:text-emerald-800'} onClick={() => openBuy(item)}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button></div></td>
@@ -205,7 +293,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               </table>
             </div>
           </Card>
-          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} onBuy={openBuy} isLive={isLive} language={marketLanguage} />)}</div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} onBuy={openBuy} onQuote={() => fetchQuote(item)} quote={quotes[item.token_id]} orderSize={orderSize} isLive={isLive} language={marketLanguage} />)}</div>
         </>
       )}
 
@@ -226,6 +314,22 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               <div className="relative"><CircleDollarSign className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><Input id="paper-amount" type="number" min="0.01" step="any" inputMode="decimal" autoFocus value={amount} onChange={(event) => setAmount(event.target.value)} className="h-11 pl-9 text-base" placeholder="0.00" aria-describedby="amount-help" /></div>
               <div className="mt-2 flex items-center justify-between gap-4 text-xs" id="amount-help"><span className="text-slate-500">预计份额（{isLive ? '按指示价估算，实际以盘口为准' : '未计费用与滑点'}）</span><span className="font-medium tabular-nums text-slate-700">{validAmount && selected.price > 0 ? formatNumber(numericAmount / selected.price, 4) : '—'}</span></div>
               {amount && !validAmount && <p className="mt-2 text-xs text-rose-600">请输入大于 0 的有效金额。</p>}
+            </div>
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-medium text-emerald-900">真实净收益（实盘盘口 + FeeSchedule）</span>
+                <button type="button" onClick={() => fetchQuote(selected, validAmount ? numericAmount : undefined)} disabled={quotes[selected.token_id]?.loading} className="rounded-md px-1.5 py-0.5 text-[11px] font-medium text-emerald-800 underline-offset-2 transition hover:bg-emerald-100 hover:underline disabled:opacity-50">
+                  {quotes[selected.token_id]?.loading ? '读取中…' : `按 ${validAmount ? formatCurrency(numericAmount) : orderSize ? `单笔 ${formatCurrency(orderSize)}` : '单笔金额'} 获取`}
+                </button>
+              </div>
+              {selectedQuote ? <>
+                <div className="mt-1.5 flex items-baseline justify-between gap-3"><span className="text-sm font-semibold tabular-nums text-emerald-800">{formatPercent(selectedQuote.net_yield, 2, true)}</span><span className="text-[11px] tabular-nums text-emerald-800/80">净利 {formatCurrency(selectedQuote.net_profit)}</span></div>
+                <p className="mt-1 text-[11px] leading-5 text-emerald-800/80">按 {formatCurrency(selectedQuote.amount)} · 成交均价 {formatPrice(selectedQuote.fill_price)} · 限价 {formatPrice(selectedQuote.limit_price)} · 手续费 {formatCurrency(selectedQuote.fee)} · 总成本 {formatCurrency(selectedQuote.total_cost)}</p>
+                {selectedQuote.exceeds_max_price && <p className="mt-1 text-[11px] leading-5 text-rose-700">盘口成交价超过最高买入价 {formatPrice(selectedQuote.max_price)}，实盘会被拒单。</p>}
+                {!selectedQuote.fully_filled && <p className="mt-1 text-[11px] leading-5 text-amber-700">盘口深度仅 {formatCompactCurrency(selectedQuote.available_notional)}，无法一次成交该金额。</p>}
+                {!isLive && <p className="mt-1 text-[11px] leading-5 text-emerald-800/60">模拟账户仍按参数设置中的滑点与费率记账，此处仅供对照实盘口径。</p>}
+              </> : <p className="mt-1 text-[11px] leading-5 text-emerald-800/70">读取 Polymarket 实时订单簿与 taker 手续费后显示，不会提交订单。</p>}
+              {quotes[selected.token_id]?.error && <p className="mt-1 break-words text-[11px] leading-5 text-rose-700">报价失败：{quotes[selected.token_id]?.error}</p>}
             </div>
             <RiskNotice compact />
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 p-3.5 transition hover:bg-slate-50">

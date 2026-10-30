@@ -427,7 +427,7 @@ export function SettingsView() {
           <SettingsSection icon={ShieldCheck} title="资金与风控" description="风控上限同时作用于实盘与模拟账户；初始资金仅用于模拟账户。">
             <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
               <NumberField id="initial_bankroll" label="新建模拟账户初始资金" description="只用于之后创建的模拟账户；已有账户使用创建时的基准，不会因修改此值而重算历史。" value={draft.initial_bankroll} unit="USD" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
-              <NumberField id="order_size" label="单笔金额" description="每次自动买入的目标名义金额。" value={draft.order_size} unit="USD" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
+              <NumberField id="order_size" label="单笔金额" description="每次自动买入的目标名义金额；机会雷达的「真实收益」也按此金额报价。" value={draft.order_size} unit="USD" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
               <NumberField id="max_position" label="单市场持仓上限" description="不得低于单笔金额。" value={draft.max_position} unit="USD" min={0} error={errors.max_position} onChange={(value) => update('max_position', value)} />
               <NumberField id="max_exposure" label="总敞口上限" description="全部未平仓头寸的风险预算上限。" value={draft.max_exposure} unit="USD" min={0} error={errors.max_exposure} onChange={(value) => update('max_exposure', value)} />
             </div>
