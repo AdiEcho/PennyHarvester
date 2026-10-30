@@ -50,13 +50,12 @@ function OpportunityCard({ item, onBuy, isLive }: { item: Opportunity; onBuy: (i
         </div>
         <MarketLink url={item.url} compact />
       </div>
-      <div className="mt-4 grid grid-cols-3 gap-3 rounded-xl bg-slate-50 p-3">
+      <div className="mt-4 grid grid-cols-2 gap-3 rounded-xl bg-slate-50 p-3">
         <div><p className="text-[11px] text-slate-500">指示价格</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPrice(item.price)}</p></div>
         <div><p className="text-[11px] text-slate-500">毛收益</p><p className="mt-1 text-sm font-semibold tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</p></div>
-        <div><p className="text-[11px] text-slate-500">理论年化</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPercent(item.annualized_yield, 1)}</p></div>
       </div>
       <div className="mt-3 flex items-center justify-between gap-3">
-        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-500"><span>流动性 {formatCompactCurrency(item.liquidity)}</span><span>{formatNumber(item.days_to_end, 1)} 天后到期</span></div>
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-500"><span>流动性 {formatCompactCurrency(item.liquidity)}</span><span>{formatNumber(item.days_to_end, 1)} 天 · {formatFullDate(item.end_date)} 到期</span></div>
         <Button size="sm" variant={isLive ? 'danger' : 'primary'} onClick={() => onBuy(item)}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button>
       </div>
     </Card>
@@ -165,7 +164,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-slate-100 pt-3 text-[11px] text-slate-400">
           <span>毛收益 = (1 − 价格) / 价格</span>
-          <span>年化为理论换算，并非收益承诺</span>
+          <span>到期时间按本地时区显示</span>
           <span>立即扫描仅刷新行情，不会自动下单</span>
           {data && <span className="sm:ml-auto">来源 {data.source} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
         </div>
@@ -179,9 +178,9 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
         <>
           <Card className="hidden overflow-hidden lg:block">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1020px] text-left text-sm">
+              <table className="w-full min-w-[920px] text-left text-sm">
                 <thead className="border-b border-slate-100 bg-slate-50/70 text-xs text-slate-500">
-                  <tr><th className="px-5 py-3.5 font-medium">市场 / 方向</th><th className="px-4 py-3.5 text-right font-medium">指示价格</th><th className="px-4 py-3.5 text-right font-medium">毛收益</th><th className="px-4 py-3.5 text-right font-medium">理论年化</th><th className="px-4 py-3.5 text-right font-medium">流动性</th><th className="px-4 py-3.5 text-right font-medium">到期</th><th className="px-5 py-3.5 text-right font-medium">操作</th></tr>
+                  <tr><th className="px-5 py-3.5 font-medium">市场 / 方向</th><th className="px-4 py-3.5 text-right font-medium">指示价格</th><th className="px-4 py-3.5 text-right font-medium">毛收益</th><th className="px-4 py-3.5 text-right font-medium">流动性</th><th className="px-4 py-3.5 text-right font-medium">到期</th><th className="px-5 py-3.5 text-right font-medium">操作</th></tr>
                 </thead>
                 <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>
                   {filtered.map((item) => (
@@ -189,9 +188,8 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
                       <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={item.question}>{item.question}</p><div className="mt-1.5 flex items-center gap-2"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{item.outcome}</Badge><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
                       <td className="px-4 py-4 text-right font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</td>
                       <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
-                      <td className="px-4 py-4 text-right tabular-nums text-slate-700">{formatPercent(item.annualized_yield, 1)}</td>
                       <td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatCompactCurrency(item.liquidity)}</td>
-                      <td className="px-4 py-4 text-right"><span className="tabular-nums text-slate-700">{formatNumber(item.days_to_end, 1)} 天</span><p className="mt-1 text-[11px] text-slate-400">{formatFullDate(item.end_date).slice(0, 10)}</p></td>
+                      <td className="px-4 py-4 text-right"><span className="tabular-nums text-slate-700">{formatNumber(item.days_to_end, 1)} 天</span><p className="mt-1 whitespace-nowrap text-[11px] tabular-nums text-slate-400">{formatFullDate(item.end_date)}</p></td>
                       <td className="px-5 py-4"><div className="flex items-center justify-end gap-1"><MarketLink url={item.url} compact /><Button size="sm" variant="secondary" className={isLive ? 'text-rose-700 group-hover:border-rose-200 group-hover:bg-rose-50 group-hover:text-rose-800' : 'group-hover:border-emerald-200 group-hover:bg-emerald-50 group-hover:text-emerald-800'} onClick={() => openBuy(item)}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button></div></td>
                     </tr>
                   ))}
@@ -232,7 +230,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               <Button variant="secondary" onClick={() => setSelected(null)} disabled={submitting}>取消</Button>
               <Button variant={isLive ? 'danger' : 'primary'} onClick={submitOrder} loading={submitting} disabled={!validAmount || !confirmed || !liveReady}><CheckCircle2 className="h-4 w-4" />{submitting ? (isLive ? '正在提交实盘订单…' : '正在记录…') : `${isLive ? '确认实盘买入' : '确认模拟买入'}${validAmount ? ` ${formatCurrency(numericAmount)}` : ''}`}</Button>
             </div>
-            <div className="-mt-2 flex items-center justify-center gap-1.5 text-[11px] text-slate-400"><CalendarDays className="h-3 w-3" />市场到期：{formatFullDate(selected.end_date)}<ArrowUpRight className="h-3 w-3" /></div>
+            <div className="-mt-2 flex items-center justify-center gap-1.5 text-[11px] text-slate-400"><CalendarDays className="h-3 w-3" />市场到期：{formatFullDate(selected.end_date)}（本地时间）<ArrowUpRight className="h-3 w-3" /></div>
           </>}
         </DialogContent>
       </Dialog>

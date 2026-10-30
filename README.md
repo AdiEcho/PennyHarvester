@@ -105,7 +105,6 @@
 - 手续费在成交时按 USDC 从钱包额外扣除，**不会减少成交份额**；系统把费用累加进持仓 `Cost`，并同时记录在 `positions.fee` 与 `orders.fee`，因此已实现/未实现盈亏与「累计盈亏」卡片都已含费。
 - 预估或计算失败时**不会按 0 费记账**：费率超出 0–0.10、费用超过名义金额 10%、或读取 `FeeSchedule` 失败，都会拒绝下单/将对账中的订单保持待确认状态。
 - 费率口径（2026-10-30 核对）：[Fees](https://docs.polymarket.com/trading/fees) 列为 taker-only、按类别费率、5 位小数向下取整；[Resolution](https://docs.polymarket.com/concepts/resolution) 与 [Manage Positions](https://docs.polymarket.com/trading/positions/manage) 明确获胜份额按 1:1 兑付、赎回不收取费用。
-- 界面展示的「年化收益率」为基于当前剩余天数的**简单年化理论值**，并非复利预测，也不构成任何收益承诺。
 
 ### 默认策略参数
 

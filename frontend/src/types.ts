@@ -90,7 +90,6 @@ export interface Opportunity {
   end_date: string
   days_to_end: number
   gross_yield: number
-  annualized_yield: number
   url: string
 }
 
