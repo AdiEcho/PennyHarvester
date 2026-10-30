@@ -17,6 +17,7 @@ import (
 type fakeProvider struct {
 	markets   map[string]market.Market
 	localized map[string]market.Market
+	eventTags map[string][]market.Tag
 	err       error
 }
 
@@ -52,6 +53,16 @@ func (f *fakeProvider) MarketsLocale(_ context.Context, ids []string, locale str
 	for _, id := range ids {
 		if item, ok := f.localized[id]; ok {
 			items = append(items, item)
+		}
+	}
+	return items, nil
+}
+
+func (f *fakeProvider) EventTags(_ context.Context, ids []string) (map[string][]market.Tag, error) {
+	items := make(map[string][]market.Tag, len(ids))
+	for _, id := range ids {
+		if tags, ok := f.eventTags[id]; ok {
+			items[id] = tags
 		}
 	}
 	return items, nil
@@ -277,6 +288,159 @@ func TestScanFiltersAndSettlesPaperPosition(t *testing.T) {
 	}
 	if dashboard.Metrics.Cash <= 10000 || dashboard.Metrics.OpenPositions != 0 || dashboard.Metrics.WinRate != 1 {
 		t.Fatalf("unexpected metrics: %+v", dashboard.Metrics)
+	}
+}
+
+func TestScanAppliesSportsPolicyAndVolatilityGuard(t *testing.T) {
+	start := time.Now().UTC().Add(time.Hour)
+	sportsGame := binary("sports-game", 0.98, 20000, 2)
+	sportsGame.EventID = "e-sports"
+	sportsGame.GameStartTime = &start
+	sportsFuture := binary("sports-future", 0.98, 20000, 2)
+	sportsFuture.EventID = "e-sports-future"
+	politics := binary("politics", 0.98, 20000, 2)
+	politics.EventID = "e-politics"
+	volatile := binary("volatile", 0.98, 20000, 2)
+	volatile.EventID = "e-politics"
+	change := 0.20
+	volatile.PriceChange24h = &change
+
+	provider := &fakeProvider{
+		markets: map[string]market.Market{
+			"sports-game": sportsGame, "sports-future": sportsFuture,
+			"politics": politics, "volatile": volatile,
+		},
+		eventTags: map[string][]market.Tag{
+			"e-sports":        {{Slug: "sports"}},
+			"e-sports-future": {{Slug: "sports"}},
+			"e-politics":      {{Slug: "politics"}},
+		},
+	}
+	instance, _ := newTestEngine(t, provider, nil)
+	if err := instance.ScanOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The default policy removes game markets (overtime risk) but keeps
+	// season-long sports futures. The 24h volatility guard removes the
+	// volatile market before categories are resolved.
+	opportunities := instance.Opportunities()
+	if opportunities.Total != 2 {
+		t.Fatalf("expected sports future and politics, got %+v", opportunities.Items)
+	}
+	byID := map[string]engine.Opportunity{}
+	for _, item := range opportunities.Items {
+		byID[item.MarketID] = item
+	}
+	if _, ok := byID["sports-game"]; ok {
+		t.Fatalf("sports game should be excluded by default: %+v", byID)
+	}
+	if _, ok := byID["volatile"]; ok {
+		t.Fatalf("volatile market should be excluded: %+v", byID)
+	}
+	if item := byID["sports-future"]; item.Category != "sports" || item.SportsGame || item.OvertimeRisk {
+		t.Fatalf("sports future flags are wrong: %+v", item)
+	}
+	if item := byID["politics"]; item.Category != "politics" || item.SportsGame {
+		t.Fatalf("politics flags are wrong: %+v", item)
+	}
+
+	settings := instance.Settings()
+	settings.SportsPolicy = engine.SportsPolicyExcludeAll
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.ScanOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	opportunities = instance.Opportunities()
+	if opportunities.Total != 1 || opportunities.Items[0].MarketID != "politics" {
+		t.Fatalf("exclude_all should leave only politics, got %+v", opportunities.Items)
+	}
+
+	settings.SportsPolicy = engine.SportsPolicyAllow
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.ScanOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	opportunities = instance.Opportunities()
+	if opportunities.Total != 3 {
+		t.Fatalf("allow should keep all non-volatile markets, got %+v", opportunities.Items)
+	}
+	for _, item := range opportunities.Items {
+		if item.MarketID == "sports-game" && (!item.SportsGame || !item.OvertimeRisk) {
+			t.Fatalf("sports game must be flagged when allowed: %+v", item)
+		}
+	}
+}
+
+func TestPlaceOrderRejectsSportsGameByDefault(t *testing.T) {
+	start := time.Now().UTC().Add(time.Hour)
+	item := binary("sports-game", 0.98, 20000, 2)
+	item.EventID = "e-sports"
+	item.GameStartTime = &start
+	provider := &fakeProvider{
+		markets:   map[string]market.Market{"sports-game": item},
+		eventTags: map[string][]market.Tag{"e-sports": {{Slug: "sports"}}},
+	}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{
+		MarketID: "sports-game", Outcome: "Yes", TokenID: "sports-game-yes", Amount: 100,
+	}); !errors.Is(err, engine.ErrInvalidOrder) {
+		t.Fatalf("manual sports game order must be rejected by default, got %v", err)
+	}
+
+	settings := instance.Settings()
+	settings.SportsPolicy = engine.SportsPolicyAllow
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{
+		MarketID: "sports-game", Outcome: "Yes", TokenID: "sports-game-yes", Amount: 100,
+	}); err != nil {
+		t.Fatalf("manual order should be allowed when policy is allow, got %v", err)
+	}
+}
+
+func TestScanUsesMarketTagsDirectly(t *testing.T) {
+	item := binary("tagged", 0.98, 20000, 2)
+	item.EventID = "e-tagged"
+	item.Tags = []market.Tag{{ID: "21", Label: "Crypto", Slug: "crypto"}}
+	provider := &fakeProvider{markets: map[string]market.Market{"tagged": item}}
+	instance, _ := newTestEngine(t, provider, nil)
+	if err := instance.ScanOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	opportunities := instance.Opportunities()
+	if opportunities.Total != 1 || opportunities.Items[0].Category != "crypto" {
+		t.Fatalf("market tags should classify without an event request: %+v", opportunities.Items)
+	}
+}
+
+func TestSettingsValidateCategoryAndVolatility(t *testing.T) {
+	settings := engine.DefaultSettings()
+	if settings.DefaultCategory != engine.RadarCategoryNonSports || settings.SportsPolicy != engine.SportsPolicyExcludeGames {
+		t.Fatalf("unexpected radar defaults: %+v", settings)
+	}
+	if err := settings.Validate(); err != nil {
+		t.Fatalf("default settings must be valid: %v", err)
+	}
+	settings.DefaultCategory = "not-a-category"
+	if err := settings.Validate(); err == nil {
+		t.Fatal("invalid default category must be rejected")
+	}
+	settings = engine.DefaultSettings()
+	settings.SportsPolicy = "not-a-policy"
+	if err := settings.Validate(); err == nil {
+		t.Fatal("invalid sports policy must be rejected")
+	}
+	settings = engine.DefaultSettings()
+	settings.MaxPriceChange24h = 1.5
+	if err := settings.Validate(); err == nil {
+		t.Fatal("out-of-range volatility limit must be rejected")
 	}
 }
 

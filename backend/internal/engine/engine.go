@@ -105,7 +105,7 @@ func (e *Engine) run(ctx context.Context) {
 	defer close(e.done)
 	for {
 		if e.isRunning() {
-			scanCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			scanCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			_ = e.Scan(scanCtx)
 			cancel()
 		}
@@ -132,6 +132,15 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	// The version is owned by the server so a client payload can never roll the
 	// one-time fee migration back or trigger it again.
 	settings.FeeModelVersion = FeeModelVersion
+	// Older API clients do not know the category fields. Treat an omitted value
+	// as "use the built-in default" instead of rejecting the whole payload.
+	defaults := DefaultSettings()
+	if settings.DefaultCategory == "" {
+		settings.DefaultCategory = defaults.DefaultCategory
+	}
+	if settings.SportsPolicy == "" {
+		settings.SportsPolicy = defaults.SportsPolicy
+	}
 	if err := settings.Validate(); err != nil {
 		return err
 	}
@@ -563,6 +572,10 @@ func (e *Engine) scan(ctx context.Context, execute bool) error {
 			}
 		}
 	}
+	// Resolve categories and sports risk only for candidates that already
+	// passed the price/liquidity/volatility filters. This also removes sports
+	// game markets before the localization request, which keeps scans cheap.
+	opportunities = e.classifyOpportunities(ctx, opportunities, byID, settings)
 	sort.Slice(opportunities, func(i, j int) bool {
 		if opportunities[i].EndDate.Equal(opportunities[j].EndDate) {
 			return opportunities[i].GrossYield > opportunities[j].GrossYield
@@ -894,8 +907,12 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 	if err != nil {
 		return Position{}, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
-	opportunity, err := findOpportunity(item, request.Outcome, request.TokenID, e.Settings(), time.Now().UTC())
+	settings := e.Settings()
+	opportunity, err := findOpportunity(item, request.Outcome, request.TokenID, settings, time.Now().UTC())
 	if err != nil {
+		return Position{}, err
+	}
+	if err := enforceSportsPolicy(e.classifyMarket(ctx, item), settings.SportsPolicy); err != nil {
 		return Position{}, err
 	}
 	if account.Mode == AccountModeLive {

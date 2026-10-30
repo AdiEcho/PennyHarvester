@@ -33,6 +33,91 @@ func TestGammaClientParsesEncodedArrays(t *testing.T) {
 	}
 }
 
+func TestGammaClientListOpenUsesBalancedViews(t *testing.T) {
+	orders := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		orders[r.URL.Query().Get("order")] = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+	client := NewGammaClient(server.URL, nil)
+	if _, err := client.ListOpen(context.Background(), 30); err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range []string{"endDate", "volume24hr", "liquidity"} {
+		if !orders[order] {
+			t.Fatalf("ListOpen did not request the %s view: %v", order, orders)
+		}
+	}
+}
+
+func TestGammaClientParsesCategorySignals(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("include_tag") != "true" {
+			t.Errorf("include_tag missing: %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{
+			"id":"42","conditionId":"condition-42","question":"Will the Mavericks beat the Grizzlies?",
+			"slug":"nba-dal-mem-2026-12-04","outcomes":["Yes","No"],"outcomePrices":["0.98","0.02"],
+			"clobTokenIds":["token-yes","token-no"],"endDate":"2099-01-01T00:00:00Z",
+			"gameStartTime":"2026-12-04 00:00:00+00","oneDayPriceChange":-0.04,
+			"tags":[{"id":"1","label":"Sports","slug":"sports"},{"id":"28","label":"Basketball","slug":"basketball"}],
+			"liquidity":"25000","volume":"90000","active":true,"closed":false,
+			"events":[{"id":"event-42","slug":"nba-dal-mem-2026-12-04","title":"Mavericks vs. Grizzlies"}]
+		}]`))
+	}))
+	defer server.Close()
+	client := NewGammaClient(server.URL, nil)
+	items, err := client.ListOpen(context.Background(), 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("unexpected items: %+v", items)
+	}
+	item := items[0]
+	if item.EventID != "event-42" || item.EventTitle != "Mavericks vs. Grizzlies" {
+		t.Fatalf("event metadata not parsed: %+v", item)
+	}
+	if len(item.Tags) != 2 || item.Tags[0].Slug != "sports" || item.Tags[1].Slug != "basketball" {
+		t.Fatalf("market tags not parsed: %+v", item.Tags)
+	}
+	if item.GameStartTime == nil || !item.GameStartTime.Equal(time.Date(2026, 12, 4, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("game start time not parsed: %+v", item.GameStartTime)
+	}
+	if item.PriceChange24h == nil || *item.PriceChange24h != -0.04 {
+		t.Fatalf("24h price change not parsed: %+v", item.PriceChange24h)
+	}
+}
+
+func TestGammaClientEventTagsBatchesIDs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/events" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		ids := r.URL.Query()["id"]
+		if len(ids) != 2 || ids[0] != "e1" || ids[1] != "e2" {
+			t.Errorf("ids = %v, want [e1 e2]", ids)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"id":"e1","tags":[{"id":"1","label":"Sports","slug":"sports"}]},
+			{"id":"e2","tags":[{"id":"2","label":"Politics","slug":"politics"}]}
+		]`))
+	}))
+	defer server.Close()
+	client := NewGammaClient(server.URL, nil)
+	tags, err := client.EventTags(context.Background(), []string{"e1", "e2", "e1", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags["e1"]) != 1 || tags["e1"][0].Slug != "sports" || len(tags["e2"]) != 1 || tags["e2"][0].Slug != "politics" {
+		t.Fatalf("unexpected event tags: %+v", tags)
+	}
+}
+
 func TestGammaClientMarketsLocaleRequestsTranslatedText(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/markets" {

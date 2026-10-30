@@ -101,6 +101,9 @@ type gammaMarket struct {
 	OutcomePrices       json.RawMessage `json:"outcomePrices"`
 	ClobTokenIDs        json.RawMessage `json:"clobTokenIds"`
 	EndDate             string          `json:"endDate"`
+	GameStartTime       string          `json:"gameStartTime"`
+	OneDayPriceChange   *float64        `json:"oneDayPriceChange"`
+	Tags                []Tag           `json:"tags"`
 	LiquidityNum        float64         `json:"liquidityNum"`
 	VolumeNum           float64         `json:"volumeNum"`
 	Liquidity           json.Number     `json:"liquidity"`
@@ -109,24 +112,74 @@ type gammaMarket struct {
 	Closed              bool            `json:"closed"`
 	UmaResolutionStatus string          `json:"umaResolutionStatus"`
 	Events              []struct {
+		ID    string `json:"id"`
 		Slug  string `json:"slug"`
 		Title string `json:"title"`
 	} `json:"events"`
 }
 
+type gammaEventTags struct {
+	ID   string `json:"id"`
+	Tags []Tag  `json:"tags"`
+}
+
 func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, error) {
 	now := time.Now().UTC()
-	markets := make([]Market, 0, 100)
-	for offset := 0; offset < 500; offset += 100 {
+	endMin := now.Format(time.RFC3339)
+	endMax := now.AddDate(0, 0, maxDays).Format(time.RFC3339)
+
+	// Polymarket's earliest-ending markets are overwhelmingly sports games. A
+	// single end-date-ordered scan can therefore return no politics, crypto or
+	// finance candidates at all. Read a few complementary views and merge them:
+	// near-end markets for the tail strategy, plus the most active and deepest
+	// books for cross-category coverage. Tags are included in each payload so
+	// classification does not need one request per event.
+	views := []struct {
+		order     string
+		ascending string
+		pages     int
+	}{
+		{order: "endDate", ascending: "true", pages: 2},
+		{order: "volume24hr", ascending: "false", pages: 2},
+		{order: "liquidity", ascending: "false", pages: 2},
+	}
+
+	seen := make(map[string]bool)
+	markets := make([]Market, 0, 800)
+	var failures []string
+	for _, view := range views {
+		items, err := g.listMarkets(ctx, endMin, endMax, view.order, view.ascending, view.pages)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		for _, item := range items {
+			if seen[item.ID] {
+				continue
+			}
+			seen[item.ID] = true
+			markets = append(markets, item)
+		}
+	}
+	if len(markets) == 0 && len(failures) > 0 {
+		return nil, fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	return markets, nil
+}
+
+func (g *GammaClient) listMarkets(ctx context.Context, endMin, endMax, order, ascending string, pages int) ([]Market, error) {
+	markets := make([]Market, 0, pages*100)
+	for page := 0; page < pages; page++ {
 		query := url.Values{
 			"active":       {"true"},
 			"closed":       {"false"},
 			"limit":        {"100"},
-			"offset":       {strconv.Itoa(offset)},
-			"order":        {"endDate"},
-			"ascending":    {"true"},
-			"end_date_min": {now.Format(time.RFC3339)},
-			"end_date_max": {now.AddDate(0, 0, maxDays).Format(time.RFC3339)},
+			"offset":       {strconv.Itoa(page * 100)},
+			"order":        {order},
+			"ascending":    {ascending},
+			"include_tag":  {"true"},
+			"end_date_min": {endMin},
+			"end_date_max": {endMax},
 		}
 		var raw []gammaMarket
 		if err := g.getJSON(ctx, "/markets?"+query.Encode(), &raw); err != nil {
@@ -184,10 +237,48 @@ func (g *GammaClient) MarketsLocale(ctx context.Context, ids []string, locale st
 
 func (g *GammaClient) Get(ctx context.Context, id string) (Market, error) {
 	var raw gammaMarket
-	if err := g.getJSON(ctx, "/markets/"+url.PathEscape(id), &raw); err != nil {
+	if err := g.getJSON(ctx, "/markets/"+url.PathEscape(id)+"?include_tag=true", &raw); err != nil {
 		return Market{}, err
 	}
 	return parseGammaMarket(raw)
+}
+
+// EventTags resolves Polymarket event tags in batches. The engine uses tags to
+// classify opportunities and to identify sports games whose result can change
+// in overtime. The endpoint returns full event objects, so callers should only
+// ask for the events behind opportunities that already passed the price and
+// liquidity filters.
+func (g *GammaClient) EventTags(ctx context.Context, eventIDs []string) (map[string][]Tag, error) {
+	unique := make([]string, 0, len(eventIDs))
+	seen := make(map[string]bool, len(eventIDs))
+	for _, id := range eventIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+	}
+	result := make(map[string][]Tag, len(unique))
+	const batchSize = 10
+	for start := 0; start < len(unique); start += batchSize {
+		end := start + batchSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		query := url.Values{"limit": {strconv.Itoa(end - start)}}
+		for _, id := range unique[start:end] {
+			query.Add("id", id)
+		}
+		var raw []gammaEventTags
+		if err := g.getJSON(ctx, "/events?"+query.Encode(), &raw); err != nil {
+			return nil, err
+		}
+		for _, item := range raw {
+			result[item.ID] = item.Tags
+		}
+	}
+	return result, nil
 }
 
 func (g *GammaClient) getJSON(ctx context.Context, path string, target any) error {
@@ -248,7 +339,9 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 	}
 	slug := raw.Slug
 	eventTitle := ""
+	eventID := ""
 	if len(raw.Events) > 0 {
+		eventID = raw.Events[0].ID
 		if raw.Events[0].Slug != "" {
 			slug = raw.Events[0].Slug
 		}
@@ -256,11 +349,31 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 	}
 	return Market{
 		ID: raw.ID, ConditionID: raw.ConditionID, Question: raw.Question,
-		GroupItemTitle: raw.GroupItemTitle, EventTitle: eventTitle,
-		Slug: slug, Outcomes: outcomes, EndDate: endDate,
+		GroupItemTitle: raw.GroupItemTitle, EventTitle: eventTitle, EventID: eventID,
+		Slug: slug, Outcomes: outcomes, EndDate: endDate, Tags: raw.Tags,
+		GameStartTime: parseGammaTime(raw.GameStartTime), PriceChange24h: raw.OneDayPriceChange,
 		Liquidity: liquidity, Volume: volume, Active: raw.Active,
 		Closed: raw.Closed, ResolutionStatus: raw.UmaResolutionStatus,
 	}, nil
+}
+
+func parseGammaTime(raw string) *time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	for _, layout := range []string{
+		"2006-01-02 15:04:05Z07",
+		"2006-01-02 15:04:05Z07:00",
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+	} {
+		if parsed, err := time.Parse(layout, raw); err == nil {
+			return &parsed
+		}
+	}
+	return nil
 }
 
 // Gamma has returned both JSON arrays and JSON-encoded arrays for these fields.

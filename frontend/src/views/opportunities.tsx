@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   CircleDollarSign,
   ExternalLink,
+  Filter,
   FlaskConical,
   Radar,
   Radio,
@@ -20,7 +21,8 @@ import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import type { Opportunity, OpportunityQuote } from '@/types'
-import { formatCompactCurrency, formatCurrency, formatFullDate, formatNumber, formatPercent, formatPrice } from '@/lib/format'
+import { formatCompactCurrency, formatCurrency, formatFullDate, formatNumber, formatPercent, formatPrice, formatPriceChange } from '@/lib/format'
+import { categoryCounts, categoryFilters, categoryLabel, matchesCategory, normalizeCategoryFilter, type CategoryFilter } from '@/lib/category'
 import { marketOutcome, marketQuestion, marketURL, persistMarketLanguage, readMarketLanguage, type MarketLanguage } from '@/lib/market-language'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/toast'
@@ -95,15 +97,16 @@ function OpportunityCard({ item, onBuy, onQuote, quote, orderSize, isLive, langu
     <Card className="p-4">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          <div className="mb-2 flex items-center gap-2"><Badge variant="info">{marketOutcome(item, language)}</Badge><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
+          <div className="mb-2 flex flex-wrap items-center gap-1.5"><Badge variant="info">{marketOutcome(item, language)}</Badge><Badge variant="default">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
           <h3 className="text-sm font-medium leading-6 text-slate-900">{marketQuestion(item, language)}</h3>
         </div>
         <MarketLink url={marketURL(item.url, language)} compact />
       </div>
       <div className="mt-4 grid grid-cols-2 gap-3 rounded-xl bg-slate-50 p-3">
-        <div><p className="text-[11px] text-slate-500">指示价格</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPrice(item.price)}</p></div>
+        <div><p className="text-[11px] text-slate-500">指示价格</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPrice(item.price)}</p>{item.price_change_24h != null && <p className={cn('mt-0.5 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}</div>
         <div><p className="text-[11px] text-slate-500">毛收益</p><p className="mt-1 text-sm font-semibold tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</p></div>
       </div>
+      {item.sports_game && <p className="mt-3 flex items-start gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-4 text-amber-800"><ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大。</p>}
       <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 p-3">
         <div>
           <p className="text-[11px] text-slate-500">真实收益（含手续费）</p>
@@ -125,6 +128,9 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const liveReady = !isLive || Boolean(account?.live_ready)
   const [query, setQuery] = useState('')
   const [marketLanguage, setMarketLanguage] = useState<MarketLanguage>(readMarketLanguage)
+  const [category, setCategory] = useState<CategoryFilter>('non_sports')
+  const [sportsPolicy, setSportsPolicy] = useState('exclude_games')
+  const categoryTouched = useRef(false)
   const [selected, setSelected] = useState<Opportunity | null>(null)
   const [amount, setAmount] = useState('')
   const [confirmed, setConfirmed] = useState(false)
@@ -153,19 +159,28 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
 
   // The real-yield button quotes the configured single-order size. Show it so
   // the amount is not mistaken for a hardcoded value; it is edited in 参数设置.
+  // The same request supplies the default radar category. A manual category
+  // selection must not be overwritten by a later poll.
   useEffect(() => {
     const controller = new AbortController()
-    api.settings(controller.signal).then((settings) => setOrderSize(settings.order_size)).catch(() => {})
+    api.settings(controller.signal).then((settings) => {
+      setOrderSize(settings.order_size)
+      setSportsPolicy(settings.sports_policy)
+      if (!categoryTouched.current) setCategory(normalizeCategoryFilter(settings.default_category))
+    }).catch(() => {})
     return () => controller.abort()
   }, [])
 
+  const allItems = useMemo(() => data?.items || [], [data])
+  const counts = useMemo(() => categoryCounts(allItems), [allItems])
   const filtered = useMemo(() => {
     const keyword = query.trim().toLocaleLowerCase()
-    if (!keyword) return data?.items || []
-    return (data?.items || []).filter((item) =>
-      [item.question, item.question_zh || '', item.event_title_zh || '', item.group_item_title || '', item.outcome, item.outcome_zh || '', item.slug, item.market_id].some((value) => value.toLocaleLowerCase().includes(keyword)),
-    )
-  }, [data, query])
+    return allItems.filter((item) => {
+      if (!matchesCategory(item, category)) return false
+      if (!keyword) return true
+      return [item.question, item.question_zh || '', item.event_title_zh || '', item.group_item_title || '', item.outcome, item.outcome_zh || '', item.slug, item.market_id].some((value) => value.toLocaleLowerCase().includes(keyword))
+    })
+  }, [allItems, query, category])
 
   const numericAmount = Number(amount)
   const validAmount = amount.trim() !== '' && Number.isFinite(numericAmount) && numericAmount > 0
@@ -251,15 +266,37 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
             {query && <button onClick={() => setQuery('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700" aria-label="清除搜索"><X className="h-3.5 w-3.5" /></button>}
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3 md:justify-end">
-            <p className="text-xs text-slate-500" aria-live="polite"><span className="font-semibold tabular-nums text-slate-800">{formatNumber(filtered.length, 0)}</span> 个匹配结果{query && data ? <span> / 共 {formatNumber(data.total, 0)} 个</span> : null}</p>
+            <p className="text-xs text-slate-500" aria-live="polite"><span className="font-semibold tabular-nums text-slate-800">{formatNumber(filtered.length, 0)}</span> 个匹配结果{(query || category !== 'all') && data ? <span> / 共 {formatNumber(data.total, 0)} 个</span> : null}</p>
             <Button variant="ghost" size="sm" onClick={refresh} disabled={isRefreshing}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />刷新</Button>
           </div>
         </div>
+        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-3">
+          <span className="mr-1 inline-flex items-center gap-1 text-[11px] font-medium text-slate-400"><Filter className="h-3.5 w-3.5" />分类</span>
+          {categoryFilters.map((option) => {
+            const active = category === option.value
+            return (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => { categoryTouched.current = true; setCategory(option.value) }}
+                aria-pressed={active}
+                className={cn('inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition', active ? 'border-emerald-200 bg-emerald-50 font-medium text-emerald-800' : 'border-slate-200 bg-surface text-slate-600 hover:border-slate-300 hover:bg-slate-50')}
+              >
+                {option.label}
+                <span className={cn('tabular-nums text-[10px]', active ? 'text-emerald-600' : 'text-slate-400')}>{formatNumber(counts[option.value], 0)}</span>
+              </button>
+            )
+          })}
+        </div>
+        {category === 'sports' && sportsPolicy !== 'allow' && (
+          <p className="mt-2 text-[11px] leading-4 text-amber-700">当前体育市场策略已排除体育赛事盘口，这里只显示未被排除的体育预测市场；可在「参数设置 → 市场筛选」中调整。</p>
+        )}
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-slate-100 pt-3 text-[11px] text-slate-400">
           <span>毛收益 = (1 − 价格) / 价格（未计手续费）</span>
           <span>真实收益 = 实时盘口成交价 + 真实手续费，按「参数设置 → 单笔金额」{orderSize ? `（${formatCurrency(orderSize)}）` : ''}估算</span>
           <span>到期时间按本地时区显示</span>
           <span>立即扫描仅刷新行情，不会自动下单</span>
+          <span>默认分类来自「参数设置」；体育赛事盘口默认按加时/波动风险过滤</span>
           <span>{marketLanguage === 'zh' ? '市场问题与方向优先使用 Polymarket 中文文案' : '市场问题与方向显示 Polymarket 英文原文'}</span>
           {data && <span className="sm:ml-auto">来源 {data.source} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
         </div>
@@ -268,7 +305,11 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
       {isLoading ? <Card><LoadingBlock rows={6} /></Card> : error && !data ? <Card><ErrorState message={error} onRetry={refresh} /></Card> : !data?.items.length ? (
         <Card><EmptyState icon={Binoculars} title="雷达暂未发现机会" description="当前筛选条件下没有候选市场。你可以重新扫描，或在参数设置中调整筛选阈值。" action={<Button variant="secondary" onClick={scan} loading={scanning}><Radar className="h-4 w-4" />重新扫描</Button>} /></Card>
       ) : filtered.length === 0 ? (
-        <Card><EmptyState icon={Search} title="没有匹配的市场" description={`没有找到与“${query}”相关的机会，请尝试其他关键词。`} action={<Button variant="secondary" onClick={() => setQuery('')}>清除搜索</Button>} /></Card>
+        query.trim() ? (
+          <Card><EmptyState icon={Search} title="没有匹配的市场" description={`没有找到与“${query}”相关的机会，请尝试其他关键词。`} action={<Button variant="secondary" onClick={() => setQuery('')}>清除搜索</Button>} /></Card>
+        ) : (
+          <Card><EmptyState icon={Filter} title="该分类暂无可交易机会" description={category === 'sports' && sportsPolicy !== 'allow' ? '体育赛事盘口默认按加时与临场波动风险过滤。可在「参数设置 → 市场筛选」中调整体育市场策略，或切换到其他分类。' : '当前分类下没有符合价格、流动性与波动上限的候选市场。可切换分类，或在参数设置中调整筛选条件。'} action={<Button variant="secondary" onClick={() => { categoryTouched.current = true; setCategory(category === 'non_sports' ? 'all' : 'non_sports') }}>{category === 'non_sports' ? '查看全部机会' : '查看非体育机会'}</Button>} /></Card>
+        )
       ) : (
         <>
           <Card className="hidden overflow-hidden lg:block">
@@ -280,8 +321,8 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
                 <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>
                   {filtered.map((item) => (
                     <tr key={`${item.market_id}-${item.token_id}`} className="group hover:bg-slate-50/70">
-                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex items-center gap-2"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
-                      <td className="px-4 py-4 text-right font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</td>
+                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex flex-wrap items-center gap-1.5"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><Badge variant="default" className="px-2 py-0.5 text-[11px]">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" className="px-2 py-0.5 text-[11px]" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
+                      <td className="px-4 py-4 text-right"><div className="font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</div>{item.price_change_24h != null && <p className={cn('mt-1 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}</td>
                       <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
                       <td className="px-4 py-4 text-right"><RealYield state={quotes[item.token_id]} onQuote={() => fetchQuote(item)} /></td>
                       <td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatCompactCurrency(item.liquidity)}</td>
@@ -307,8 +348,9 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
             </div>
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
               <p className="pr-4 text-sm font-medium leading-6 text-slate-900">{marketQuestion(selected, marketLanguage)}</p>
-              <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
+              <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><Badge variant="default">{categoryLabel(selected.category)}</Badge>{selected.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
             </div>
+            {selected.sports_game && <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">体育赛事盘口：</span>可能包含加时、延长赛或点球决胜，临近结算时价格波动明显。请确认你已理解该风险。</span></div>}
             <div>
               <div className="mb-2 flex items-center justify-between"><label htmlFor="paper-amount" className="text-sm font-medium text-slate-700">{isLive ? '实盘投入金额' : '投入虚拟金额'}</label><span className="text-xs text-slate-400">USD</span></div>
               <div className="relative"><CircleDollarSign className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><Input id="paper-amount" type="number" min="0.01" step="any" inputMode="decimal" autoFocus value={amount} onChange={(event) => setAmount(event.target.value)} className="h-11 pl-9 text-base" placeholder="0.00" aria-describedby="amount-help" /></div>

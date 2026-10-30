@@ -15,19 +15,23 @@ type Outcome struct {
 }
 
 type Market struct {
-	ID               string    `json:"id"`
-	ConditionID      string    `json:"condition_id"`
-	Question         string    `json:"question"`
-	GroupItemTitle   string    `json:"group_item_title"`
-	EventTitle       string    `json:"event_title"`
-	Slug             string    `json:"slug"`
-	Outcomes         []Outcome `json:"outcomes"`
-	EndDate          time.Time `json:"end_date"`
-	Liquidity        float64   `json:"liquidity"`
-	Volume           float64   `json:"volume"`
-	Active           bool      `json:"active"`
-	Closed           bool      `json:"closed"`
-	ResolutionStatus string    `json:"resolution_status"`
+	ID               string     `json:"id"`
+	ConditionID      string     `json:"condition_id"`
+	Question         string     `json:"question"`
+	GroupItemTitle   string     `json:"group_item_title"`
+	EventTitle       string     `json:"event_title"`
+	EventID          string     `json:"event_id"`
+	Tags             []Tag      `json:"tags,omitempty"`
+	Slug             string     `json:"slug"`
+	Outcomes         []Outcome  `json:"outcomes"`
+	EndDate          time.Time  `json:"end_date"`
+	GameStartTime    *time.Time `json:"game_start_time,omitempty"`
+	PriceChange24h   *float64   `json:"price_change_24h,omitempty"`
+	Liquidity        float64    `json:"liquidity"`
+	Volume           float64    `json:"volume"`
+	Active           bool       `json:"active"`
+	Closed           bool       `json:"closed"`
+	ResolutionStatus string     `json:"resolution_status"`
 }
 
 func (m Market) URL() string {
@@ -103,6 +107,22 @@ type Provider interface {
 	ListOpen(ctx context.Context, maxDays int) ([]Market, error)
 	Get(ctx context.Context, id string) (Market, error)
 	Name() string
+}
+
+// Tag is a Polymarket event tag. Categories are derived from these tags when
+// the provider can supply them; otherwise the engine falls back to local
+// heuristics (game start time, question text and slug).
+type Tag struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Slug  string `json:"slug"`
+}
+
+// EventTagProvider is implemented by providers that can resolve event tags in
+// batches. It is optional so read-only providers and tests keep working when
+// they cannot supply category metadata.
+type EventTagProvider interface {
+	EventTags(ctx context.Context, eventIDs []string) (map[string][]Tag, error)
 }
 
 // LocalizedProvider is implemented by providers that can return the same

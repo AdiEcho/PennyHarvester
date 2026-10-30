@@ -95,6 +95,10 @@ export interface Opportunity {
   days_to_end: number
   gross_yield: number
   url: string
+  category: string
+  sports_game: boolean
+  overtime_risk: boolean
+  price_change_24h?: number | null
 }
 
 export interface OpportunitiesResponse {
@@ -199,6 +203,9 @@ export interface Settings {
   slippage_bps: number
   fee_bps: number
   initial_bankroll: number
+  default_category: string
+  sports_policy: string
+  max_price_change_24h: number
 }
 
 export type ProxyMode = 'environment' | 'custom' | 'off'

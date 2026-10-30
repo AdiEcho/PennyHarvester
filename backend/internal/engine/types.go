@@ -70,8 +70,48 @@ type Settings struct {
 	SlippageBPS         float64 `json:"slippage_bps"`
 	FeeBPS              float64 `json:"fee_bps"`
 	InitialBankroll     float64 `json:"initial_bankroll"`
+	// DefaultCategory only controls which category the radar opens with. It
+	// does not change automatic trading; SportsPolicy does.
+	DefaultCategory string `json:"default_category"`
+	// SportsPolicy is one of exclude_games, exclude_all or allow. The default
+	// excludes game markets because overtime and late-game swings are poorly
+	// suited to a 0.95–0.99 tail strategy.
+	SportsPolicy string `json:"sports_policy"`
+	// MaxPriceChange24h rejects markets whose reference price moved more than
+	// this amount in the last 24 hours. Zero disables the guard.
+	MaxPriceChange24h float64 `json:"max_price_change_24h"`
 	// FeeModelVersion is managed by the server; clients must not set it.
 	FeeModelVersion int `json:"fee_model_version"`
+}
+
+const (
+	RadarCategoryAll       = "all"
+	RadarCategoryNonSports = "non_sports"
+
+	SportsPolicyExcludeGames = "exclude_games"
+	SportsPolicyExcludeAll   = "exclude_all"
+	SportsPolicyAllow        = "allow"
+)
+
+func validRadarCategory(value string) bool {
+	switch value {
+	case RadarCategoryAll, RadarCategoryNonSports,
+		string(market.CategorySports), string(market.CategoryPolitics), string(market.CategoryCrypto),
+		string(market.CategoryFinance), string(market.CategoryTech), string(market.CategoryCulture),
+		string(market.CategoryOther):
+		return true
+	default:
+		return false
+	}
+}
+
+func validSportsPolicy(value string) bool {
+	switch value {
+	case SportsPolicyExcludeGames, SportsPolicyExcludeAll, SportsPolicyAllow:
+		return true
+	default:
+		return false
+	}
 }
 
 // DefaultFeeBPS approximates Polymarket's taker fee for this strategy's price
@@ -87,7 +127,8 @@ func DefaultSettings() Settings {
 		MinPrice: 0.95, MaxPrice: 0.99, MaxDays: 30, MinLiquidity: 10000,
 		OrderSize: 100, MaxPosition: 250, MaxExposure: 1000,
 		ScanIntervalSeconds: 60, SlippageBPS: 20, FeeBPS: DefaultFeeBPS,
-		InitialBankroll: 10000,
+		InitialBankroll: 10000, DefaultCategory: RadarCategoryNonSports,
+		SportsPolicy: SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
 		FeeModelVersion: FeeModelVersion,
 	}
 }
@@ -118,6 +159,16 @@ func (s Settings) Validate() error {
 	if s.SlippageBPS < 0 || s.SlippageBPS > 1000 || s.FeeBPS < 0 || s.FeeBPS > 1000 ||
 		math.IsNaN(s.SlippageBPS) || math.IsNaN(s.FeeBPS) || math.IsInf(s.SlippageBPS, 0) || math.IsInf(s.FeeBPS, 0) {
 		return fmt.Errorf("滑点和费率须为 0–1000 BPS")
+	}
+	if !validRadarCategory(s.DefaultCategory) {
+		return fmt.Errorf("默认分类无效")
+	}
+	if !validSportsPolicy(s.SportsPolicy) {
+		return fmt.Errorf("体育市场策略无效")
+	}
+	if s.MaxPriceChange24h < 0 || s.MaxPriceChange24h > 1 ||
+		math.IsNaN(s.MaxPriceChange24h) || math.IsInf(s.MaxPriceChange24h, 0) {
+		return fmt.Errorf("24 小时价格波动上限须为 0–1")
 	}
 	return nil
 }
@@ -421,6 +472,12 @@ type Opportunity struct {
 	DaysToEnd      float64   `json:"days_to_end"`
 	GrossYield     float64   `json:"gross_yield"`
 	URL            string    `json:"url"`
+	// Category and the risk flags are derived from Polymarket event tags and
+	// local heuristics during the scan.
+	Category       string   `json:"category"`
+	SportsGame     bool     `json:"sports_game"`
+	OvertimeRisk   bool     `json:"overtime_risk"`
+	PriceChange24h *float64 `json:"price_change_24h,omitempty"`
 }
 
 // OpportunityQuote is a read-only, executable estimate for one radar row. It
@@ -662,7 +719,7 @@ func opportunityFor(m market.Market, outcome market.Outcome, now time.Time) Oppo
 		MarketID: m.ID, ConditionID: m.ConditionID, Question: m.Question, GroupItemTitle: m.GroupItemTitle,
 		Slug: m.Slug, Outcome: outcome.Name, TokenID: outcome.TokenID, Price: outcome.Price,
 		Liquidity: m.Liquidity, Volume: m.Volume, EndDate: m.EndDate, DaysToEnd: days,
-		GrossYield: grossYield, URL: m.URL(),
+		GrossYield: grossYield, URL: m.URL(), PriceChange24h: m.PriceChange24h,
 	}
 }
 
@@ -672,6 +729,10 @@ func findOpportunity(m market.Market, outcomeName, tokenID string, settings Sett
 	}
 	if len(m.Outcomes) != 2 || m.Liquidity < settings.MinLiquidity {
 		return Opportunity{}, fmt.Errorf("%w: 非二元市场或流动性不足", ErrInvalidOrder)
+	}
+	if settings.MaxPriceChange24h > 0 && m.PriceChange24h != nil &&
+		math.Abs(*m.PriceChange24h) > settings.MaxPriceChange24h+1e-9 {
+		return Opportunity{}, fmt.Errorf("%w: 24 小时价格变动 %.4f 超过上限 %.4f", ErrInvalidOrder, *m.PriceChange24h, settings.MaxPriceChange24h)
 	}
 	for _, outcome := range m.Outcomes {
 		if (tokenID != "" && outcome.TokenID != tokenID) || (tokenID == "" && !strings.EqualFold(outcome.Name, outcomeName)) {

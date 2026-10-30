@@ -54,6 +54,14 @@ export function formatPrice(value: number) {
   return `$${value.toFixed(3)}`
 }
 
+// Gamma reports oneDayPriceChange in probability dollars (0.03 = 3 cents).
+// Show cents because the strategy's whole edge lives in the last few cents.
+export function formatPriceChange(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return '—'
+  const cents = value * 100
+  return `${cents > 0 ? '+' : ''}${cents.toFixed(1)}¢`
+}
+
 export function formatDate(value: string | null, includeTime = true) {
   if (!value) return '暂无记录'
   const date = new Date(value)

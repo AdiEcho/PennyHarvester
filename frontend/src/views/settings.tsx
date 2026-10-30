@@ -33,10 +33,30 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { ModeBadge } from '@/components/status-badges'
 
-const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll'] as const
+const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h'] as const
+const selectKeys = ['default_category', 'sports_policy'] as const
 type NumericKey = typeof numericKeys[number]
-type Draft = Record<NumericKey, string>
-type FieldErrors = Partial<Record<NumericKey, string>>
+type SelectKey = typeof selectKeys[number]
+type Draft = Record<NumericKey, string> & Record<SelectKey, string>
+type FieldErrors = Partial<Record<NumericKey | SelectKey, string>>
+
+const defaultCategoryOptions = [
+  { value: 'non_sports', label: '非体育（推荐）' },
+  { value: 'all', label: '全部分类' },
+  { value: 'politics', label: '政治' },
+  { value: 'crypto', label: '加密' },
+  { value: 'finance', label: '金融' },
+  { value: 'tech', label: '科技' },
+  { value: 'culture', label: '文化' },
+  { value: 'sports', label: '体育' },
+  { value: 'other', label: '其他' },
+]
+
+const sportsPolicyOptions = [
+  { value: 'exclude_games', label: '排除体育赛事盘口（推荐）' },
+  { value: 'exclude_all', label: '排除全部体育分类' },
+  { value: 'allow', label: '保留体育市场并标记风险' },
+]
 
 function toDraft(settings: Settings): Draft {
   return {
@@ -51,6 +71,9 @@ function toDraft(settings: Settings): Draft {
     slippage_bps: String(settings.slippage_bps),
     fee_bps: String(settings.fee_bps),
     initial_bankroll: String(settings.initial_bankroll),
+    default_category: settings.default_category,
+    sports_policy: settings.sports_policy,
+    max_price_change_24h: String(settings.max_price_change_24h),
   }
 }
 
@@ -67,6 +90,9 @@ function toSettings(draft: Draft): Settings {
     slippage_bps: Number(draft.slippage_bps),
     fee_bps: Number(draft.fee_bps),
     initial_bankroll: Number(draft.initial_bankroll),
+    default_category: draft.default_category,
+    sports_policy: draft.sports_policy,
+    max_price_change_24h: Number(draft.max_price_change_24h),
   }
 }
 
@@ -90,6 +116,9 @@ function validate(settings: Settings): FieldErrors {
   if (settings.slippage_bps < 0 || settings.slippage_bps > 1000) errors.slippage_bps = '滑点范围为 0–1000 bps。'
   if (settings.fee_bps < 0 || settings.fee_bps > 1000) errors.fee_bps = '费用范围为 0–1000 bps。'
   if (settings.initial_bankroll <= 0) errors.initial_bankroll = '模拟初始资金必须大于 0。'
+  if (!defaultCategoryOptions.some((option) => option.value === settings.default_category)) errors.default_category = '请选择有效的默认分类。'
+  if (!sportsPolicyOptions.some((option) => option.value === settings.sports_policy)) errors.sports_policy = '请选择有效的体育市场策略。'
+  if (settings.max_price_change_24h < 0 || settings.max_price_change_24h > 1) errors.max_price_change_24h = '请输入 0–1 之间的数值（0 表示不限制）。'
   return errors
 }
 
@@ -113,6 +142,32 @@ function NumberField({ id, label, description, value, unit, error, min, max, ste
         <Input id={id} type="number" inputMode="decimal" value={value} min={min} max={max} step={step} onChange={(event) => onChange(event.target.value)} aria-invalid={Boolean(error)} aria-describedby={error ? `${id}-error` : undefined} className={cn('pr-16 tabular-nums', error && 'border-rose-400 focus:border-rose-500 focus:ring-rose-500/10')} />
         <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">{unit}</span>
       </div>
+      {error && <p id={`${id}-error`} className="mt-1.5 text-xs leading-4 text-rose-600" role="alert">{error}</p>}
+    </div>
+  )
+}
+
+function SelectField({ id, label, description, value, options, error, onChange }: {
+  id: SelectKey
+  label: string
+  description: string
+  value: string
+  options: { value: string; label: string }[]
+  error?: string
+  onChange: (value: string) => void
+}) {
+  return (
+    <div>
+      <label htmlFor={id} className="text-sm font-medium text-slate-700">{label}</label>
+      <p className="mt-1 min-h-8 text-xs leading-4 text-slate-400">{description}</p>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger id={id} className={cn('mt-2', error && 'border-rose-400 focus:border-rose-500 focus:ring-rose-500/10')} aria-invalid={Boolean(error)} aria-describedby={error ? `${id}-error` : undefined}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+        </SelectContent>
+      </Select>
       {error && <p id={`${id}-error`} className="mt-1.5 text-xs leading-4 text-rose-600" role="alert">{error}</p>}
     </div>
   )
@@ -341,7 +396,7 @@ export function SettingsView() {
 
   useEffect(() => () => saveController.current?.abort(), [])
 
-  const update = (key: NumericKey, value: string) => {
+  const update = (key: keyof Draft, value: string) => {
     setDraft((current) => current ? { ...current, [key]: value } : current)
     setDirty(true)
     setErrors((current) => ({ ...current, [key]: undefined }))
@@ -415,12 +470,24 @@ export function SettingsView() {
       {settingsQuery.isLoading ? <Card><div className="grid gap-5 p-6 sm:grid-cols-2"><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /></div></Card> : settingsQuery.error && !settingsQuery.data ? <Card><ErrorState message={settingsQuery.error} onRetry={settingsQuery.refresh} /></Card> : !draft ? <Card><div className="grid gap-5 p-6 sm:grid-cols-2"><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /></div></Card> : (
         <form id="settings-form" onSubmit={(event) => { event.preventDefault(); void save() }} className="space-y-4">
           {settingsQuery.error && <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">后台刷新失败，当前表单仍可编辑：{settingsQuery.error}</div>}
-          <SettingsSection icon={SlidersHorizontal} title="市场筛选" description="只保留符合价格、到期时间与流动性要求的公开市场候选。实盘与模拟共用同一套筛选条件。">
+          <SettingsSection icon={SlidersHorizontal} title="市场筛选" description="只保留符合价格、到期时间、流动性与分类要求的公开市场候选。实盘与模拟共用同一套筛选条件；默认分类只决定雷达打开时的分类。">
             <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
               <NumberField id="min_price" label="最低指示价格" description="必须大于 0，且不高于最高价格。" value={draft.min_price} unit="USD" min={0} max={1} error={errors.min_price} onChange={(value) => update('min_price', value)} />
               <NumberField id="max_price" label="最高指示价格" description="必须小于 1，且不低于最低价格。" value={draft.max_price} unit="USD" min={0} max={1} error={errors.max_price} onChange={(value) => update('max_price', value)} />
               <NumberField id="max_days" label="最长到期时间" description="筛选 1–3650 天内到期的市场。" value={draft.max_days} unit="天" min={1} max={3650} step="1" error={errors.max_days} onChange={(value) => update('max_days', value)} />
               <NumberField id="min_liquidity" label="最低流动性" description="低于该值的市场不会进入雷达。" value={draft.min_liquidity} unit="USD" min={0} error={errors.min_liquidity} onChange={(value) => update('min_liquidity', value)} />
+            </div>
+            <div className="mt-6 grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-3">
+              <SelectField id="default_category" label="雷达默认分类" description="机会雷达打开时默认选中的分类；只影响展示，不改变自动交易策略。" value={draft.default_category} options={defaultCategoryOptions} error={errors.default_category} onChange={(value) => update('default_category', value)} />
+              <SelectField id="sports_policy" label="体育市场策略" description="体育赛事盘口可能包含加时、延长赛或点球决胜，临场波动大。默认排除有开赛时间的赛事盘口，保留赛季冠军等长期体育预测。" value={draft.sports_policy} options={sportsPolicyOptions} error={errors.sports_policy} onChange={(value) => update('sports_policy', value)} />
+              <NumberField id="max_price_change_24h" label="24 小时价格波动上限" description="24 小时价格变动绝对值超过该值时跳过该市场；0 表示不限制。用于过滤临场剧烈波动的盘口。" value={draft.max_price_change_24h} unit="USD" min={0} max={1} error={errors.max_price_change_24h} onChange={(value) => update('max_price_change_24h', value)} />
+            </div>
+            {draft.default_category === 'sports' && draft.sports_policy !== 'allow' && (
+              <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">当前体育市场策略会排除体育盘口，但雷达默认分类是「体育」，打开雷达时可能为空。建议把默认分类改为「非体育」，或把体育策略改为「保留并标记风险」。</div>
+            )}
+            <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div className="rounded-xl bg-surface p-2.5 text-slate-500"><Info className="h-5 w-5" /></div>
+              <div className="flex-1"><p className="text-sm font-semibold text-slate-800">为什么默认排除体育赛事盘口？</p><p className="mt-1 text-xs leading-5 text-slate-500">足球加时、篮球加时、冰球加时、棒球延长局和电竞决胜局都会让临近结算的价格重新波动。0.95–0.99 的尾盘策略更适合结果已基本确定、且不会因加时改写的市场。自动交易同样使用该策略；若希望完全避开体育，请选择「排除全部体育分类」。</p></div>
             </div>
           </SettingsSection>
 
@@ -449,7 +516,7 @@ export function SettingsView() {
           </SettingsSection>
 
           <div className="sticky bottom-4 z-10 flex flex-col gap-3 rounded-2xl border border-slate-200 bg-surface/95 p-4 shadow-float backdrop-blur sm:flex-row sm:items-center">
-            <div className="flex flex-1 items-start gap-2 text-xs leading-5 text-slate-500"><Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" /><span>{dirty ? '有尚未保存的更改。保存前请确认风控上限。' : '当前参数已与后端同步。'} 筛选与风控参数对实盘、模拟账户同时生效。</span></div>
+            <div className="flex flex-1 items-start gap-2 text-xs leading-5 text-slate-500"><Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" /><span>{dirty ? '有尚未保存的更改。保存前请确认风控上限。' : '当前参数已与后端同步。'} 筛选与风控参数对实盘、模拟账户同时生效；默认分类只影响雷达初始展示。</span></div>
             <div className="flex gap-2"><Button type="button" variant="secondary" onClick={reset} disabled={!dirty || saving}><RotateCcw className="h-4 w-4" />放弃更改</Button><Button type="submit" variant="primary" loading={saving} disabled={!dirty}>{saving ? '正在保存…' : <><Save className="h-4 w-4" />保存参数</>}</Button></div>
           </div>
         </form>
