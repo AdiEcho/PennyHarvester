@@ -23,7 +23,7 @@ func TestGammaClientParsesEncodedArrays(t *testing.T) {
 		}]`))
 	}))
 	defer server.Close()
-	client := NewGammaClient(server.URL)
+	client := NewGammaClient(server.URL, nil)
 	items, err := client.ListOpen(context.Background(), 30)
 	if err != nil {
 		t.Fatal(err)

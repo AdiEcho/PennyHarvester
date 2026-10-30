@@ -40,4 +40,7 @@ frontend/node_modules/
 frontend/dist/
 frontend/tsconfig.tsbuildinfo
 *.log
+
+# SQLite encryption key for web-managed live credentials
+*.db.key
 .DS_Store

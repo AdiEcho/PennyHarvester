@@ -65,11 +65,11 @@ func setupRouter(t *testing.T) (http.Handler, *engine.Engine) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { repository.Close() })
-	instance, err := engine.New(context.Background(), repository, testProvider(), nil)
+	instance, err := engine.New(context.Background(), repository, testProvider(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return api.NewRouter(instance, ""), instance
+	return api.NewRouter(instance, "", api.NewAuthenticator(repository)), instance
 }
 
 func accountID(t *testing.T, handler http.Handler, mode engine.AccountMode) int64 {
@@ -124,6 +124,13 @@ func TestHealthAndPaperOrderAPI(t *testing.T) {
 	dashboard := request(t, handler, http.MethodGet, "/api/v1/dashboard?account_id="+itoa(paperID), nil)
 	if dashboard.Code != http.StatusOK || !bytes.Contains(dashboard.Body.Bytes(), []byte(`"open_positions":1`)) {
 		t.Fatalf("unexpected dashboard: %d %s", dashboard.Code, dashboard.Body.String())
+	}
+	if !bytes.Contains(dashboard.Body.Bytes(), []byte(`"fees_paid":0.15`)) {
+		t.Fatalf("paper fee was not reported by the dashboard: %s", dashboard.Body.String())
+	}
+	orders := request(t, handler, http.MethodGet, "/api/v1/orders?account_id="+itoa(paperID)+"&status=all", nil)
+	if orders.Code != http.StatusOK || !bytes.Contains(orders.Body.Bytes(), []byte(`"fee":0.15`)) {
+		t.Fatalf("order fee was not exposed by the API: %d %s", orders.Code, orders.Body.String())
 	}
 }
 

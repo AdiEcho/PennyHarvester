@@ -9,21 +9,84 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"pennyharvester/backend/internal/netproxy"
 )
 
 const maxResponseBytes = 8 << 20
 
 type GammaClient struct {
-	baseURL string
-	client  *http.Client
+	mu             sync.RWMutex
+	baseURL        string
+	defaultBaseURL string
+	proxy          *netproxy.Manager
+	client         *http.Client
 }
 
-func NewGammaClient(baseURL string) *GammaClient {
+// NewGammaClient keeps the public Gamma API on the outbound egress configured
+// in the system settings. A nil manager keeps the Go default behaviour, which
+// is what the tests use. The base URL can be switched at runtime from the web
+// UI; the startup value remains the fallback when the override is cleared.
+func NewGammaClient(baseURL string, proxy *netproxy.Manager) *GammaClient {
+	normalized := normalizeBaseURL(baseURL)
 	return &GammaClient{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{Timeout: 15 * time.Second},
+		baseURL:        normalized,
+		defaultBaseURL: normalized,
+		proxy:          proxy,
+		client:         &http.Client{Timeout: 15 * time.Second},
 	}
+}
+
+func normalizeBaseURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
+}
+
+func (g *GammaClient) BaseURL() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.baseURL
+}
+
+func (g *GammaClient) DefaultBaseURL() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.defaultBaseURL
+}
+
+// SetBaseURL applies a web-managed override. An empty value restores the
+// startup URL.
+func (g *GammaClient) SetBaseURL(raw string) error {
+	normalized := normalizeBaseURL(raw)
+	if normalized == "" {
+		normalized = g.DefaultBaseURL()
+	}
+	if normalized != "" {
+		parsed, err := url.Parse(normalized)
+		if err != nil {
+			return fmt.Errorf("Gamma 行情地址无效: %w", err)
+		}
+		switch strings.ToLower(parsed.Scheme) {
+		case "http", "https":
+		default:
+			return fmt.Errorf("Gamma 行情地址仅支持 http 或 https")
+		}
+		if parsed.Host == "" {
+			return fmt.Errorf("Gamma 行情地址缺少主机与端口")
+		}
+	}
+	g.mu.Lock()
+	g.baseURL = normalized
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *GammaClient) httpClient() *http.Client {
+	if g.proxy != nil {
+		return g.proxy.HTTPClient(15 * time.Second)
+	}
+	return g.client
 }
 
 func (g *GammaClient) Name() string { return "Polymarket Gamma" }
@@ -89,13 +152,13 @@ func (g *GammaClient) Get(ctx context.Context, id string) (Market, error) {
 }
 
 func (g *GammaClient) getJSON(ctx context.Context, path string, target any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.BaseURL()+path, nil)
 	if err != nil {
 		return fmt.Errorf("创建行情请求: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "PennyHarvester/0.1 (public-data paper-mode)")
-	resp, err := g.client.Do(req)
+	resp, err := g.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("读取 Polymarket 公开行情: %w", err)
 	}

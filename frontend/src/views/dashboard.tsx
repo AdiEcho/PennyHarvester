@@ -165,7 +165,7 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
         value={metrics ? formatCurrency(metrics.total_pnl, true) : '—'}
         icon={Banknote}
         loading={loading}
-        detail={metrics ? <span>已实现 <span className={pnlClass(metrics.realized_pnl)}>{formatCurrency(metrics.realized_pnl, true)}</span> · 浮动 <span className={pnlClass(metrics.unrealized_pnl)}>{formatCurrency(metrics.unrealized_pnl, true)}</span></span> : '正在加载账户数据'}
+        detail={metrics ? <span>已实现 <span className={pnlClass(metrics.realized_pnl)}>{formatCurrency(metrics.realized_pnl, true)}</span> · 浮动 <span className={pnlClass(metrics.unrealized_pnl)}>{formatCurrency(metrics.unrealized_pnl, true)}</span> · 手续费 <span className="font-medium tabular-nums text-slate-700">{formatCurrency(metrics.fees_paid)}</span></span> : '正在加载账户数据'}
       />
       <StatCard
         label="当前持仓投入"
@@ -237,7 +237,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
                 {isLive && !data.account.live_ready && (
                   <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
                     <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>{data.account.live_configured ? <>实盘配置待完善：{data.account.live_error || '请检查钱包、Funder 与 API 凭据设置。'}</> : <>实盘尚未配置：在服务端设置 <code className="rounded bg-amber-100 px-1">POLYMARKET_PRIVATE_KEY</code> 并重启后即可启用实盘。</>}</span>
+                    <span>{data.account.live_configured ? <>实盘配置待完善：{data.account.live_error || '请检查钱包、Funder 与 API 凭据设置。'}</> : <>实盘尚未配置：在「系统设置 → 实盘交易凭据」中填写私钥，或设置 <code className="rounded bg-amber-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启服务。</>}</span>
                   </div>
                 )}
                 {data.account.live_error && data.account.live_ready && <div className="mt-4 break-words rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs leading-5 text-rose-700"><span className="font-medium">实盘错误：</span>{data.account.live_error}</div>}

@@ -1,0 +1,139 @@
+package api
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"pennyharvester/backend/internal/engine"
+	"pennyharvester/backend/internal/netproxy"
+)
+
+// proxyProbeURL is a fixed, cheap Polymarket endpoint so the connectivity test
+// cannot be turned into a request against an arbitrary host from the browser.
+const proxyProbeURL = "https://clob.polymarket.com/time"
+
+func (h *Handler) systemSettings(c *gin.Context) {
+	h.writeSystemSettings(c)
+}
+
+func (h *Handler) updateSystemSettings(c *gin.Context) {
+	var request struct {
+		Proxy      *netproxy.Config           `json:"proxy"`
+		DataSource *engine.DataSourceSettings `json:"data_source"`
+		Live       *engine.LiveSettings       `json:"live"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "系统设置 JSON 无效: " + err.Error()})
+		return
+	}
+	// Treat the payload as a partial update so saving one section cannot wipe
+	// the other one. Masked secrets echoed back by the browser are restored
+	// from the stored values.
+	current := h.engine.SystemSettings()
+	settings := current
+	if request.Proxy != nil {
+		settings.Proxy = request.Proxy.MergeSecret(current.Proxy)
+	}
+	if request.DataSource != nil {
+		settings.DataSource = *request.DataSource
+	}
+	if request.Live != nil {
+		settings.Live = request.Live.MergeSecret(current.Live)
+	}
+	if err := settings.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.engine.UpdateSystemSettings(c.Request.Context(), settings); err != nil {
+		respondError(c, err)
+		return
+	}
+	h.writeSystemSettings(c)
+}
+
+func (h *Handler) writeSystemSettings(c *gin.Context) {
+	settings := h.engine.SystemSettings()
+	enabled, err := h.auth.Enabled(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"proxy":           settings.Proxy.Redacted(),
+		"data_source":     settings.DataSource,
+		"live":            settings.Live.Redacted(),
+		"runtime":         h.engine.SystemRuntime(),
+		"password_set":    enabled,
+		"proxy_probe_url": proxyProbeURL,
+		"environment": gin.H{
+			"http_proxy_set":  envPresent("HTTP_PROXY"),
+			"https_proxy_set": envPresent("HTTPS_PROXY"),
+			"no_proxy":        envValue("NO_PROXY"),
+		},
+	})
+}
+
+// testProxy dials the probe endpoint through the proxy configuration in the
+// request body (falling back to the stored one) without persisting anything.
+func (h *Handler) testProxy(c *gin.Context) {
+	var request struct {
+		Proxy netproxy.Config `json:"proxy"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "代理测试请求无效: " + err.Error()})
+		return
+	}
+	config := request.Proxy.MergeSecret(h.engine.SystemSettings().Proxy)
+	manager, err := netproxy.New(config)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, proxyProbeURL, nil)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+	start := time.Now()
+	response, err := manager.HTTPClient(12 * time.Second).Do(req)
+	latency := float64(time.Since(start).Microseconds()) / 1000
+	result := gin.H{
+		"target":     proxyProbeURL,
+		"mode":       config.Normalize().Mode,
+		"latency_ms": latency,
+	}
+	if err != nil {
+		result["ok"] = false
+		result["error"] = err.Error()
+		c.JSON(http.StatusOK, result)
+		return
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	result["ok"] = response.StatusCode >= 200 && response.StatusCode < 400
+	result["status_code"] = response.StatusCode
+	if !result["ok"].(bool) {
+		result["error"] = "上游返回 " + response.Status
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func envPresent(key string) bool {
+	return envValue(key) != ""
+}
+
+func envValue(key string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(strings.ToLower(key)))
+}

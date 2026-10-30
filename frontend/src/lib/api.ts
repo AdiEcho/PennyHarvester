@@ -2,16 +2,22 @@ import type {
   Account,
   AccountMode,
   AccountsResponse,
+  AuthStatus,
   Dashboard,
+  DataSourceSettings,
   Engine,
   Health,
+  LiveSettings,
   OpportunitiesResponse,
   OrderStatusFilter,
   OrdersResponse,
   Position,
   PositionStatus,
   PositionsResponse,
+  ProxyConfig,
+  ProxyTestResult,
   Settings,
+  SystemSettings,
 } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api/v1'
@@ -37,6 +43,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   try {
     response = await fetch(`${API_BASE}${path}`, {
       method: options.method || 'GET',
+      credentials: 'same-origin',
       headers: {
         Accept: 'application/json',
         ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
@@ -55,6 +62,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     : await response.text().catch(() => '')
 
   if (!response.ok) {
+    if (response.status === 401 && !path.startsWith('/auth/')) {
+      window.dispatchEvent(new Event('penny:unauthorized'))
+    }
     const message =
       payload && typeof payload === 'object' && 'error' in payload && typeof payload.error === 'string'
         ? payload.error
@@ -94,6 +104,21 @@ export const api = {
   settings: (signal?: AbortSignal) => request<Settings>('/settings', { signal }),
   updateSettings: (settings: Settings, signal?: AbortSignal) =>
     request<Settings>('/settings', { method: 'PUT', body: settings, signal }),
+  authStatus: (signal?: AbortSignal) => request<AuthStatus>('/auth/status', { signal }),
+  login: (password: string, signal?: AbortSignal) =>
+    request<void>('/auth/login', { method: 'POST', body: { password }, signal }),
+  logout: (signal?: AbortSignal) => request<void>('/auth/logout', { method: 'POST', signal }),
+  changePassword: (body: { current_password: string; new_password: string }, signal?: AbortSignal) =>
+    request<void>('/auth/password', { method: 'POST', body, signal }),
+  disablePassword: (currentPassword: string, signal?: AbortSignal) =>
+    request<void>('/auth/password/disable', { method: 'POST', body: { current_password: currentPassword }, signal }),
+  system: (signal?: AbortSignal) => request<SystemSettings>('/system', { signal }),
+  updateSystem: (
+    body: { proxy?: ProxyConfig; data_source?: DataSourceSettings; live?: LiveSettings },
+    signal?: AbortSignal,
+  ) => request<SystemSettings>('/system', { method: 'PUT', body, signal }),
+  testProxy: (proxy: ProxyConfig, signal?: AbortSignal) =>
+    request<ProxyTestResult>('/system/proxy/test', { method: 'POST', body: { proxy }, signal }),
   toggleEngine: (running: boolean, signal?: AbortSignal) =>
     request<Engine>('/engine/toggle', { method: 'POST', body: { running }, signal }),
   scan: (signal?: AbortSignal, execute = false) =>

@@ -10,6 +10,7 @@ import (
 
 	"pennyharvester/backend/internal/engine"
 	"pennyharvester/backend/internal/market"
+	"pennyharvester/backend/internal/netproxy"
 	"pennyharvester/backend/internal/store"
 )
 
@@ -49,7 +50,10 @@ type fakeLive struct {
 	fill      engine.LiveFill
 	err       error
 	lookup    map[string]engine.LiveFill
+	reloads   int
 }
+
+func (f *fakeLive) ReloadProxy() { f.reloads++ }
 
 func (f *fakeLive) Configured() bool   { return true }
 func (f *fakeLive) Signer() string     { return "0x0000000000000000000000000000000000000001" }
@@ -97,7 +101,7 @@ func newTestEngine(t *testing.T, provider market.Provider, live engine.LiveExecu
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { repository.Close() })
-	instance, err := engine.New(context.Background(), repository, provider, live)
+	instance, err := engine.New(context.Background(), repository, provider, live, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,6 +206,66 @@ func TestScanFiltersAndSettlesPaperPosition(t *testing.T) {
 	}
 	if dashboard.Metrics.Cash <= 10000 || dashboard.Metrics.OpenPositions != 0 || dashboard.Metrics.WinRate != 1 {
 		t.Fatalf("unexpected metrics: %+v", dashboard.Metrics)
+	}
+}
+
+func TestPaperBuyBooksFeeAndReportsIt(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	settings := instance.Settings()
+	if settings.FeeBPS <= 0 {
+		t.Fatalf("paper accounts must charge a fee by default, got %+v", settings)
+	}
+	position, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{
+		MarketID: "one", Outcome: "Yes", TokenID: "one-yes", Amount: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFee := 100 * settings.FeeBPS / 10000
+	if math.Abs(position.Fee-wantFee) > 1e-9 {
+		t.Fatalf("position fee = %v, want %v", position.Fee, wantFee)
+	}
+	if math.Abs(position.Cost-(100+wantFee)) > 1e-9 {
+		t.Fatalf("fee was not added to cost: %+v", position)
+	}
+	if math.Abs(position.EntryPrice-0.98196) > 1e-9 {
+		t.Fatalf("entry price must stay the execution price: %+v", position)
+	}
+	orders, err := instance.Orders(context.Background(), paper.ID, "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orders.Total != 1 || math.Abs(orders.Items[0].Fee-wantFee) > 1e-9 {
+		t.Fatalf("order fee was not recorded: %+v", orders.Items)
+	}
+	if math.Abs(orders.Items[0].Amount-position.Cost) > 1e-9 {
+		t.Fatalf("a filled order amount should be the cash spent: %+v", orders.Items[0])
+	}
+	dashboard, err := instance.Dashboard(context.Background(), paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(dashboard.Metrics.FeesPaid-wantFee) > 1e-9 {
+		t.Fatalf("dashboard fees_paid = %v, want %v", dashboard.Metrics.FeesPaid, wantFee)
+	}
+}
+
+func TestUpdateSettingsForcesFeeModelVersion(t *testing.T) {
+	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, nil)
+	settings := instance.Settings()
+	settings.FeeModelVersion = 0
+	settings.FeeBPS = 0
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	stored := instance.Settings()
+	if stored.FeeModelVersion != engine.FeeModelVersion {
+		t.Fatalf("fee model version must be server managed: %+v", stored)
+	}
+	if stored.FeeBPS != 0 {
+		t.Fatalf("an explicit zero fee must be kept: %+v", stored)
 	}
 }
 
@@ -548,5 +612,157 @@ func TestUnknownLiveOrderIsReconciled(t *testing.T) {
 	orders, err = instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0)
 	if err != nil || orders.Total != 1 || orders.Items[0].Status != "filled" || orders.Items[0].ExternalID != "pending-1" {
 		t.Fatalf("reconciliation did not finalize the order: %+v, %v", orders, err)
+	}
+}
+
+func TestUpdateSystemSettingsAppliesProxyAndReloadsLive(t *testing.T) {
+	ctx := context.Background()
+	executor := &fakeLive{}
+	instance, repository := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, executor)
+
+	if instance.SystemSettings().Proxy.Mode != netproxy.ModeEnvironment {
+		t.Fatalf("default system settings should follow the environment")
+	}
+
+	custom := engine.SystemSettings{Proxy: netproxy.Config{
+		Mode: netproxy.ModeCustom, URL: "http://127.0.0.1:7890", NoProxy: "localhost",
+	}}
+	if err := instance.UpdateSystemSettings(ctx, custom); err != nil {
+		t.Fatal(err)
+	}
+	if got := instance.SystemSettings(); got.Proxy.URL != custom.Proxy.URL || got.Proxy.Mode != netproxy.ModeCustom {
+		t.Fatalf("system settings were not applied: %+v", got)
+	}
+	if executor.reloads != 1 {
+		t.Fatalf("live executor reloads = %d, want 1", executor.reloads)
+	}
+	stored, err := repository.LoadSystemSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Proxy.URL != custom.Proxy.URL {
+		t.Fatalf("stored proxy = %q", stored.Proxy.URL)
+	}
+
+	if err := instance.UpdateSystemSettings(ctx, engine.SystemSettings{Proxy: netproxy.Config{Mode: "sometimes"}}); err == nil {
+		t.Fatalf("an invalid proxy mode must be rejected")
+	}
+	if executor.reloads != 1 {
+		t.Fatalf("a rejected update must not reload the live executor")
+	}
+}
+
+type runtimeProvider struct {
+	*fakeProvider
+	baseURL    string
+	defaultURL string
+}
+
+func (p *runtimeProvider) SetBaseURL(value string) error {
+	if value == "" {
+		value = p.defaultURL
+	}
+	p.baseURL = value
+	return nil
+}
+
+func (p *runtimeProvider) BaseURL() string        { return p.baseURL }
+func (p *runtimeProvider) DefaultBaseURL() string { return p.defaultURL }
+
+type runtimeLive struct {
+	*fakeLive
+	clobURL     string
+	defaultCLOB string
+	settings    engine.LiveSettings
+}
+
+func (l *runtimeLive) UpdateSettings(settings engine.LiveSettings, clobURL string) error {
+	if clobURL == "" {
+		clobURL = l.defaultCLOB
+	}
+	l.clobURL = clobURL
+	l.settings = settings
+	return nil
+}
+
+func (l *runtimeLive) EffectiveCLOBURL() string { return l.clobURL }
+
+func (l *runtimeLive) Environment() engine.LiveEnvironment {
+	return engine.LiveEnvironment{
+		CLOBBaseURL:   l.defaultCLOB,
+		PrivateKeySet: true,
+		SignatureType: 0,
+	}
+}
+
+func intPointer(value int) *int { return &value }
+
+func TestUpdateSystemSettingsAppliesEndpointsAndLiveOverrides(t *testing.T) {
+	ctx := context.Background()
+	provider := &runtimeProvider{
+		fakeProvider: &fakeProvider{markets: map[string]market.Market{}},
+		baseURL:      "https://default-gamma.example",
+		defaultURL:   "https://default-gamma.example",
+	}
+	live := &runtimeLive{
+		fakeLive:    &fakeLive{},
+		clobURL:     "https://default-clob.example",
+		defaultCLOB: "https://default-clob.example",
+	}
+	instance, repository := newTestEngine(t, provider, live)
+
+	if provider.BaseURL() != provider.DefaultBaseURL() || live.EffectiveCLOBURL() != live.defaultCLOB {
+		t.Fatalf("engine startup should inherit defaults: gamma=%q clob=%q", provider.BaseURL(), live.EffectiveCLOBURL())
+	}
+
+	key := "0x" + strings.Repeat("1", 64)
+	settings := engine.SystemSettings{
+		Proxy: netproxy.DefaultConfig(),
+		DataSource: engine.DataSourceSettings{
+			GammaBaseURL: "https://gamma.example.com",
+			CLOBBaseURL:  "https://clob.example.com",
+		},
+		Live: engine.LiveSettings{PrivateKey: key, SignatureType: intPointer(0)},
+	}
+	if err := instance.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	if provider.BaseURL() != settings.DataSource.GammaBaseURL {
+		t.Fatalf("gamma URL = %q", provider.BaseURL())
+	}
+	if live.EffectiveCLOBURL() != settings.DataSource.CLOBBaseURL {
+		t.Fatalf("clob URL = %q", live.EffectiveCLOBURL())
+	}
+	if live.settings.PrivateKey != key {
+		t.Fatalf("live settings were not applied: %+v", live.settings)
+	}
+	runtime := instance.SystemRuntime()
+	if runtime.GammaBaseURL != settings.DataSource.GammaBaseURL || runtime.CLOBBaseURL != settings.DataSource.CLOBBaseURL {
+		t.Fatalf("runtime endpoints = %+v", runtime)
+	}
+	if runtime.GammaDefault != provider.DefaultBaseURL() || runtime.CLOBDefault != live.defaultCLOB {
+		t.Fatalf("runtime defaults = %+v", runtime)
+	}
+	stored, err := repository.LoadSystemSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Live.PrivateKey != key || stored.DataSource.GammaBaseURL != settings.DataSource.GammaBaseURL {
+		t.Fatalf("stored settings = %+v", stored)
+	}
+
+	// Clearing the overrides falls back to the startup values.
+	cleared := engine.SystemSettings{Proxy: netproxy.DefaultConfig()}
+	if err := instance.UpdateSystemSettings(ctx, cleared); err != nil {
+		t.Fatal(err)
+	}
+	if provider.BaseURL() != provider.DefaultBaseURL() || live.EffectiveCLOBURL() != live.defaultCLOB {
+		t.Fatalf("cleared overrides did not restore defaults: gamma=%q clob=%q", provider.BaseURL(), live.EffectiveCLOBURL())
+	}
+
+	invalid := cleared
+	invalid.Live.PrivateKey = "not-a-key"
+	if err := instance.UpdateSystemSettings(ctx, invalid); err == nil {
+		t.Fatal("an invalid private key must be rejected")
 	}
 }

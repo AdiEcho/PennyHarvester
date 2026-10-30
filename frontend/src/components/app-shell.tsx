@@ -4,6 +4,7 @@ import {
   Binoculars,
   BookOpenCheck,
   CircleDollarSign,
+  Cog,
   FlaskConical,
   LayoutDashboard,
   Menu,
@@ -25,7 +26,7 @@ import { RiskNotice } from '@/components/risk-notice'
 import { ModeBadge } from '@/components/status-badges'
 import { ThemeToggle } from '@/components/theme-toggle'
 
-export type View = 'dashboard' | 'opportunities' | 'positions' | 'orders' | 'settings'
+export type View = 'dashboard' | 'opportunities' | 'positions' | 'orders' | 'settings' | 'system'
 
 const navigation: { id: View; label: string; icon: LucideIcon; section?: string }[] = [
   { id: 'dashboard', label: '账户总览', icon: LayoutDashboard, section: '工作台' },
@@ -33,6 +34,7 @@ const navigation: { id: View; label: string; icon: LucideIcon; section?: string 
   { id: 'positions', label: '我的持仓', icon: WalletCards },
   { id: 'orders', label: '订单记录', icon: BookOpenCheck },
   { id: 'settings', label: '参数设置', icon: Settings2, section: '系统' },
+  { id: 'system', label: '系统设置', icon: Cog },
 ]
 
 const viewNames: Record<View, string> = {
@@ -41,6 +43,7 @@ const viewNames: Record<View, string> = {
   positions: '我的持仓',
   orders: '订单记录',
   settings: '参数设置',
+  system: '系统设置',
 }
 
 function Brand() {
@@ -200,7 +203,7 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
               <div>
                 <p className="font-semibold">{account.live_configured ? '实盘账户还差一步即可就绪' : '实盘账户尚未配置钱包私钥'}</p>
                 <p className="mt-1 text-xs leading-5 text-rose-700">
-                  {account.live_configured ? <>{account.live_error || '请检查代理钱包地址（POLYMARKET_FUNDER）、API 凭据以及 Polymarket 上的 USDC 授权状态。'}</> : <>服务端尚未配置 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code>，目前无法提交实盘订单。你可以先在右上角切换到「模拟账户」体验策略，或在服务端配置好钱包私钥后重启服务。</>}
+                  {account.live_configured ? <>{account.live_error || '请检查代理钱包地址（POLYMARKET_FUNDER）、API 凭据以及 Polymarket 上的 USDC 授权状态。'}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code> 后重启服务。你也可以先在右上角切换到「模拟账户」体验策略。</>}
                 </p>
               </div>
             </div>

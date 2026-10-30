@@ -41,6 +41,7 @@ export interface Metrics {
   realized_pnl: number
   unrealized_pnl: number
   total_pnl: number
+  fees_paid: number
   total_return: number
   open_exposure: number
   open_positions: number
@@ -146,6 +147,7 @@ export interface Order {
   amount: number
   price: number
   shares: number
+  fee: number
   status: OrderStatus
   reason: string
   external_id: string
@@ -169,4 +171,78 @@ export interface Settings {
   slippage_bps: number
   fee_bps: number
   initial_bankroll: number
+}
+
+export type ProxyMode = 'environment' | 'custom' | 'off'
+
+export interface ProxyConfig {
+  mode: ProxyMode
+  url: string
+  no_proxy: string
+}
+
+export interface DataSourceSettings {
+  gamma_base_url: string
+  clob_base_url: string
+}
+
+export interface LiveSettings {
+  private_key: string
+  funder: string
+  signature_type: number | null
+  api_key: string
+  api_secret: string
+  api_passphrase: string
+}
+
+export interface LiveEnvironment {
+  clob_base_url: string
+  private_key_set: boolean
+  funder: string
+  signature_type: number
+  api_key_set: boolean
+  api_secret_set: boolean
+  api_passphrase_set: boolean
+}
+
+export interface SystemRuntime {
+  gamma_base_url: string
+  clob_base_url: string
+  gamma_default: string
+  clob_default: string
+  live_environment: LiveEnvironment
+  live_configured: boolean
+  live_ready: boolean
+  live_error: string
+  error: string
+}
+
+export interface SystemEnvironment {
+  http_proxy_set: boolean
+  https_proxy_set: boolean
+  no_proxy: string
+}
+
+export interface SystemSettings {
+  proxy: ProxyConfig
+  data_source: DataSourceSettings
+  live: LiveSettings
+  runtime: SystemRuntime
+  password_set: boolean
+  proxy_probe_url: string
+  environment: SystemEnvironment
+}
+
+export interface ProxyTestResult {
+  ok: boolean
+  target: string
+  mode: ProxyMode
+  latency_ms: number
+  status_code?: number
+  error?: string
+}
+
+export interface AuthStatus {
+  required: boolean
+  authenticated: boolean
 }

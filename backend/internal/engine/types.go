@@ -2,13 +2,16 @@ package engine
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"strings"
 	"time"
 
 	"pennyharvester/backend/internal/market"
+	"pennyharvester/backend/internal/netproxy"
 )
 
 var (
@@ -18,6 +21,7 @@ var (
 	ErrLiveUnavailable = errors.New("实盘交易不可用")
 	ErrAccountNotFound = errors.New("账户不存在")
 	ErrAccountConflict = errors.New("账户状态冲突")
+	ErrInvalidSettings = errors.New("系统设置无效")
 )
 
 type AccountMode string
@@ -50,6 +54,10 @@ type Account struct {
 	LiveError      string `json:"live_error"`
 }
 
+// FeeModelVersion is bumped whenever the default fee accounting changes so a
+// database written by an older build can be upgraded exactly once on load.
+const FeeModelVersion = 2
+
 type Settings struct {
 	MinPrice            float64 `json:"min_price"`
 	MaxPrice            float64 `json:"max_price"`
@@ -62,14 +70,25 @@ type Settings struct {
 	SlippageBPS         float64 `json:"slippage_bps"`
 	FeeBPS              float64 `json:"fee_bps"`
 	InitialBankroll     float64 `json:"initial_bankroll"`
+	// FeeModelVersion is managed by the server; clients must not set it.
+	FeeModelVersion int `json:"fee_model_version"`
 }
+
+// DefaultFeeBPS approximates Polymarket's taker fee for this strategy's price
+// band. The exchange charges fee = shares × rate × p × (1 - p), so as a share
+// of the traded notional that is rate × (1 - p): about 25 bps at p=0.95 and
+// 5 bps at p=0.99 for a 0.05 category rate. 15 bps matches p≈0.97 and stays
+// slightly conservative across the 0.95–0.99 range. Live accounts never use
+// this value: they read the market's real FeeSchedule.
+const DefaultFeeBPS = 15
 
 func DefaultSettings() Settings {
 	return Settings{
 		MinPrice: 0.95, MaxPrice: 0.99, MaxDays: 30, MinLiquidity: 10000,
 		OrderSize: 100, MaxPosition: 250, MaxExposure: 1000,
-		ScanIntervalSeconds: 60, SlippageBPS: 20, FeeBPS: 0,
+		ScanIntervalSeconds: 60, SlippageBPS: 20, FeeBPS: DefaultFeeBPS,
 		InitialBankroll: 10000,
+		FeeModelVersion: FeeModelVersion,
 	}
 }
 
@@ -101,6 +120,243 @@ func (s Settings) Validate() error {
 		return fmt.Errorf("滑点和费率须为 0–1000 BPS")
 	}
 	return nil
+}
+
+// SystemSettings holds runtime settings that are edited in the web UI instead
+// of the process environment. They are persisted in SQLite so they survive a
+// restart without leaking into shell history or .env files. Empty strings mean
+// "inherit the process environment / built-in default", which keeps existing
+// deployments working while allowing the UI to override them at runtime.
+type SystemSettings struct {
+	Proxy      netproxy.Config    `json:"proxy"`
+	DataSource DataSourceSettings `json:"data_source"`
+	Live       LiveSettings       `json:"live"`
+}
+
+// DataSourceSettings overrides the public data and CLOB endpoints. An empty
+// value falls back to GAMMA_BASE_URL / POLYMARKET_CLOB_URL or the built-in
+// public defaults.
+type DataSourceSettings struct {
+	GammaBaseURL string `json:"gamma_base_url"`
+	CLOBBaseURL  string `json:"clob_base_url"`
+}
+
+func (d DataSourceSettings) Normalize() DataSourceSettings {
+	d.GammaBaseURL = strings.TrimRight(strings.TrimSpace(d.GammaBaseURL), "/")
+	d.CLOBBaseURL = strings.TrimRight(strings.TrimSpace(d.CLOBBaseURL), "/")
+	return d
+}
+
+func (d DataSourceSettings) Validate() error {
+	d = d.Normalize()
+	if err := validateBaseURL("Gamma 行情地址", d.GammaBaseURL); err != nil {
+		return err
+	}
+	return validateBaseURL("CLOB 交易地址", d.CLOBBaseURL)
+}
+
+func validateBaseURL(label, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s无效: %w", label, err)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return fmt.Errorf("%s仅支持 http 或 https", label)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("%s缺少主机与端口", label)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("%s不能包含用户名或密码", label)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s不能包含查询参数或片段", label)
+	}
+	return nil
+}
+
+// LiveSettings are web-managed overrides for the live CLOB executor. Secrets
+// are encrypted at rest by the store layer and are never returned to the
+// browser in clear text.
+type LiveSettings struct {
+	PrivateKey    string `json:"private_key"`
+	Funder        string `json:"funder"`
+	SignatureType *int   `json:"signature_type"`
+	APIKey        string `json:"api_key"`
+	APISecret     string `json:"api_secret"`
+	APIPassphrase string `json:"api_passphrase"`
+}
+
+func (s LiveSettings) Normalize() LiveSettings {
+	s.PrivateKey = normalizeHexPrefix(strings.TrimSpace(s.PrivateKey))
+	s.Funder = normalizeHexPrefix(strings.TrimSpace(s.Funder))
+	s.APIKey = strings.TrimSpace(s.APIKey)
+	s.APISecret = strings.TrimSpace(s.APISecret)
+	s.APIPassphrase = strings.TrimSpace(s.APIPassphrase)
+	if s.SignatureType != nil {
+		value := *s.SignatureType
+		s.SignatureType = &value
+	}
+	return s
+}
+
+func normalizeHexPrefix(value string) string {
+	if len(value) >= 2 && strings.EqualFold(value[:2], "0x") {
+		return "0x" + value[2:]
+	}
+	return value
+}
+
+func (s LiveSettings) Validate() error {
+	s = s.Normalize()
+	if s.PrivateKey != "" && !validHexValue(s.PrivateKey, 32) {
+		return fmt.Errorf("实盘私钥必须是 0x 开头的 64 位十六进制字符串")
+	}
+	if s.Funder != "" && !validHexValue(s.Funder, 20) {
+		return fmt.Errorf("Funder 必须是 0x 开头的 40 位十六进制地址")
+	}
+	if s.SignatureType != nil {
+		if *s.SignatureType < 0 || *s.SignatureType > 3 {
+			return fmt.Errorf("签名类型仅支持 0（EOA）、1（Proxy）、2（Safe）或 3（Deposit/Poly1271）")
+		}
+		if *s.SignatureType == 0 && s.Funder != "" {
+			return fmt.Errorf("EOA 签名类型不需要 Funder，请留空或改用 1/2/3")
+		}
+	}
+	credentials := 0
+	for _, value := range []string{s.APIKey, s.APISecret, s.APIPassphrase} {
+		if value != "" {
+			credentials++
+		}
+	}
+	if credentials != 0 && credentials != 3 {
+		return fmt.Errorf("L2 API Key、Secret、Passphrase 必须同时填写或同时留空")
+	}
+	return nil
+}
+
+// Redacted returns a copy safe to send to the browser. The API key is an
+// identifier, but the private key and L2 secrets are masked.
+func (s LiveSettings) Redacted() LiveSettings {
+	s = s.Normalize()
+	if s.PrivateKey != "" {
+		s.PrivateKey = netproxy.RedactedSecret
+	}
+	if s.APISecret != "" {
+		s.APISecret = netproxy.RedactedSecret
+	}
+	if s.APIPassphrase != "" {
+		s.APIPassphrase = netproxy.RedactedSecret
+	}
+	return s
+}
+
+// MergeSecret restores stored secrets when the browser echoes back the masked
+// values it received. An explicit empty value still clears the override.
+func (s LiveSettings) MergeSecret(previous LiveSettings) LiveSettings {
+	s = s.Normalize()
+	previous = previous.Normalize()
+	if s.PrivateKey == netproxy.RedactedSecret {
+		s.PrivateKey = previous.PrivateKey
+	}
+	if s.APISecret == netproxy.RedactedSecret {
+		s.APISecret = previous.APISecret
+	}
+	if s.APIPassphrase == netproxy.RedactedSecret {
+		s.APIPassphrase = previous.APIPassphrase
+	}
+	return s
+}
+
+func validHexValue(value string, bytes int) bool {
+	if len(value) != 2+bytes*2 || !strings.HasPrefix(strings.ToLower(value), "0x") {
+		return false
+	}
+	decoded, err := hex.DecodeString(value[2:])
+	return err == nil && len(decoded) == bytes
+}
+
+func DefaultSystemSettings() SystemSettings {
+	return SystemSettings{Proxy: netproxy.DefaultConfig()}
+}
+
+func (s SystemSettings) Validate() error {
+	if err := s.Proxy.Validate(); err != nil {
+		return err
+	}
+	if err := s.DataSource.Validate(); err != nil {
+		return err
+	}
+	return s.Live.Validate()
+}
+
+func (s SystemSettings) Normalize() SystemSettings {
+	s.Proxy = s.Proxy.Normalize()
+	s.DataSource = s.DataSource.Normalize()
+	s.Live = s.Live.Normalize()
+	return s
+}
+
+func (s SystemSettings) Redacted() SystemSettings {
+	s = s.Normalize()
+	s.Proxy = s.Proxy.Redacted()
+	s.Live = s.Live.Redacted()
+	return s
+}
+
+func (s SystemSettings) MergeSecret(previous SystemSettings) SystemSettings {
+	s = s.Normalize()
+	previous = previous.Normalize()
+	s.Proxy = s.Proxy.MergeSecret(previous.Proxy)
+	s.Live = s.Live.MergeSecret(previous.Live)
+	return s
+}
+
+// LiveEnvironment reports which values were supplied by the process
+// environment at startup. The web UI uses it to show inheritance hints.
+type LiveEnvironment struct {
+	CLOBBaseURL      string `json:"clob_base_url"`
+	PrivateKeySet    bool   `json:"private_key_set"`
+	Funder           string `json:"funder"`
+	SignatureType    int    `json:"signature_type"`
+	APIKeySet        bool   `json:"api_key_set"`
+	APISecretSet     bool   `json:"api_secret_set"`
+	APIPassphraseSet bool   `json:"api_passphrase_set"`
+}
+
+// SystemRuntime is the effective, read-only view of the runtime settings. It
+// is not persisted; it is assembled from the provider and live executor.
+type SystemRuntime struct {
+	GammaBaseURL    string          `json:"gamma_base_url"`
+	CLOBBaseURL     string          `json:"clob_base_url"`
+	GammaDefault    string          `json:"gamma_default"`
+	CLOBDefault     string          `json:"clob_default"`
+	LiveEnvironment LiveEnvironment `json:"live_environment"`
+	LiveConfigured  bool            `json:"live_configured"`
+	LiveReady       bool            `json:"live_ready"`
+	LiveError       string          `json:"live_error"`
+	Error           string          `json:"error"`
+}
+
+// dataSourceRuntime is implemented by market providers that can switch their
+// base URL without a restart.
+type dataSourceRuntime interface {
+	SetBaseURL(string) error
+	BaseURL() string
+	DefaultBaseURL() string
+}
+
+// liveSettingsRuntime is implemented by the CLOB executor so the engine can
+// apply web-managed credentials at runtime.
+type liveSettingsRuntime interface {
+	UpdateSettings(LiveSettings, string) error
+	EffectiveCLOBURL() string
+	Environment() LiveEnvironment
 }
 
 type Opportunity struct {
@@ -144,18 +400,21 @@ type Position struct {
 }
 
 type Order struct {
-	ID         int64     `json:"id"`
-	AccountID  int64     `json:"account_id"`
-	PositionID *int64    `json:"position_id"`
-	MarketID   string    `json:"market_id"`
-	Question   string    `json:"question"`
-	Outcome    string    `json:"outcome"`
-	TokenID    string    `json:"token_id"`
-	Kind       string    `json:"kind"`
-	Type       string    `json:"type"`
-	Amount     float64   `json:"amount"`
-	Price      float64   `json:"price"`
-	Shares     float64   `json:"shares"`
+	ID         int64   `json:"id"`
+	AccountID  int64   `json:"account_id"`
+	PositionID *int64  `json:"position_id"`
+	MarketID   string  `json:"market_id"`
+	Question   string  `json:"question"`
+	Outcome    string  `json:"outcome"`
+	TokenID    string  `json:"token_id"`
+	Kind       string  `json:"kind"`
+	Type       string  `json:"type"`
+	Amount     float64 `json:"amount"`
+	Price      float64 `json:"price"`
+	Shares     float64 `json:"shares"`
+	// Fee is the taker fee paid on top of Amount for a filled buy. Settlement
+	// (redemption) orders carry no fee: Polymarket redeems at par.
+	Fee        float64   `json:"fee"`
 	Status     string    `json:"status"`
 	Reason     string    `json:"reason"`
 	ExternalID string    `json:"external_id"`
@@ -168,15 +427,18 @@ type EquityPoint struct {
 }
 
 type Metrics struct {
-	Mode             string  `json:"mode"`
-	InitialBankroll  float64 `json:"initial_bankroll"`
-	Cash             float64 `json:"cash"`
-	WalletCash       float64 `json:"wallet_cash"`
-	WalletCashStale  bool    `json:"wallet_cash_stale"`
-	Equity           float64 `json:"equity"`
-	RealizedPNL      float64 `json:"realized_pnl"`
-	UnrealizedPNL    float64 `json:"unrealized_pnl"`
-	TotalPNL         float64 `json:"total_pnl"`
+	Mode            string  `json:"mode"`
+	InitialBankroll float64 `json:"initial_bankroll"`
+	Cash            float64 `json:"cash"`
+	WalletCash      float64 `json:"wallet_cash"`
+	WalletCashStale bool    `json:"wallet_cash_stale"`
+	Equity          float64 `json:"equity"`
+	RealizedPNL     float64 `json:"realized_pnl"`
+	UnrealizedPNL   float64 `json:"unrealized_pnl"`
+	TotalPNL        float64 `json:"total_pnl"`
+	// FeesPaid is the sum of the buy-side taker fees already booked into the
+	// cost of every position, open or settled.
+	FeesPaid         float64 `json:"fees_paid"`
 	TotalReturn      float64 `json:"total_return"`
 	OpenExposure     float64 `json:"open_exposure"`
 	OpenPositions    int     `json:"open_positions"`
@@ -267,6 +529,9 @@ type LiveExecutor interface {
 type Repository interface {
 	LoadSettings(context.Context) (Settings, error)
 	SaveSettings(context.Context, Settings) error
+
+	LoadSystemSettings(context.Context) (SystemSettings, error)
+	SaveSystemSettings(context.Context, SystemSettings) error
 
 	ListAccounts(context.Context) ([]Account, error)
 	AccountByID(context.Context, int64) (Account, error)

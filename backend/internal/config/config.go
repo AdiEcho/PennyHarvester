@@ -5,6 +5,16 @@ import (
 	"strconv"
 )
 
+// Builder attribution. Every order this deployment signs carries BuilderCode so
+// matched trades are credited to the builder profile (and its fee share). The
+// code is public: it is serialized into the signed order and is not a secret.
+// BuilderAddress only identifies the builder account for reference — never send
+// funds to it.
+const (
+	BuilderAddress = "0x1db6b86b012d59ebda322390d462295a6817a0c4"
+	BuilderCode    = "0x07718b719cce8cdfb015b268d90732d15f7071e9fa845bd16ec058b0ab2226eb"
+)
+
 type Config struct {
 	Addr         string
 	DatabasePath string

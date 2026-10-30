@@ -16,7 +16,7 @@
 系统内置「实盘」与「模拟」两套完全隔离的账本，首次启动时会自动创建默认账户：
 
 - **实盘账户（默认，`mode=live`）**
-  通过服务端环境变量中的私钥派生 CLOB L2 API 凭据，使用 EIP-712 签名向 Polymarket 提交真实订单。每个实例仅允许存在一个实盘账户，且不可删除。若未配置私钥，实盘下单会被明确拦截并提示原因，**绝不会静默回退到模拟盘**，避免误判交易状态。
+  通过网页「系统设置」或服务端环境变量提供的私钥派生 CLOB L2 API 凭据，使用 EIP-712 签名向 Polymarket 提交真实订单。每个实例仅允许存在一个实盘账户，且不可删除。若未配置私钥，实盘下单会被明确拦截并提示原因，**绝不会静默回退到模拟盘**，避免误判交易状态。
 - **模拟账户（`mode=paper`）**
   实时同步 Polymarket 公开行情，但使用虚拟资金在本地 SQLite 中记账，按可配置的滑点、手续费与风控规则模拟撮合，不会发出任何真实订单。支持创建多个模拟账户以对比不同参数方案；删除模拟账户时会一并清理其持仓、订单和净值记录。
 - **独立隔离与安全开关**
@@ -42,9 +42,18 @@
 - **多维绩效指标**：实时核算已实现盈亏、浮动盈亏、胜率（自动剔除平局退款样本）、策略可用资金、钱包真实 USDC 余额、当前持仓投入与历史净值曲线。
 
 ### 4. 可视化工作台与工程底座
-- **五大核心视图**：账户总览、机会雷达、我的持仓、订单记录、参数设置，支持深浅色主题切换与响应式布局。
+- **六大核心视图**：账户总览、机会雷达、我的持仓、订单记录、参数设置、系统设置，支持深浅色主题切换与响应式布局。
 - **扫描与下单解耦**：手动点击「刷新行情/扫描」默认只更新行情、持仓盯市与净值快照，不会触发自动买单；后台扫描引擎则按各账户独立的自动交易开关执行策略。
 - **开箱即用与安全默认**：内置 SQLite 事务级自动迁移、优雅停机、请求体大小限制、安全响应头，默认仅监听本地回环地址（`127.0.0.1`），并通过 Go 竞态检测（`-race`）与前后端构建测试。
+
+### 5. 系统设置（接口、实盘凭据、网络代理与访问密码）
+- **行情与交易接口**：在「系统设置」页直接修改 Gamma 行情地址与 CLOB 交易地址，支持自建镜像或本地代理。保存后新的行情与交易请求立即使用新地址，无需重启；留空则继承环境变量或官方默认值。
+- **网页配置实盘凭据**：钱包私钥、签名类型、Funder 以及可选的 CLOB L2 API Key / Secret / Passphrase 都可以在网页中填写。网页值优先于启动环境变量；私钥与 L2 Secret 使用 AES-256-GCM 加密保存在 SQLite，读取时只返回 `******` 掩码，前端原样回传时后端自动还原。
+- **网络出口代理**：在「系统设置」页统一配置后端访问 Polymarket 的出口，支持「跟随环境变量（`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`）」「自定义代理（http / https / socks5，支持 `NO_PROXY` 白名单）」「直连（忽略环境变量）」三种模式。修改后立即应用到 Gamma 行情与 CLOB 实盘请求，无需重启；配置保存在本机 SQLite 的 `system_settings` 表。
+- **代理连通性测试**：保存前可用「测试连接」按钮通过当前表单配置探测 `https://clob.polymarket.com/time`，返回状态码与耗时；测试不会保存设置。
+- **代理凭据保护**：代理地址中的密码在读取时以 `******` 掩码返回，前端原样回传时后端会自动还原，避免误清空密钥。
+- **网页访问密码**：可选启用（默认关闭，保持本地无认证的默认行为）。启用后所有 API 与工作台都需要登录，密码以 bcrypt 哈希保存在 `access_password` 表，登录会话为 `HttpOnly` + `SameSite=Strict` Cookie，有效期 7 天；连续输错 5 次会被临时限流。
+- **密码修改与关闭**：系统设置页支持校验当前密码后修改或关闭保护；修改密码会自动使其他浏览器会话失效。
 
 ---
 
@@ -63,7 +72,21 @@
 ```
 
 - 若计入滑点后的模拟成交价 `p'` 超过策略设定的最高买入价 `max_price`，该笔模拟订单会被直接拒绝。
-- 模拟账户采用固定 `fee_bps` 近似估算费用，不复刻 CLOB 的非线性费率公式；若需贴近实盘成本，可手动调高 `fee_bps`。
+- Polymarket 的实盘 taker 费为 `fee = 份额 × 类别费率 × p × (1 − p)`，折算成名义金额占比即 `类别费率 × (1 − p)`。因此理论等效费率为：
+
+  ```text
+  fee_bps ≈ 类别费率 × (1 − p) × 10000
+  ```
+
+  | 成交价 | 类别费率 0.04 | 0.05 | 0.07 |
+  |---|---:|---:|---:|
+  | 0.95 | 20 bps | 25 bps | 35 bps |
+  | 0.97 | 12 bps | 15 bps | 21 bps |
+  | 0.98 | 8 bps | 10 bps | 14 bps |
+  | 0.99 | 4 bps | 5 bps | 7 bps |
+
+- 默认 `fee_bps = 15`，对应 `p≈0.97`、类别费率 `0.05`，在本策略的 0.95–0.99 区间内整体偏保守。旧版本写入的默认 `0` 会在首次加载时一次性升级为 15；升级后如需 0 费（例如只做地缘政治这类免手续费市场）可以再手动改回。
+- 模拟账户仍采用固定 `fee_bps` 近似，不复刻 CLOB 的非线性费率曲线；要更贴近某个具体价位，按上表换算后填入即可。
 - `initial_bankroll`（模拟初始本金）仅在**新建模拟账户**时写入该账户的基准权益；后续修改全局默认值不会重算已有账户的历史现金或累计收益率。
 
 ### 实盘账户（`mode=live`）
@@ -79,6 +102,9 @@
 ```
 
 - 实盘提交前会检查盘口价格是否超过 `max_price`，并按预估手续费提前校验和预留可用资金与风险敞口。
+- 手续费在成交时按 USDC 从钱包额外扣除，**不会减少成交份额**；系统把费用累加进持仓 `Cost`，并同时记录在 `positions.fee` 与 `orders.fee`，因此已实现/未实现盈亏与「累计盈亏」卡片都已含费。
+- 预估或计算失败时**不会按 0 费记账**：费率超出 0–0.10、费用超过名义金额 10%、或读取 `FeeSchedule` 失败，都会拒绝下单/将对账中的订单保持待确认状态。
+- 费率口径（2026-10-30 核对）：[Fees](https://docs.polymarket.com/trading/fees) 列为 taker-only、按类别费率、5 位小数向下取整；[Resolution](https://docs.polymarket.com/concepts/resolution) 与 [Manage Positions](https://docs.polymarket.com/trading/positions/manage) 明确获胜份额按 1:1 兑付、赎回不收取费用。
 - 界面展示的「年化收益率」为基于当前剩余天数的**简单年化理论值**，并非复利预测，也不构成任何收益承诺。
 
 ### 默认策略参数
@@ -92,7 +118,7 @@
 | 单市场 / 总敞口上限 | `250 / 1,000 USD` | 单一市场最大投入与账户总持仓投入上限 |
 | 模拟初始资金 | `10,000 USD` | 仅对新创建的模拟账户生效 |
 | 模拟滑点 (`slippage_bps`) | `20 BPS` | 模拟买入时的价格上浮比例（0.20%） |
-| 模拟费用 (`fee_bps`) | `0 BPS` | 建议根据目标市场实际费率手动上调 |
+| 模拟费用 (`fee_bps`) | `15 BPS` | 按名义金额计，≈ `类别费率 × (1 − p)`；见上表换算 |
 | 实盘手续费 | 自动计算 | 按市场 `FeeSchedule` 动态读取并核算 |
 | 扫描间隔 | `60 秒` | 后台引擎自动轮询行情的周期 |
 | 默认账户 / 自动交易 | `实盘 / 关闭` | 自动交易默认关闭，需按账户单独开启 |
@@ -154,10 +180,10 @@ npm run dev
 
 ### 配置实盘交易（可选）
 
-实盘凭据**仅从服务端环境变量读取**，绝不写入数据库或暴露给前端：
+推荐直接在网页「系统设置 → 实盘交易凭据」中填写，保存后立即重建 CLOB 客户端，无需重启。也可以继续使用服务端环境变量；网页中留空的字段会继承环境变量：
 
 ```bash
-export POLYMARKET_PRIVATE_KEY=0x...          # 必填：钱包签名私钥
+export POLYMARKET_PRIVATE_KEY=0x...          # 可选：钱包签名私钥
 export POLYMARKET_SIGNATURE_TYPE=0           # 0=EOA，1=Proxy，2=Safe，3=Deposit/Poly1271
 export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式必须留空
 # export POLYMARKET_API_KEY=...              # 可选：若已有 CLOB L2 凭据可直接指定
@@ -165,8 +191,10 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 # export POLYMARKET_API_PASSPHRASE=...
 ```
 
+- **网页凭据的存储方式**：私钥、L2 Secret 与 Passphrase 以 AES-256-GCM 加密写入 SQLite；密钥文件默认位于数据库旁（`<DATABASE_PATH>.key`，权限 `0600`）。请将数据库与密钥文件一同备份；丢失密钥将无法解密已保存的凭据。网页与 API 永远不会返回明文私钥。
 - 若未手动提供 L2 API 凭据，系统会在首次执行实盘操作时自动通过私钥派生。
-- 请将私钥保存在进程管理器、系统密钥环或受控的本地密钥文件中，**切勿提交至 Git 仓库**。
+- **开发者码（Builder Code）已内置**：`backend/internal/config/config.go` 中硬编码了 `BuilderCode`（及仅供识别的 `BuilderAddress`），实盘订单在签名前会写入该 `builder` 字段，用于把成交归因到对应 builder 档案并参与分佣。该值为公开标识，不是密钥，也不需要环境变量配置。
+- 请使用专用的小额热钱包，**切勿将私钥提交至 Git 仓库**；网页保存的私钥也应按同等敏感级别保护数据库与密钥文件。
 - **实盘资金口径说明**：实盘账户的「策略可用资金」计算公式为 `首次同步的钱包 USDC 基准 + 已实现盈亏 − 当前未平仓成本`，同时界面会并列展示链上真实的「钱包 USDC 余额」。该核算方式假设该钱包专用于本策略；若同一钱包内还有你在 Polymarket 手动交易的其他仓位，策略账面可用资金会与钱包真实余额产生偏差。
 - **Signer 与 Maker 说明**：实盘账户的下单地址（`maker`）可能是 EOA 签名地址本身，也可能是 `POLYMARKET_FUNDER` 指向的 Proxy / Safe 代理钱包，参数设置页会分别展示两者。注意：**使用 EOA 模式（`POLYMARKET_SIGNATURE_TYPE=0`）时，请务必将 `POLYMARKET_FUNDER` 留空**。
 
@@ -174,23 +202,27 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 ## 环境变量配置
 
-后端所有运行参数均通过环境变量注入（配置示例参见 [.env.example](.env.example)）：
+`ADDR`、`DATABASE_PATH`、`WEB_DIR` 属于启动参数；其余运行时选项都可以在页面「系统设置」中维护并保存在本机 SQLite。下表中的 `GAMMA_BASE_URL`、`POLYMARKET_*` 与代理变量是**可选的环境变量回退值**：网页中保存了非空值时优先使用网页值，留空时继承环境变量或内置默认值（配置示例参见 [.env.example](.env.example)）。
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `ADDR` | `127.0.0.1:8080` | HTTP 服务监听地址 |
-| `DATABASE_PATH` | `./data/pennyharvester.db` | SQLite 数据库文件路径 |
-| `GAMMA_BASE_URL` | `https://gamma-api.polymarket.com` | Polymarket Gamma 公共行情 API 地址 |
-| `WEB_DIR` | 空 | 前端静态产物目录（配置后由后端同端口托管页面） |
-| `POLYMARKET_PRIVATE_KEY` | 空 | 实盘签名私钥；留空时实盘交易不可用 |
-| `POLYMARKET_SIGNATURE_TYPE` | `0` | 签名类型：`0` EOA、`1` Proxy、`2` Safe、`3` Deposit/Poly1271 |
-| `POLYMARKET_FUNDER` | 空 | 非 EOA 签名类型对应的代理/Safe 钱包地址；EOA 模式必须留空（兼容旧变量名 `POLYMARKET_MAKER_ADDRESS`） |
-| `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | Polymarket CLOB 交易接口地址 |
-| `POLYMARKET_API_KEY` | 空 | 可选，复用已有的 CLOB L2 API Key |
-| `POLYMARKET_API_SECRET` | 空 | 可选，复用已有的 CLOB L2 API Secret |
-| `POLYMARKET_API_PASSPHRASE` | 空 | 可选，复用已有的 CLOB L2 API Passphrase |
+| `ADDR` | `127.0.0.1:8080` | HTTP 服务监听地址（启动参数，修改需重启） |
+| `DATABASE_PATH` | `./data/pennyharvester.db` | SQLite 数据库文件路径（启动参数，修改需重启） |
+| `GAMMA_BASE_URL` | `https://gamma-api.polymarket.com` | 公共行情地址的默认值；可在网页「系统设置」中覆盖 |
+| `WEB_DIR` | 空 | 前端静态产物目录（启动参数；配置后由后端同端口托管页面） |
+| `POLYMARKET_PRIVATE_KEY` | 空 | 实盘签名私钥的可选回退值；也可在网页中加密保存 |
+| `POLYMARKET_SIGNATURE_TYPE` | `0` | 签名类型的可选回退值：`0` EOA、`1` Proxy、`2` Safe、`3` Deposit/Poly1271 |
+| `POLYMARKET_FUNDER` | 空 | 非 EOA 签名类型对应的代理/Safe 钱包地址的可选回退值；EOA 模式必须留空（兼容旧变量名 `POLYMARKET_MAKER_ADDRESS`） |
+| `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | CLOB 交易地址的默认值；可在网页「系统设置」中覆盖 |
+| `POLYMARKET_API_KEY` | 空 | 可选，复用已有的 CLOB L2 API Key；也可在网页中填写 |
+| `POLYMARKET_API_SECRET` | 空 | 可选，复用已有的 CLOB L2 API Secret；也可在网页中加密保存 |
+| `POLYMARKET_API_PASSPHRASE` | 空 | 可选，复用已有的 CLOB L2 API Passphrase；也可在网页中加密保存 |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 仅当代理模式为「跟随环境变量」（默认）时生效；由 Go 标准库在首次请求时读取并缓存 |
+| `NO_PROXY` | 空 | 仅当代理模式为「跟随环境变量」时生效，逗号分隔的主机/域名列表 |
 
-> **安全提醒**：本项目不会自动加载 `.env` 文件，请通过 Shell 或进程管理器注入环境变量。后端 API 默认不设身份认证，**请勿直接暴露在公网环境**；如需远程访问，请务必自行配置反向代理、TLS 加密与访问控制。私钥等同于钱包资产控制权，请务必使用专用的小额热钱包并严格限制宿主机权限。
+> **安全提醒**：本项目不会自动加载 `.env` 文件，请通过 Shell 或进程管理器注入环境变量。后端默认不设身份认证，**请勿直接暴露在公网环境**；如需远程访问，请先在「系统设置」中启用访问密码，并自行配置 TLS 反向代理与网络访问控制。私钥等同于钱包资产控制权，请务必使用专用的小额热钱包并严格限制宿主机权限。网页保存的实盘私钥与 L2 Secret 会加密写入 SQLite，但数据库旁的 `<DATABASE_PATH>.key` 密钥文件仍是敏感文件，请与数据库一同保护。
+
+> **代理说明**：出口代理的默认模式为「跟随环境变量」，与旧版本行为一致；进程启动时读取一次 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`（Go 标准库会缓存该环境）。若需要在不重启的情况下切换出口，请在「系统设置」中选择「自定义代理」或「直连」。
 
 ---
 
@@ -211,6 +243,13 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `GET` | `/positions?account_id=1&status=open` | 查询持仓列表，`status` 支持 `all / open / won / lost / split` |
 | `GET` | `/orders?account_id=1&status=all&limit=100&offset=0` | 查询订单记录，`status` 支持 `all / filled / settled / rejected / pending / unknown / unresolved` |
 | `GET / PUT` | `/settings` | 读取或更新全局策略筛选条件与风控参数 |
+| `GET / PUT` | `/system` | 读取或更新系统设置（Gamma / CLOB 地址、实盘凭据、网络出口代理）；私钥、L2 Secret、Passphrase 与代理密码在响应中自动掩码。请求体支持按分区部分更新：`proxy`、`data_source`、`live` 可单独提交；提交 `live` 时请带上该分区的完整字段，掩码值会自动还原为已保存的密钥 |
+| `POST` | `/system/proxy/test` | 使用请求体中的代理配置探测 `https://clob.polymarket.com/time`，不保存设置 |
+| `GET` | `/auth/status` | 查询是否需要登录与当前会话是否有效（无需登录即可访问） |
+| `POST` | `/auth/login` | 使用访问密码登录，成功后在 `ph_session` Cookie 中下发会话 |
+| `POST` | `/auth/logout` | 退出登录并吊销当前会话 |
+| `POST` | `/auth/password` | 首次设置或修改访问密码（需提供当前密码），成功后重新下发会话 |
+| `POST` | `/auth/password/disable` | 校验当前密码后关闭访问密码保护 |
 | `POST` | `/engine/toggle` | 启停后台定时扫描引擎，请求体：`{"running":false}` |
 | `POST` | `/accounts/:id/orders` | 在指定账户下提交一笔实盘或模拟买入订单 |
 
@@ -232,7 +271,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 ## 数据库迁移与测试验证
 
 ### 自动数据库迁移
-服务启动时会自动检测并升级旧版 SQLite 数据库结构：包括为 `positions` 表补充 `kind` 字段与 `split` 状态、为 `orders` 表补充 `pending / unknown` 状态，以及为存量模拟账户补写基准权益。所有迁移均在数据库事务内执行，若失败会自动回滚；建议在版本升级前先备份 `pennyharvester.db`。
+服务启动时会自动检测并升级旧版 SQLite 数据库结构：包括为 `positions` 表补充 `kind` 字段与 `split` 状态、为 `orders` 表补充 `pending / unknown` 状态、为存量模拟账户补写基准权益，以及创建 `system_settings`（网络代理配置）与 `access_password`（访问密码哈希）两张新表。所有迁移均在数据库事务内执行，若失败会自动回滚；建议在版本升级前先备份 `pennyharvester.db`。
 
 ### 运行测试与构建检查
 
@@ -265,9 +304,11 @@ npm run build
 - **公开参考价 ≠ 可成交盘口价**：Gamma 接口返回的 `outcomePrices` 仅代表公开参考价，不等于订单簿上的实际卖一价（Best Ask）。买卖点差、盘口深度不足与手续费都可能显著影响最终收益。
 - **实盘成交不确定性**：实盘采用 FAK 订单，实际成交价格由 CLOB 实时订单簿决定，可能与页面显示的参考价存在偏差，也可能出现部分成交或因深度不足而未成交。
 - **USDC 授权（Allowance）要求**：实盘下单前需先在 Polymarket 完成 USDC 合约授权。系统每次下单前会检查链上 Allowance，并直接拒绝授权额度不足的订单。
-- **手续费记账口径**：实盘手续费由 Polymarket CLOB 按市场规则收取并可能随平台政策调整；本系统基于 `FeeSchedule` 进行预估和本地记账，最终资金变动以链上钱包实际扣款为准。
+- **手续费记账口径**：实盘 taker 费在成交时按市场 `FeeSchedule` 计算并计入成本，maker 为 0；费率异常会拒单而不是按 0 费记账。模拟账户使用固定 `fee_bps` 近似（默认 15 BPS）。页面「累计盈亏」卡片单独展示已付手续费合计。Polymarket 的费率由平台设定并可能调整，最终资金变动仍以链上钱包实际扣款为准。
+- **赎回不收费，但 gas 视钱包类型而定**：结算时获胜份额按 1:1 兑付，Polymarket 不收取赎回费；通过 Deposit/Proxy 钱包经 relayer 赎回不消耗 gas，而自托管 EOA（`POLYMARKET_SIGNATURE_TYPE=0`）赎回需自付 Polygon gas，本系统不记账该项成本。
 - **未决订单熔断保护**：实盘订单若遇网络中断、超时或 CLOB 异步撮合，会进入 `unknown`（待核对）状态。系统已持久化该订单并会在后续扫描中自动对账，但在核对完成前不会继续为该账户自动下单。
-- **本地结算记账 vs 链上领奖**：实盘持仓到期后，系统会根据公开的 `0/1` 或 `50/50` 结果在本地更新结算状态与盈亏，但**不包含链上奖金赎回（Redeem）与跨系统资金对账**——获胜头寸的奖金仍需前往 Polymarket 官方界面手动领取。
+- **出口代理与行情可用性**：代理链路不稳定会直接影响行情扫描与实盘下单；若出现 `502` 与「公开行情不可用」，请先在「系统设置」中测试代理连通性。代理只改变网络出口，不改变策略与风控判定。
+- **本地结算记账 vs 链上领奖**：本系统只发送买入（BUY）指令，不提供卖出/平仓，也不会自动赎回头寸。实盘持仓到期后，系统会根据公开的 `0/1` 或 `50/50` 结果在本地更新结算状态与盈亏，但**不包含链上奖金赎回（Redeem）与跨系统资金对账**——获胜头寸的奖金仍需前往 Polymarket 官方界面手动领取。赎回本身不收取协议费，但自托管 EOA 需自付 Polygon gas（本系统不记账）。
 - **平局退款（`split`）处理**：若市场按 `50/50` 分摊结算，持仓会标记为 `split`（平局退款），该笔交易不计入胜率的分子或分母。
 - **模拟表现不代表实盘收益**：模拟账户仅基于实时行情做简化规则记账，既非历史回测，也无法复现真实订单簿的排队、流动性枯竭与价格冲击，不证明策略具有正数学期望。
 - **特殊市场事件**：预测市场可能出现延期、规则争议、取消或特殊结算。当公开结算数据存在歧义或异常时，系统会保持持仓为未结算状态并提示错误，而不会强行猜测结算结果。

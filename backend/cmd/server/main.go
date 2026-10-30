@@ -16,6 +16,7 @@ import (
 	"pennyharvester/backend/internal/engine"
 	"pennyharvester/backend/internal/live"
 	"pennyharvester/backend/internal/market"
+	"pennyharvester/backend/internal/netproxy"
 	"pennyharvester/backend/internal/store"
 )
 
@@ -41,7 +42,19 @@ func run() error {
 	}
 	defer repository.Close()
 
-	provider := market.NewGammaClient(cfg.GammaBaseURL)
+	systemSettings, err := repository.LoadSystemSettings(ctx)
+	if err != nil {
+		return err
+	}
+	proxyManager, err := netproxy.New(systemSettings.Proxy)
+	if err != nil {
+		// A bad stored row must not stop the process: fall back to the
+		// environment, and let the system settings page surface the value.
+		log.Printf("系统代理配置无效，回退到环境变量模式: %v", err)
+		proxyManager = netproxy.NewMust(netproxy.DefaultConfig())
+	}
+
+	provider := market.NewGammaClient(cfg.GammaBaseURL, proxyManager)
 	liveExecutor := live.New(live.Config{
 		PrivateKey:    cfg.PolymarketPrivateKey,
 		Funder:        cfg.PolymarketFunder,
@@ -50,17 +63,25 @@ func run() error {
 		APIKey:        cfg.PolymarketAPIKey,
 		APISecret:     cfg.PolymarketAPISecret,
 		APIPassphrase: cfg.PolymarketAPIPassphrase,
+		BuilderCode:   config.BuilderCode,
+		Proxy:         proxyManager,
 	})
-	strategyEngine, err := engine.New(ctx, repository, provider, liveExecutor)
+	strategyEngine, err := engine.New(ctx, repository, provider, liveExecutor, proxyManager)
 	if err != nil {
 		return err
 	}
 	strategyEngine.Start(ctx)
 	defer strategyEngine.Stop()
 
+	authenticator := api.NewAuthenticator(repository)
+	passwordProtected, err := authenticator.Enabled(ctx)
+	if err != nil {
+		return err
+	}
+
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewRouter(strategyEngine, cfg.WebDir),
+		Handler:           api.NewRouter(strategyEngine, cfg.WebDir, authenticator),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -72,8 +93,8 @@ func run() error {
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
-	log.Printf("PennyHarvester listening on http://%s | source=%s | default=LIVE | live_configured=%t",
-		cfg.Addr, cfg.GammaBaseURL, liveExecutor.Configured())
+	log.Printf("PennyHarvester listening on http://%s | source=%s | proxy=%s | access_password=%t | default=LIVE | live_configured=%t",
+		cfg.Addr, cfg.GammaBaseURL, proxyManager.Config().Mode, passwordProtected, liveExecutor.Configured())
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil

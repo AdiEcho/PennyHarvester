@@ -11,16 +11,20 @@ import (
 	"time"
 
 	"pennyharvester/backend/internal/market"
+	"pennyharvester/backend/internal/netproxy"
 )
 
 type Engine struct {
 	repo     Repository
 	provider market.Provider
 	live     LiveExecutor
+	proxy    *netproxy.Manager
 
 	tradeMu       sync.Mutex
 	mu            sync.RWMutex
 	settings      Settings
+	system        SystemSettings
+	systemError   string
 	opportunities []Opportunity
 	lastScanAt    *time.Time
 	lastSyncAt    *time.Time
@@ -33,10 +37,21 @@ type Engine struct {
 	done      chan struct{}
 }
 
-func New(ctx context.Context, repo Repository, provider market.Provider, live LiveExecutor) (*Engine, error) {
+func New(ctx context.Context, repo Repository, provider market.Provider, live LiveExecutor, proxy *netproxy.Manager) (*Engine, error) {
 	settings, err := repo.LoadSettings(ctx)
 	if err != nil {
 		return nil, err
+	}
+	system, err := repo.LoadSystemSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if proxy == nil {
+		proxy = netproxy.NewMust(system.Proxy)
+	} else if err := proxy.Apply(system.Proxy); err != nil {
+		// A row written by an older build must not stop the process from
+		// booting; the system settings page will surface the stored value.
+		proxy = netproxy.NewMust(netproxy.DefaultConfig())
 	}
 	// Paper accounts created before the baseline was persisted (or legacy
 	// accounts) get the current default once. After that the stored baseline
@@ -53,10 +68,18 @@ func New(ctx context.Context, repo Repository, provider market.Provider, live Li
 			}
 		}
 	}
-	return &Engine{
-		repo: repo, provider: provider, live: live, settings: settings,
+	instance := &Engine{
+		repo: repo, provider: provider, live: live, proxy: proxy, settings: settings, system: system,
 		opportunities: []Opportunity{}, running: true, done: make(chan struct{}),
-	}, nil
+	}
+	// Apply web-managed runtime settings on top of the process environment. A
+	// row written by an older build has empty fields and therefore inherits the
+	// startup configuration. An unusable row must not prevent boot; it is
+	// surfaced through SystemRuntime instead.
+	if err := instance.applyRuntimeSettings(system); err != nil {
+		instance.systemError = err.Error()
+	}
+	return instance, nil
 }
 
 func (e *Engine) Start(parent context.Context) {
@@ -106,6 +129,9 @@ func (e *Engine) Settings() Settings {
 }
 
 func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
+	// The version is owned by the server so a client payload can never roll the
+	// one-time fee migration back or trigger it again.
+	settings.FeeModelVersion = FeeModelVersion
 	if err := settings.Validate(); err != nil {
 		return err
 	}
@@ -118,6 +144,97 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	e.settings = settings
 	e.mu.Unlock()
 	return nil
+}
+
+func (e *Engine) SystemSettings() SystemSettings {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.system
+}
+
+// UpdateSystemSettings persists the runtime egress, endpoint and live-trading
+// configuration and applies it without a restart. Values are applied before
+// the row is saved so an unusable URL or credential set never lands in the
+// database; a failed save rolls the live clients back to the previous state.
+func (e *Engine) UpdateSystemSettings(ctx context.Context, settings SystemSettings) error {
+	settings = settings.Normalize()
+	if err := settings.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
+	// Serialize with scans and order placement so a live order cannot be
+	// signed with one credential set while the client is being rebuilt for
+	// another.
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	previous := e.SystemSettings()
+	if err := e.applyRuntimeSettings(settings); err != nil {
+		// applyRuntimeSettings rolls back internally on a partial failure.
+		return fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
+	if err := e.repo.SaveSystemSettings(ctx, settings); err != nil {
+		_ = e.applyRuntimeSettings(previous)
+		return err
+	}
+	e.mu.Lock()
+	e.system = settings
+	e.systemError = ""
+	e.mu.Unlock()
+	if reloader, ok := e.live.(interface{ ReloadProxy() }); ok && reloader != nil {
+		reloader.ReloadProxy()
+	}
+	return nil
+}
+
+// applyRuntimeSettings applies proxy, data-source and live credentials in
+// order. If a later step fails, earlier steps are rolled back to previous.
+func (e *Engine) applyRuntimeSettings(settings SystemSettings) error {
+	previous := e.SystemSettings()
+	if e.proxy != nil {
+		if err := e.proxy.Apply(settings.Proxy); err != nil {
+			return err
+		}
+	}
+	provider, hasProvider := e.provider.(dataSourceRuntime)
+	if hasProvider {
+		if err := provider.SetBaseURL(settings.DataSource.GammaBaseURL); err != nil {
+			if e.proxy != nil {
+				_ = e.proxy.Apply(previous.Proxy)
+			}
+			return err
+		}
+	}
+	updater, hasLive := e.live.(liveSettingsRuntime)
+	if hasLive {
+		if err := updater.UpdateSettings(settings.Live, settings.DataSource.CLOBBaseURL); err != nil {
+			if hasProvider {
+				_ = provider.SetBaseURL(previous.DataSource.GammaBaseURL)
+			}
+			if e.proxy != nil {
+				_ = e.proxy.Apply(previous.Proxy)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// SystemRuntime reports the effective endpoints and the live executor state.
+func (e *Engine) SystemRuntime() SystemRuntime {
+	runtime := SystemRuntime{}
+	if provider, ok := e.provider.(dataSourceRuntime); ok && provider != nil {
+		runtime.GammaBaseURL = provider.BaseURL()
+		runtime.GammaDefault = provider.DefaultBaseURL()
+	}
+	if live, ok := e.live.(liveSettingsRuntime); ok && live != nil {
+		runtime.CLOBBaseURL = live.EffectiveCLOBURL()
+		runtime.LiveEnvironment = live.Environment()
+		runtime.CLOBDefault = runtime.LiveEnvironment.CLOBBaseURL
+	}
+	runtime.LiveConfigured, runtime.LiveReady, runtime.LiveError = e.LiveStatus()
+	e.mu.RLock()
+	runtime.Error = e.systemError
+	e.mu.RUnlock()
+	return runtime
 }
 
 func (e *Engine) Status() EngineStatus {
@@ -698,7 +815,7 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
 		AccountID: account.ID, MarketID: position.MarketID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
-		Amount: amount, Price: fillPrice, Shares: shares, Status: "filled",
+		Amount: cost, Price: fillPrice, Shares: shares, Fee: fee, Status: "filled",
 		Reason: "模拟成交；未发送任何真实订单", CreatedAt: now,
 	})
 	if err != nil {
@@ -829,7 +946,7 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
 		AccountID: account.ID, MarketID: position.MarketID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
-		Amount: fill.Cost, Price: fill.Price, Shares: fill.Shares, Status: "filled",
+		Amount: fill.Cost, Price: fill.Price, Shares: fill.Shares, Fee: fill.Fee, Status: "filled",
 		Reason: "Polymarket CLOB 实盘成交", ExternalID: fill.OrderID, CreatedAt: now,
 	})
 	if err != nil {
@@ -975,6 +1092,7 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	metrics := Metrics{Mode: string(account.Mode), InitialBankroll: settings.InitialBankroll}
 	wins, marketValue := 0, 0.0
 	for _, position := range positions {
+		metrics.FeesPaid += position.Fee
 		if position.Status == "open" {
 			metrics.OpenPositions++
 			metrics.OpenExposure += position.Cost

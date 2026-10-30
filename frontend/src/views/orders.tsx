@@ -38,7 +38,7 @@ function OrderCard({ order, isLive }: { order: Order; isLive: boolean }) {
         <OrderModeBadge mode={isLive ? 'live' : 'paper'} kind={order.kind} />
       </div>
       <div className="mt-4 grid grid-cols-3 gap-3 border-t border-slate-100 pt-4">
-        <div><p className="text-[11px] text-slate-400">金额</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-800">{formatCurrency(order.amount)}</p></div>
+        <div><p className="text-[11px] text-slate-400">金额</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-800">{formatCurrency(order.amount)}</p>{order.fee > 0 && <p className="mt-0.5 text-[10px] text-slate-400">含费用 {formatCurrency(order.fee)}</p>}</div>
         <div><p className="text-[11px] text-slate-400">价格</p><p className="mt-1 text-sm tabular-nums text-slate-700">{formatPrice(order.price)}</p></div>
         <div><p className="text-[11px] text-slate-400">份额</p><p className="mt-1 text-sm tabular-nums text-slate-700">{formatNumber(order.shares, 4)}</p></div>
       </div>
@@ -104,7 +104,7 @@ export function OrdersView() {
                         <p className="flex items-center gap-1.5 text-slate-700">{order.kind === 'auto' ? <Bot className="h-3.5 w-3.5 text-slate-400" /> : <UserRound className="h-3.5 w-3.5 text-slate-400" />}{order.kind === 'auto' ? '自动策略' : '手动确认'}</p>
                         <p className="mt-1.5 text-xs text-slate-400">{order.type === 'buy' ? (isLive ? '实盘买入' : '模拟买入') : '结算'}</p>
                       </td>
-                      <td className="px-4 py-4 text-right font-medium tabular-nums text-slate-800">{formatCurrency(order.amount)}</td>
+                      <td className="px-4 py-4 text-right"><p className="font-medium tabular-nums text-slate-800">{formatCurrency(order.amount)}</p>{order.fee > 0 && <p className="mt-1 text-[11px] text-slate-400">含费用 {formatCurrency(order.fee)}</p>}</td>
                       <td className="px-4 py-4 text-right"><p className="tabular-nums text-slate-700">{formatPrice(order.price)}</p><p className="mt-1 text-xs tabular-nums text-slate-400">{formatNumber(order.shares, 4)} 份</p></td>
                       <td className="max-w-[230px] px-4 py-4">
                         <OrderStatusBadge status={order.status} />

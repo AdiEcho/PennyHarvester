@@ -169,14 +169,21 @@ func TestSchemaMigratesLegacyStatusConstraints(t *testing.T) {
 	}
 	order, err := repository.CreateOrder(ctx, engine.Order{
 		AccountID: paper.ID, PositionID: &position.ID, MarketID: "m1", Question: "split",
-		Outcome: "Yes", TokenID: "t1", Kind: "manual", Type: "buy", Amount: 100,
-		Price: 0.98, Shares: 100, Status: "pending", Reason: "pending", ExternalID: "order-1", CreatedAt: now,
+		Outcome: "Yes", TokenID: "t1", Kind: "manual", Type: "buy", Amount: 100.15,
+		Price: 0.98, Shares: 102.19, Fee: 0.15, Status: "pending", Reason: "pending", ExternalID: "order-1", CreatedAt: now,
 	})
 	if err != nil {
 		t.Fatalf("pending order was not accepted after migration: %v", err)
 	}
 	if order.ID == 0 {
 		t.Fatal("pending order was not inserted")
+	}
+	orders, err := repository.ListOrders(ctx, paper.ID, "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].Fee != 0.15 {
+		t.Fatalf("legacy orders table did not gain a usable fee column: %+v", orders)
 	}
 }
 
@@ -203,5 +210,58 @@ func TestLegacySettingsPayloadUsesDefaultsForMissingFields(t *testing.T) {
 	}
 	if settings.MinPrice != 0.96 {
 		t.Fatalf("existing values must be preserved, got %v", settings.MinPrice)
+	}
+	// The old row predates paper fees: its zero fee_bps is the old default and
+	// must be upgraded once, then left alone.
+	if settings.FeeBPS != engine.DefaultSettings().FeeBPS {
+		t.Fatalf("legacy zero fee should be upgraded, got %v", settings.FeeBPS)
+	}
+	if settings.FeeModelVersion != engine.FeeModelVersion {
+		t.Fatalf("fee model version not stamped: %+v", settings)
+	}
+
+	// A row written by the current build keeps an explicit zero fee.
+	deliberate := settings
+	deliberate.FeeBPS = 0
+	if err := repository.SaveSettings(ctx, deliberate); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := repository.LoadSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.FeeBPS != 0 {
+		t.Fatalf("an explicit zero fee must survive a reload, got %v", reloaded.FeeBPS)
+	}
+}
+
+func TestOrderFeeIsPersisted(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, filepath.Join(t.TempDir(), "orders.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	account, err := repository.DefaultAccount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := repository.CreateOrder(ctx, engine.Order{
+		AccountID: account.ID, MarketID: "m", Question: "q", Outcome: "Yes", TokenID: "t",
+		Kind: "manual", Type: "buy", Amount: 100.15, Price: 0.98, Shares: 102.19,
+		Fee: 0.15, Status: "filled", CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orders, err := repository.ListOrders(ctx, account.ID, "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 {
+		t.Fatalf("unexpected orders: %+v", orders)
+	}
+	if orders[0].ID != order.ID || orders[0].Fee != 0.15 || orders[0].Amount != 100.15 {
+		t.Fatalf("order fee was not persisted: %+v", orders[0])
 	}
 }

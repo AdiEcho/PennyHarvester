@@ -250,7 +250,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
             {isLive && !account.live_ready && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-rose-200 bg-surface/70 p-3 text-xs leading-5 text-rose-700">
                 <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>{account.live_configured ? <>实盘凭据未就绪：{account.live_error || '请检查 Funder、API 凭据与 USDC 授权。'}</> : <>未配置 <code className="rounded bg-rose-100 px-1">POLYMARKET_PRIVATE_KEY</code>，实盘下单会被拒绝。可先使用模拟账户测试策略。</>}</span>
+                <span>{account.live_configured ? <>实盘凭据未就绪：{account.live_error || '请检查 Funder、API 凭据与 USDC 授权。'}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启服务。可先使用模拟账户测试策略。</>}</span>
               </div>
             )}
             {isLive && account.live_error && <p className="mt-2 break-words text-xs leading-5 text-rose-600">实盘错误：{account.live_error}</p>}
@@ -266,7 +266,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
 
         <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs leading-5 text-slate-500">
           <Info className="mr-1 inline h-3.5 w-3.5 align-[-2px]" />
-          实盘账户使用服务端环境变量中的钱包和 CLOB 凭据，下单前需在 Polymarket 完成 USDC 授权；模拟账户只写本地数据库。实盘账户不可删除，每个实例只允许一个实盘账户。
+          实盘账户使用「系统设置」或服务端环境变量中的钱包和 CLOB 凭据，下单前需在 Polymarket 完成 USDC 授权；模拟账户只写本地数据库。实盘账户不可删除，每个实例只允许一个实盘账户。
         </div>
       </CardContent>
 
@@ -437,8 +437,11 @@ export function SettingsView() {
             <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-3">
               <NumberField id="scan_interval_seconds" label="扫描间隔" description="允许 10–86400 秒，需为整数。" value={draft.scan_interval_seconds} unit="秒" min={10} max={86400} step="1" error={errors.scan_interval_seconds} onChange={(value) => update('scan_interval_seconds', value)} />
               <NumberField id="slippage_bps" label="Paper 滑点" description="0–1000 bps；仅影响模拟成交。" value={draft.slippage_bps} unit="bps" min={0} max={1000} error={errors.slippage_bps} onChange={(value) => update('slippage_bps', value)} />
-              <NumberField id="fee_bps" label="Paper 费用" description="0–1000 bps；仅用于模拟核算。" value={draft.fee_bps} unit="bps" min={0} max={1000} error={errors.fee_bps} onChange={(value) => update('fee_bps', value)} />
+              <NumberField id="fee_bps" label="Paper 费用" description="0–1000 bps，按名义金额计；实盘不读此值。等效费率 ≈ 类别费率 × (1 − 价格)，0.95–0.99 区间约 4–25 bps。" value={draft.fee_bps} unit="bps" min={0} max={1000} error={errors.fee_bps} onChange={(value) => update('fee_bps', value)} />
             </div>
+            {draft.fee_bps !== '' && Number(draft.fee_bps) === 0 && (
+              <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">模拟费用为 0 时，模拟收益会系统性高估。Polymarket 对多数类别收取 taker 费，按当前价格区间折算约为 4–25 bps，建议不低于 10 bps。</div>
+            )}
             <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
               <div className="rounded-xl bg-surface p-2.5 text-slate-500"><UserCog className="h-5 w-5" /></div>
               <div className="flex-1"><p className="text-sm font-semibold text-slate-800">自动交易开关已移到账户管理</p><p className="mt-1 text-xs leading-5 text-slate-500">实盘与模拟账户可以分别开启自动交易。实盘账户开启时需要二次确认。</p></div>

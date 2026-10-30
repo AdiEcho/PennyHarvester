@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -15,10 +16,15 @@ import (
 )
 
 type SQLite struct {
-	db *sql.DB
+	db      *sql.DB
+	secrets *secretBox
 }
 
 func Open(ctx context.Context, path string) (*SQLite, error) {
+	secrets, err := newSecretBox(path)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, err
@@ -28,10 +34,15 @@ func Open(ctx context.Context, path string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("初始化 SQLite: %w", err)
 	}
-	store := &SQLite{db: db}
+	store := &SQLite{db: db, secrets: secrets}
 	if err := store.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if path != ":memory:" {
+		// Best effort: the database holds wallet credentials, so keep it
+		// private even when the process umask is permissive.
+		_ = os.Chmod(path, 0o600)
 	}
 	return store, nil
 }
@@ -53,6 +64,16 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	CREATE TABLE IF NOT EXISTS settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		payload TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS system_settings (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		payload TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS access_password (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		password_hash TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS positions (
@@ -90,6 +111,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		amount REAL NOT NULL,
 		price REAL NOT NULL,
 		shares REAL NOT NULL,
+		fee REAL NOT NULL DEFAULT 0,
 		status TEXT NOT NULL CHECK(status IN ('filled', 'rejected', 'settled', 'pending', 'unknown')),
 		reason TEXT NOT NULL,
 		external_id TEXT NOT NULL DEFAULT '',
@@ -133,6 +155,11 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.migrateOrderStatus(ctx); err != nil {
+		return err
+	}
+	// Must run after migrateOrderStatus: that rebuild recreates the orders
+	// table from the legacy column list, which has no fee column.
+	if err := s.ensureColumn(ctx, "orders", "fee", "REAL NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	const indexes = `
@@ -361,6 +388,25 @@ func (s *SQLite) LoadSettings(ctx context.Context) (engine.Settings, error) {
 	if err := settings.Validate(); err != nil {
 		return engine.Settings{}, fmt.Errorf("数据库中的策略设置无效: %w", err)
 	}
+	// A payload without fee_model_version was written before paper accounts
+	// charged a fee. Its fee_bps of 0 is the old default, not a deliberate
+	// choice, so the current default is applied once.
+	var stored struct {
+		FeeModelVersion int `json:"fee_model_version"`
+	}
+	if err := json.Unmarshal([]byte(payload), &stored); err != nil {
+		return engine.Settings{}, fmt.Errorf("读取策略设置: %w", err)
+	}
+	if stored.FeeModelVersion >= engine.FeeModelVersion {
+		return settings, nil
+	}
+	if settings.FeeBPS == 0 {
+		settings.FeeBPS = engine.DefaultSettings().FeeBPS
+	}
+	settings.FeeModelVersion = engine.FeeModelVersion
+	if err := s.SaveSettings(ctx, settings); err != nil {
+		return engine.Settings{}, err
+	}
 	return settings, nil
 }
 
@@ -372,6 +418,126 @@ func (s *SQLite) SaveSettings(ctx context.Context, settings engine.Settings) err
 	_, err = s.db.ExecContext(ctx, `INSERT INTO settings(id, payload, updated_at) VALUES(1, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`,
 		string(payload), formatTime(time.Now().UTC()))
+	return err
+}
+
+func (s *SQLite) LoadSystemSettings(ctx context.Context) (engine.SystemSettings, error) {
+	var payload string
+	err := s.db.QueryRowContext(ctx, "SELECT payload FROM system_settings WHERE id = 1").Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		settings := engine.DefaultSystemSettings()
+		return settings, s.SaveSystemSettings(ctx, settings)
+	}
+	if err != nil {
+		return engine.SystemSettings{}, err
+	}
+	// Start from defaults so a payload written before a field existed stays
+	// readable instead of failing validation.
+	settings := engine.DefaultSystemSettings()
+	if err := json.Unmarshal([]byte(payload), &settings); err != nil {
+		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
+	}
+	legacyPlaintext := false
+	decrypt := func(value string) (string, error) {
+		plain, legacy, err := s.decryptSetting(value)
+		if err != nil {
+			return "", err
+		}
+		if legacy {
+			legacyPlaintext = true
+		}
+		return plain, nil
+	}
+	if settings.Proxy.URL, err = decrypt(settings.Proxy.URL); err != nil {
+		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
+	}
+	if settings.Live.PrivateKey, err = decrypt(settings.Live.PrivateKey); err != nil {
+		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
+	}
+	if settings.Live.APISecret, err = decrypt(settings.Live.APISecret); err != nil {
+		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
+	}
+	if settings.Live.APIPassphrase, err = decrypt(settings.Live.APIPassphrase); err != nil {
+		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
+	}
+	settings = settings.Normalize()
+	if err := settings.Validate(); err != nil {
+		return engine.SystemSettings{}, fmt.Errorf("数据库中的系统设置无效: %w", err)
+	}
+	if legacyPlaintext {
+		// Upgrade rows written before secrets were encrypted at rest.
+		if err := s.SaveSystemSettings(ctx, settings); err != nil {
+			return engine.SystemSettings{}, err
+		}
+	}
+	return settings, nil
+}
+
+func (s *SQLite) decryptSetting(value string) (string, bool, error) {
+	if s.secrets == nil {
+		return value, false, nil
+	}
+	plain, encrypted, err := s.secrets.Decrypt(value)
+	if err != nil {
+		if s.secrets.keyPath != "" {
+			return "", true, fmt.Errorf("%w（请确认密钥文件 %s 与数据库一同保留；如确认要丢弃已保存的网页凭据，可删除 system_settings 表中的该行后重启）", err, s.secrets.keyPath)
+		}
+		return "", true, err
+	}
+	return plain, value != "" && !encrypted, nil
+}
+
+func (s *SQLite) SaveSystemSettings(ctx context.Context, settings engine.SystemSettings) error {
+	stored := settings
+	if s.secrets != nil {
+		var err error
+		if stored.Proxy.URL, err = s.secrets.Encrypt(stored.Proxy.URL); err != nil {
+			return fmt.Errorf("加密代理设置: %w", err)
+		}
+		if stored.Live.PrivateKey, err = s.secrets.Encrypt(stored.Live.PrivateKey); err != nil {
+			return fmt.Errorf("加密实盘私钥: %w", err)
+		}
+		if stored.Live.APISecret, err = s.secrets.Encrypt(stored.Live.APISecret); err != nil {
+			return fmt.Errorf("加密 L2 API Secret: %w", err)
+		}
+		if stored.Live.APIPassphrase, err = s.secrets.Encrypt(stored.Live.APIPassphrase); err != nil {
+			return fmt.Errorf("加密 L2 API Passphrase: %w", err)
+		}
+	}
+	payload, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO system_settings(id, payload, updated_at) VALUES(1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`,
+		string(payload), formatTime(time.Now().UTC()))
+	return err
+}
+
+// LoadAccessHash returns the bcrypt hash of the web access password, or an
+// empty string when password protection is disabled.
+func (s *SQLite) LoadAccessHash(ctx context.Context) (string, error) {
+	var hash string
+	err := s.db.QueryRowContext(ctx, "SELECT password_hash FROM access_password WHERE id = 1").Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return hash, nil
+}
+
+// SaveAccessHash stores a new hash, or removes the row when hash is empty so
+// password protection can be turned off again.
+func (s *SQLite) SaveAccessHash(ctx context.Context, hash string) error {
+	if hash == "" {
+		_, err := s.db.ExecContext(ctx, "DELETE FROM access_password WHERE id = 1")
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO access_password(id, password_hash, updated_at) VALUES(1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET password_hash=excluded.password_hash, updated_at=excluded.updated_at`,
+		hash, formatTime(time.Now().UTC()))
 	return err
 }
 
@@ -560,10 +726,10 @@ type orderInserter interface {
 func insertOrder(ctx context.Context, db orderInserter, order engine.Order) (int64, error) {
 	result, err := db.ExecContext(ctx, `INSERT INTO orders(
 		account_id, position_id, market_id, question, outcome, token_id, kind, type,
-		amount, price, shares, status, reason, external_id, created_at
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		amount, price, shares, fee, status, reason, external_id, created_at
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		order.AccountID, order.PositionID, order.MarketID, order.Question, order.Outcome, order.TokenID,
-		order.Kind, order.Type, order.Amount, order.Price, order.Shares, order.Status,
+		order.Kind, order.Type, order.Amount, order.Price, order.Shares, order.Fee, order.Status,
 		order.Reason, order.ExternalID, formatTime(order.CreatedAt))
 	if err != nil {
 		return 0, err
@@ -628,7 +794,7 @@ func orderStatusClause(status string) (string, []any) {
 }
 
 const orderColumns = `SELECT id, account_id, position_id, market_id, question, outcome,
-	token_id, kind, type, amount, price, shares, status, reason, external_id, created_at
+	token_id, kind, type, amount, price, shares, fee, status, reason, external_id, created_at
 	FROM orders`
 
 func scanOrderRows(rows *sql.Rows) ([]engine.Order, error) {
@@ -639,7 +805,7 @@ func scanOrderRows(rows *sql.Rows) ([]engine.Order, error) {
 		var createdAt string
 		if err := rows.Scan(&order.ID, &order.AccountID, &positionID, &order.MarketID, &order.Question,
 			&order.Outcome, &order.TokenID, &order.Kind, &order.Type, &order.Amount,
-			&order.Price, &order.Shares, &order.Status, &order.Reason, &order.ExternalID, &createdAt); err != nil {
+			&order.Price, &order.Shares, &order.Fee, &order.Status, &order.Reason, &order.ExternalID, &createdAt); err != nil {
 			return nil, err
 		}
 		if positionID.Valid {
@@ -706,10 +872,10 @@ func (s *SQLite) FinalizeLiveBuy(ctx context.Context, orderID int64, p engine.Po
 	if err != nil {
 		return engine.Position{}, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE orders SET position_id = ?, amount = ?, price = ?, shares = ?,
+	result, err := tx.ExecContext(ctx, `UPDATE orders SET position_id = ?, amount = ?, price = ?, shares = ?, fee = ?,
 		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END
 		WHERE id = ? AND status IN ('pending', 'unknown')`,
-		p.ID, fill.Cost, fill.Price, fill.Shares, "Polymarket CLOB 实盘成交", fill.OrderID, orderID)
+		p.ID, fill.Cost, fill.Price, fill.Shares, fill.Fee, "Polymarket CLOB 实盘成交", fill.OrderID, orderID)
 	if err != nil {
 		return engine.Position{}, err
 	}

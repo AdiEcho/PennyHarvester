@@ -15,30 +15,44 @@ import (
 
 type Handler struct {
 	engine *engine.Engine
+	auth   *Authenticator
 }
 
-func NewRouter(engine *engine.Engine, webDir string) *gin.Engine {
+func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Authenticator) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery(), securityHeaders())
-	h := &Handler{engine: engine}
+	h := &Handler{engine: strategyEngine, auth: authenticator}
 	v1 := router.Group("/api/v1")
 	v1.Use(maxBodySize(1 << 20))
 	{
-		v1.GET("/health", h.health)
-		v1.GET("/accounts", h.accounts)
-		v1.POST("/accounts", h.createAccount)
-		v1.PATCH("/accounts/:id", h.updateAccount)
-		v1.DELETE("/accounts/:id", h.deleteAccount)
-		v1.GET("/dashboard", h.dashboard)
-		v1.GET("/opportunities", h.opportunities)
-		v1.POST("/scan", h.scan)
-		v1.GET("/positions", h.positions)
-		v1.GET("/orders", h.orders)
-		v1.GET("/settings", h.settings)
-		v1.PUT("/settings", h.updateSettings)
-		v1.POST("/engine/toggle", h.toggleEngine)
-		v1.POST("/accounts/:id/orders", h.placeOrder)
-		v1.POST("/paper/orders", h.paperOrderCompat)
+		// Login endpoints stay public so the SPA can render its sign-in form.
+		v1.GET("/auth/status", h.authStatus)
+		v1.POST("/auth/login", h.login)
+	}
+	protected := v1.Group("")
+	protected.Use(authenticator.Middleware())
+	{
+		protected.GET("/health", h.health)
+		protected.POST("/auth/logout", h.logout)
+		protected.POST("/auth/password", h.updatePassword)
+		protected.POST("/auth/password/disable", h.disablePassword)
+		protected.GET("/accounts", h.accounts)
+		protected.POST("/accounts", h.createAccount)
+		protected.PATCH("/accounts/:id", h.updateAccount)
+		protected.DELETE("/accounts/:id", h.deleteAccount)
+		protected.GET("/dashboard", h.dashboard)
+		protected.GET("/opportunities", h.opportunities)
+		protected.POST("/scan", h.scan)
+		protected.GET("/positions", h.positions)
+		protected.GET("/orders", h.orders)
+		protected.GET("/settings", h.settings)
+		protected.PUT("/settings", h.updateSettings)
+		protected.GET("/system", h.systemSettings)
+		protected.PUT("/system", h.updateSystemSettings)
+		protected.POST("/system/proxy/test", h.testProxy)
+		protected.POST("/engine/toggle", h.toggleEngine)
+		protected.POST("/accounts/:id/orders", h.placeOrder)
+		protected.POST("/paper/orders", h.paperOrderCompat)
 	}
 	if webDir != "" {
 		serveWeb(router, webDir)
@@ -337,7 +351,7 @@ func accountIDFromQuery(c *gin.Context) (int64, bool) {
 func respondError(c *gin.Context, err error) {
 	status := http.StatusInternalServerError
 	switch {
-	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrNotFound):
+	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrNotFound), errors.Is(err, engine.ErrInvalidSettings):
 		status = http.StatusBadRequest
 	case errors.Is(err, engine.ErrAccountNotFound):
 		status = http.StatusNotFound
