@@ -535,6 +535,12 @@ func (e *Engine) scan(ctx context.Context, execute bool) error {
 				if localizedItem.Question != "" {
 					opportunities[i].QuestionZH = localizedItem.Question
 				}
+				if localizedItem.EventTitle != "" {
+					opportunities[i].EventTitleZH = localizedItem.EventTitle
+				}
+				if opportunities[i].GroupItemTitle == "" {
+					opportunities[i].GroupItemTitle = localizedItem.GroupItemTitle
+				}
 				if outcome, ok := localizedItem.OutcomeByToken(opportunities[i].TokenID); ok && outcome.Name != "" {
 					opportunities[i].OutcomeZH = outcome.Name
 				}

@@ -82,6 +82,8 @@ export interface Opportunity {
   condition_id: string
   question: string
   question_zh?: string
+  group_item_title?: string
+  event_title_zh?: string
   slug: string
   outcome: string
   outcome_zh?: string

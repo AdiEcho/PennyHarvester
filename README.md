@@ -28,7 +28,7 @@
 
 ### 1. 机会雷达与行情过滤
 - **公开行情接入**：对接 Polymarket Gamma 只读行情接口，兼容标准 JSON 数组与 JSON 字符串编码数组字段。
-- **中文市场文案**：机会雷达提供「中文 / English」市场语言选择，默认中文。中文直接读取 Polymarket Gamma 的 `locale=zh` 翻译，市场问题与方向（如「是 / 否」）与 Polymarket 中文站保持一致；切换语言不会改变工作台界面语言。
+- **中文市场文案**：机会雷达提供「中文 / English」市场语言选择，默认中文。中文优先读取 Polymarket Gamma 的 `locale=zh` 翻译；部分体育盘口 Polymarket 只翻译赛事标题而不翻译具体问题，此时会自动组合中文赛事标题、盘口类型与常见结果（如「总分 / 让分 / 准确比分」「是 / 否」「大 / 小」），避免整列回退为英文。切换语言不会改变工作台界面语言。
 - **多维条件筛选**：针对二元市场（Binary Markets），按参考价格区间、剩余到期天数、最低流动性自动过滤尾盘机会。
 - **行情异常保护**：当上游行情不可用或结算数据异常时，系统会保持现有持仓状态不变并明确报错，绝不使用占位数据或猜测结果替代真实行情。
 
@@ -271,7 +271,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `PATCH` | `/accounts/:id` | 修改账户名称、自动交易开关或设为默认账户 |
 | `DELETE` | `/accounts/:id` | 删除指定模拟账户（级联清除其持仓、订单与净值记录） |
 | `GET` | `/dashboard?account_id=1` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照 |
-| `GET` | `/opportunities` | 获取最近一次成功扫描筛选出的市场机会列表；每项同时返回原始 `question` / `outcome` 与 Polymarket 中文翻译 `question_zh` / `outcome_zh` |
+| `GET` | `/opportunities` | 获取最近一次成功扫描筛选出的市场机会列表；每项同时返回原始 `question` / `outcome`、Polymarket 中文翻译 `question_zh` / `outcome_zh`，以及中文赛事标题 `event_title_zh` 和盘口短标题 `group_item_title`，用于体育盘口的中文兜底展示 |
 | `POST` | `/scan` | 手动触发扫描：默认仅刷新行情、持仓盯市与净值，不自动下单；附加 `?execute=true` 时同步执行自动交易 |
 | `GET` | `/positions?account_id=1&status=open` | 查询持仓列表，`status` 支持 `all / open / won / lost / split` |
 | `GET` | `/orders?account_id=1&status=all&limit=100&offset=0` | 查询订单记录，`status` 支持 `all / filled / settled / rejected / pending / unknown / unresolved` |

@@ -404,21 +404,23 @@ type funderDiscovery interface {
 }
 
 type Opportunity struct {
-	MarketID    string    `json:"market_id"`
-	ConditionID string    `json:"condition_id"`
-	Question    string    `json:"question"`
-	QuestionZH  string    `json:"question_zh"`
-	Slug        string    `json:"slug"`
-	Outcome     string    `json:"outcome"`
-	OutcomeZH   string    `json:"outcome_zh"`
-	TokenID     string    `json:"token_id"`
-	Price       float64   `json:"price"`
-	Liquidity   float64   `json:"liquidity"`
-	Volume      float64   `json:"volume"`
-	EndDate     time.Time `json:"end_date"`
-	DaysToEnd   float64   `json:"days_to_end"`
-	GrossYield  float64   `json:"gross_yield"`
-	URL         string    `json:"url"`
+	MarketID       string    `json:"market_id"`
+	ConditionID    string    `json:"condition_id"`
+	Question       string    `json:"question"`
+	QuestionZH     string    `json:"question_zh"`
+	GroupItemTitle string    `json:"group_item_title"`
+	EventTitleZH   string    `json:"event_title_zh"`
+	Slug           string    `json:"slug"`
+	Outcome        string    `json:"outcome"`
+	OutcomeZH      string    `json:"outcome_zh"`
+	TokenID        string    `json:"token_id"`
+	Price          float64   `json:"price"`
+	Liquidity      float64   `json:"liquidity"`
+	Volume         float64   `json:"volume"`
+	EndDate        time.Time `json:"end_date"`
+	DaysToEnd      float64   `json:"days_to_end"`
+	GrossYield     float64   `json:"gross_yield"`
+	URL            string    `json:"url"`
 }
 
 type Position struct {
@@ -606,8 +608,8 @@ func opportunityFor(m market.Market, outcome market.Outcome, now time.Time) Oppo
 	days := m.EndDate.Sub(now).Hours() / 24
 	grossYield := (1 - outcome.Price) / outcome.Price
 	return Opportunity{
-		MarketID: m.ID, ConditionID: m.ConditionID, Question: m.Question, Slug: m.Slug,
-		Outcome: outcome.Name, TokenID: outcome.TokenID, Price: outcome.Price,
+		MarketID: m.ID, ConditionID: m.ConditionID, Question: m.Question, GroupItemTitle: m.GroupItemTitle,
+		Slug: m.Slug, Outcome: outcome.Name, TokenID: outcome.TokenID, Price: outcome.Price,
 		Liquidity: m.Liquidity, Volume: m.Volume, EndDate: m.EndDate, DaysToEnd: days,
 		GrossYield: grossYield, URL: m.URL(),
 	}

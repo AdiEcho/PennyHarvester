@@ -227,6 +227,8 @@ func TestScanAddsPolymarketChineseText(t *testing.T) {
 	en := binary("eligible", 0.98, 20000, 2)
 	zh := binary("eligible", 0.98, 20000, 2)
 	zh.Question = "会如期结算吗？"
+	zh.GroupItemTitle = "O/U 0.5"
+	zh.EventTitle = "中文赛事 -更多市场"
 	zh.Outcomes[0].Name = "是"
 	zh.Outcomes[1].Name = "否"
 	provider := &fakeProvider{
@@ -247,6 +249,9 @@ func TestScanAddsPolymarketChineseText(t *testing.T) {
 	}
 	if item.OutcomeZH != "是" || item.Outcome != "Yes" {
 		t.Fatalf("unexpected outcomes: canonical=%q zh=%q", item.Outcome, item.OutcomeZH)
+	}
+	if item.EventTitleZH != zh.EventTitle || item.GroupItemTitle != zh.GroupItemTitle {
+		t.Fatalf("missing localized context: %+v", item)
 	}
 }
 

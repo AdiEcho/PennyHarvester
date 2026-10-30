@@ -95,7 +95,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     const keyword = query.trim().toLocaleLowerCase()
     if (!keyword) return data?.items || []
     return (data?.items || []).filter((item) =>
-      [item.question, item.question_zh || '', item.outcome, item.outcome_zh || '', item.slug, item.market_id].some((value) => value.toLocaleLowerCase().includes(keyword)),
+      [item.question, item.question_zh || '', item.event_title_zh || '', item.group_item_title || '', item.outcome, item.outcome_zh || '', item.slug, item.market_id].some((value) => value.toLocaleLowerCase().includes(keyword)),
     )
   }, [data, query])
 
@@ -173,7 +173,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           <span>毛收益 = (1 − 价格) / 价格</span>
           <span>到期时间按本地时区显示</span>
           <span>立即扫描仅刷新行情，不会自动下单</span>
-          <span>{marketLanguage === 'zh' ? '市场问题与方向使用 Polymarket 中文翻译' : '市场问题与方向显示 Polymarket 英文原文'}</span>
+          <span>{marketLanguage === 'zh' ? '市场问题与方向优先使用 Polymarket 中文文案' : '市场问题与方向显示 Polymarket 英文原文'}</span>
           {data && <span className="sm:ml-auto">来源 {data.source} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
         </div>
       </Card>

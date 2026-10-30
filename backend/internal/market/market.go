@@ -18,6 +18,8 @@ type Market struct {
 	ID               string    `json:"id"`
 	ConditionID      string    `json:"condition_id"`
 	Question         string    `json:"question"`
+	GroupItemTitle   string    `json:"group_item_title"`
+	EventTitle       string    `json:"event_title"`
 	Slug             string    `json:"slug"`
 	Outcomes         []Outcome `json:"outcomes"`
 	EndDate          time.Time `json:"end_date"`

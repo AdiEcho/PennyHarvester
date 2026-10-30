@@ -95,6 +95,7 @@ type gammaMarket struct {
 	ID                  string          `json:"id"`
 	ConditionID         string          `json:"conditionId"`
 	Question            string          `json:"question"`
+	GroupItemTitle      string          `json:"groupItemTitle"`
 	Slug                string          `json:"slug"`
 	Outcomes            json.RawMessage `json:"outcomes"`
 	OutcomePrices       json.RawMessage `json:"outcomePrices"`
@@ -108,7 +109,8 @@ type gammaMarket struct {
 	Closed              bool            `json:"closed"`
 	UmaResolutionStatus string          `json:"umaResolutionStatus"`
 	Events              []struct {
-		Slug string `json:"slug"`
+		Slug  string `json:"slug"`
+		Title string `json:"title"`
 	} `json:"events"`
 }
 
@@ -157,7 +159,7 @@ func (g *GammaClient) MarketsLocale(ctx context.Context, ids []string, locale st
 		if end > len(ids) {
 			end = len(ids)
 		}
-		query := url.Values{"locale": {locale}}
+		query := url.Values{"locale": {locale}, "limit": {"100"}}
 		for _, id := range ids[start:end] {
 			if id != "" {
 				query.Add("id", id)
@@ -245,11 +247,16 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 		volume, _ = raw.Volume.Float64()
 	}
 	slug := raw.Slug
-	if len(raw.Events) > 0 && raw.Events[0].Slug != "" {
-		slug = raw.Events[0].Slug
+	eventTitle := ""
+	if len(raw.Events) > 0 {
+		if raw.Events[0].Slug != "" {
+			slug = raw.Events[0].Slug
+		}
+		eventTitle = raw.Events[0].Title
 	}
 	return Market{
 		ID: raw.ID, ConditionID: raw.ConditionID, Question: raw.Question,
+		GroupItemTitle: raw.GroupItemTitle, EventTitle: eventTitle,
 		Slug: slug, Outcomes: outcomes, EndDate: endDate,
 		Liquidity: liquidity, Volume: volume, Active: raw.Active,
 		Closed: raw.Closed, ResolutionStatus: raw.UmaResolutionStatus,

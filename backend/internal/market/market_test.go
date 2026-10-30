@@ -44,12 +44,16 @@ func TestGammaClientMarketsLocaleRequestsTranslatedText(t *testing.T) {
 		if ids := r.URL.Query()["id"]; len(ids) != 2 || ids[0] != "42" || ids[1] != "43" {
 			t.Errorf("ids = %v, want [42 43]", ids)
 		}
+		if got := r.URL.Query().Get("limit"); got != "100" {
+			t.Errorf("limit = %q, want 100", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[{
-			"id":"42","conditionId":"condition-42","question":"会结算吗？","slug":"will-it-resolve",
+			"id":"42","conditionId":"condition-42","question":"会结算吗？","groupItemTitle":"O/U 0.5","slug":"will-it-resolve",
 			"outcomes":"[\"是\",\"否\"]","outcomePrices":"[\"0.98\",\"0.02\"]",
 			"clobTokenIds":"[\"token-yes\",\"token-no\"]","endDate":"2099-01-01T00:00:00Z",
-			"liquidity":"25000","volume":"90000","active":true,"closed":false
+			"liquidity":"25000","volume":"90000","active":true,"closed":false,
+			"events":[{"slug":"will-it-resolve","title":"会结算吗 -更多市场"}]
 		}]`))
 	}))
 	defer server.Close()
@@ -60,6 +64,9 @@ func TestGammaClientMarketsLocaleRequestsTranslatedText(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Question != "会结算吗？" || items[0].Outcomes[0].Name != "是" {
 		t.Fatalf("unexpected localized market: %+v", items)
+	}
+	if items[0].GroupItemTitle != "O/U 0.5" || items[0].EventTitle != "会结算吗 -更多市场" {
+		t.Fatalf("localized context not parsed: %+v", items[0])
 	}
 }
 
