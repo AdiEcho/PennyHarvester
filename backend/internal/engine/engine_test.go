@@ -941,6 +941,7 @@ type runtimeLive struct {
 	clobURL     string
 	defaultCLOB string
 	settings    engine.LiveSettings
+	endpoints   engine.WalletEndpoints
 	probeURL    string
 	probeErr    error
 	relayerKey  string
@@ -1061,13 +1062,20 @@ func (l *runtimeLive) ProbeRelayer(_ context.Context, settings engine.LiveSettin
 	}, nil
 }
 
-func (l *runtimeLive) DiscoverFunder(_ context.Context, settings engine.LiveSettings, clobURL string) ([]string, error) {
+func (l *runtimeLive) DiscoverWallet(_ context.Context, settings engine.LiveSettings, endpoints engine.WalletEndpoints) (engine.WalletDiscovery, error) {
 	l.settings = settings
-	l.probeURL = clobURL
-	return []string{"0x0000000000000000000000000000000000000003"}, nil
+	l.probeURL = endpoints.CLOB
+	l.endpoints = endpoints
+	return engine.WalletDiscovery{
+		Signer:     "0x0000000000000000000000000000000000000001",
+		Funder:     "0x0000000000000000000000000000000000000003",
+		WalletType: 3, WalletName: "Deposit Wallet（POLY_1271）", Deployed: true,
+		Source:  "polymarket-profile",
+		Wallets: []string{"0x0000000000000000000000000000000000000003"},
+	}, nil
 }
 
-func TestDiscoverFunderUsesStoredSigner(t *testing.T) {
+func TestDiscoverWalletUsesStoredSigner(t *testing.T) {
 	ctx := context.Background()
 	live := &runtimeLive{fakeLive: &fakeLive{}}
 	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, live)
@@ -1078,12 +1086,19 @@ func TestDiscoverFunderUsesStoredSigner(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	wallets, err := instance.DiscoverFunder(ctx, instance.SystemSettings().Live.Redacted(), "https://clob.example.com")
+	discovery, err := instance.DiscoverWallet(ctx, instance.SystemSettings().Live.Redacted(), engine.WalletEndpoints{
+		CLOB: "https://clob.example.com",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(wallets) != 1 || live.settings.PrivateKey != key {
-		t.Fatalf("unexpected discovery: %v %+v", wallets, live.settings)
+	if discovery.WalletType != 3 || discovery.Funder == "" || live.settings.PrivateKey != key {
+		t.Fatalf("unexpected discovery: %+v %+v", discovery, live.settings)
+	}
+	// An empty Gamma endpoint falls back to the effective data-source URL, so
+	// the profile lookup always has somewhere to go.
+	if live.endpoints.Gamma != instance.SystemRuntime().GammaBaseURL {
+		t.Fatalf("gamma endpoint = %q, want %q", live.endpoints.Gamma, instance.SystemRuntime().GammaBaseURL)
 	}
 }
 

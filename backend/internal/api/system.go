@@ -201,27 +201,42 @@ func (h *Handler) testRelayer(c *gin.Context) {
 	})
 }
 
-// discoverFunder asks the CLOB which proxy / deposit wallets belong to the
-// signer in the request body. It saves nothing and needs no funder, so the
-// settings page can fill the field for a wallet that was just connected to
-// polymarket.com.
+// discoverFunder resolves the Polymarket account wallet (funder) of the signer
+// in the request body and detects its wallet type. It saves nothing, derives no
+// L2 credentials and needs no funder, so the settings page can fill both fields
+// for a wallet that was just connected to polymarket.com.
 func (h *Handler) discoverFunder(c *gin.Context) {
 	var request struct {
 		Live        engine.LiveSettings `json:"live"`
 		CLOBBaseURL string              `json:"clob_base_url"`
+		GammaURL    string              `json:"gamma_base_url"`
 	}
 	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Funder 查询请求无效: " + err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "钱包检测请求无效: " + err.Error()})
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 25*time.Second)
 	defer cancel()
-	wallets, err := h.engine.DiscoverFunder(ctx, request.Live, request.CLOBBaseURL)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"ok": false, "error": err.Error()})
-		return
+	discovery, err := h.engine.DiscoverWallet(ctx, request.Live, engine.WalletEndpoints{
+		CLOB:  request.CLOBBaseURL,
+		Gamma: request.GammaURL,
+	})
+	payload := gin.H{
+		"ok":               err == nil,
+		"signer":           discovery.Signer,
+		"funder":           discovery.Funder,
+		"wallet_type":      discovery.WalletType,
+		"wallet_type_name": discovery.WalletName,
+		"deployed":         discovery.Deployed,
+		"source":           discovery.Source,
+		"wallets":          discovery.Wallets,
+		"candidates":       discovery.Candidates,
+		"notes":            discovery.Notes,
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "wallets": wallets})
+	if err != nil {
+		payload["error"] = err.Error()
+	}
+	c.JSON(http.StatusOK, payload)
 }
 
 func envPresent(key string) bool {

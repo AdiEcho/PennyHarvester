@@ -37,6 +37,9 @@ type Config struct {
 	// BuilderCode attributes every signed order to a Polymarket builder
 	// profile. It is public and may be empty (unattributed orders).
 	BuilderCode string
+	// PolygonRPC is a read-only Polygon JSON-RPC endpoint used by wallet
+	// detection (eth_getCode / eth_call). It never signs anything.
+	PolygonRPC string
 	// Proxy is the outbound egress shared with the market data client. The
 	// executor rebuilds its CLOB client when the system settings change.
 	Proxy *netproxy.Manager
@@ -71,6 +74,7 @@ func New(cfg Config) *Executor {
 	cfg.APIPassphrase = strings.TrimSpace(cfg.APIPassphrase)
 	cfg.CLOBURL = strings.TrimRight(strings.TrimSpace(cfg.CLOBURL), "/")
 	cfg.RelayerURL = strings.TrimRight(strings.TrimSpace(cfg.RelayerURL), "/")
+	cfg.PolygonRPC = strings.TrimRight(strings.TrimSpace(cfg.PolygonRPC), "/")
 	builderCode, builderErr := normalizeBuilderCode(cfg.BuilderCode)
 	return &Executor{base: cfg, cfg: cfg, builderCode: builderCode, builderErr: builderErr}
 }
@@ -264,68 +268,6 @@ func walletMode(signatureType int) string {
 	return WalletModeProxy
 }
 
-// DiscoverFunder asks the CLOB which proxy / deposit wallets belong to the
-// configured signer. It only needs L1 authentication, so it works before a
-// funder is known — which is exactly when the operator needs it.
-func (e *Executor) DiscoverFunder(ctx context.Context, settings engine.LiveSettings, clobBaseURL string) ([]string, error) {
-	if e == nil {
-		return nil, fmt.Errorf("未配置实盘执行器")
-	}
-	cfg, err := e.resolveSigner(settings, clobBaseURL)
-	if err != nil {
-		return nil, err
-	}
-	client, err := newClobClient(cfg, nil)
-	if err != nil {
-		return nil, fmt.Errorf("初始化 Polymarket CLOB 客户端: %w", err)
-	}
-	wallets, err := client.ProxyWallets(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("查询 Polymarket 关联钱包: %w", err)
-	}
-	seen := make(map[string]bool, len(wallets))
-	out := make([]string, 0, len(wallets))
-	for _, wallet := range wallets {
-		wallet = normalizeKeyPrefix(strings.TrimSpace(wallet))
-		if !common.IsHexAddress(wallet) {
-			continue
-		}
-		key := strings.ToLower(wallet)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, wallet)
-	}
-	return out, nil
-}
-
-// resolveSigner merges only the signer fields so wallet discovery is not
-// blocked by an unknown or still-empty funder.
-func (e *Executor) resolveSigner(settings engine.LiveSettings, clobBaseURL string) (Config, error) {
-	settings = settings.Normalize()
-	e.mu.Lock()
-	cfg := e.base
-	cfg.Proxy = e.cfg.Proxy
-	e.mu.Unlock()
-	if clob := strings.TrimRight(strings.TrimSpace(clobBaseURL), "/"); clob != "" {
-		cfg.CLOBURL = clob
-	}
-	if settings.PrivateKey != "" {
-		cfg.PrivateKey = settings.PrivateKey
-	}
-	cfg.SignatureType = 0
-	cfg.Funder = ""
-	cfg.APIKey, cfg.APISecret, cfg.APIPassphrase = "", "", ""
-	if strings.TrimSpace(cfg.PrivateKey) == "" {
-		return Config{}, fmt.Errorf("未配置 POLYMARKET_PRIVATE_KEY")
-	}
-	if _, err := crypto.HexToECDSA(strings.TrimPrefix(strings.TrimSpace(cfg.PrivateKey), "0x")); err != nil {
-		return Config{}, fmt.Errorf("POLYMARKET_PRIVATE_KEY 无效: %w", err)
-	}
-	return cfg, nil
-}
-
 // maskAPIKey keeps the leading bytes of the UUID so the operator can match the
 // value against the CLOB dashboard without exposing the whole credential.
 func maskAPIKey(value string) string {
@@ -356,6 +298,7 @@ func (e *Executor) Environment() engine.LiveEnvironment {
 	base := e.base
 	return engine.LiveEnvironment{
 		CLOBBaseURL:      base.CLOBURL,
+		PolygonRPCURL:    effectiveRPC(base.PolygonRPC),
 		PrivateKeySet:    strings.TrimSpace(base.PrivateKey) != "",
 		Funder:           base.Funder,
 		SignatureType:    base.SignatureType,

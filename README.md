@@ -55,6 +55,7 @@
 ### 5. 系统设置（接口、实盘凭据、网络代理与访问密码）
 - **行情与交易接口**：在「系统设置」页直接修改 Gamma 行情地址与 CLOB 交易地址，支持自建镜像或本地代理。保存后新的行情与交易请求立即使用新地址，无需重启；留空则继承环境变量或官方默认值。
 - **网页配置实盘凭据**：钱包私钥、签名类型、Funder 以及可选的 CLOB L2 API Key / Secret / Passphrase 都可以在网页中填写。网页值优先于启动环境变量；私钥与 L2 Secret 使用 AES-256-GCM 加密保存在 SQLite，读取时只返回 `******` 掩码，前端原样回传时后端自动还原。
+- **钱包类型自动识别**：填入私钥后系统会自动把地址解析成 Polymarket 账户钱包并判断钱包类型（`0` EOA / `1` Proxy / `2` Safe / `3` Deposit Wallet），同时填入 Funder，无需自己猜签名类型。识别来源依次为 Polymarket 公开资料（Gamma `/public-profile` 的 `proxyWallet`）与链上 CREATE2 推导（旧版 Proxy / Safe / Deposit 地址逐个用 `eth_getCode` 校验），再用字节码特征（EIP-1167 克隆 → Proxy，ERC-1967 / Beacon 克隆或 EIP-7702 委托 → Deposit，`getOwners()` → Safe）确认类型。检测只读，不保存、不派生 L2 凭据、不下单。
 - **网络出口代理**：在「系统设置」页统一配置后端访问 Polymarket 的出口，支持「跟随环境变量（`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`）」「自定义代理（http / https / socks5，支持 `NO_PROXY` 白名单）」「直连（忽略环境变量）」三种模式。修改后立即应用到 Gamma 行情与 CLOB 实盘请求，无需重启；配置保存在本机 SQLite 的 `system_settings` 表。
 - **代理连通性测试**：保存前可用「测试连接」按钮通过当前表单配置探测 `https://clob.polymarket.com/time`，返回状态码与耗时；测试不会保存设置。
 - **代理凭据保护**：代理地址中的密码在读取时以 `******` 掩码返回，前端原样回传时后端会自动还原，避免误清空密钥。
@@ -241,6 +242,17 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 - **邮箱 / Magic 登录的账号无法导出私钥**（由 Polymarket 托管），因此不能直接用于本系统实盘；需要另用一个能导出私钥的钱包，或把资金转到由自己私钥控制的地址。
 - 保存前会做本地校验：EOA 模式带 Funder、代理模式缺 Funder、Funder 等于私钥地址都会直接拒绝，避免订单签给一个没有余额的地址。
 
+#### 钱包类型与 Funder 自动识别
+
+`POST /system/live/funder`（网页「系统设置 → 实盘交易凭据 → 自动检测」）只需要私钥，不保存设置、不派生 L2 凭据、不下单：
+
+1. **Polymarket 公开资料**（首选）：`GET {Gamma}/public-profile?address=<私钥地址>` 返回该账户的 `proxyWallet`。这是官方索引的 账户 EOA → 账户钱包 映射，新注册的 Deposit 钱包也能直接查到。
+2. **CLOB 关联钱包接口**（已下线，仅兼容自建实例）：`GET /auth/get-proxy-wallets` 在官方 CLOB 上返回 `404 page not found`，因此该来源失败只作为提示，不再当作错误。
+3. **链上 CREATE2 推导**：用签名的 EOA 推导旧版 Proxy（`0xaB45…4052`，`salt = keccak256(abi.encodePacked(eoa))`）、Safe（`0xaacF…541b`，`salt = keccak256(abi.encode(eoa))`）与 Deposit 钱包（`0x0000…3Cc07`，`walletId = bytes32(eoa)`、`salt = keccak256(abi.encode(factory, walletId))`），再用 `eth_getCode` 确认哪个已部署。未命中时按官方默认（Deposit Wallet）处理。
+4. **类型确认**：EIP-1167 克隆 → Proxy（`1`）；ERC-1967 / Beacon 克隆或 EIP-7702 委托 → Deposit（`3`）；`getOwners()` 有返回 → Safe（`2`）；推导地址直接命中则以推导结果为准。
+
+链上只读调用默认走公共 Polygon RPC `https://polygon-bor-rpc.publicnode.com`，可用 `POLYGON_RPC_URL` 换成自己的节点（同样受「网络出口代理」设置约束）。若公开资料与链上校验都查不到，说明该钱包还没有在 polymarket.com 登录过，需要先用它登录一次让平台创建账户钱包。
+
 #### 邮箱登录账号如何实盘
 
 邮箱 / Google 登录的 Polymarket 账号由 Magic 托管私钥（MPC），网页上的下单是 Magic 在浏览器内完成签名，**私钥无法导出**。本系统需要本地签名，所以无法直接用这类账号下单。可行路径：
@@ -249,7 +261,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
    - 新建或导入一个 MetaMask / Rabby 等钱包（记下私钥）。
    - 在 polymarket.com（邮箱账号）里把 USDC 提现到这个新地址，提现由 Magic 在浏览器签名，无需导出私钥。
    - 用新钱包登录一次 polymarket.com，让平台为它部署 Deposit 钱包（类型 `3`）。
-   - 在本系统选「Polymarket 代理钱包」，填新钱包私钥，点 Funder 旁的「自动获取」（或从个人菜单复制 Deposit 钱包地址），类型选 `3`。
+   - 在本系统「Polymarket 代理钱包」里填入新钱包私钥，系统会自动识别为 Deposit Wallet（类型 `3`）并填好 Funder（也可点「自动检测」重试，或从个人菜单复制地址手动填入）。
    - 不想用 Polymarket 智能钱包也可以选「自托管 EOA」：USDC 直接在新地址上，但需自行完成 USDC 授权（自付 Polygon gas）。
 2. **Session Key（官方 beta，仅 Deposit 钱包）**：Deposit Wallet 所有者可以授权一个独立 EOA 签名者代为交易（可按 venue 限定、180 天过期、不能提现），参见 [Session Keys](https://docs.polymarket.com/trading/session-keys)。但授权本身仍需 owner 私钥签名 + Builder API Key + relayer，且订单需要 session-key 签名包装，本系统当前 SDK 未实现，暂不支持。
 3. **不要尝试“导出” Magic 私钥**：没有公开接口，也违反平台条款。
@@ -280,6 +292,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POLYMARKET_SIGNATURE_TYPE` | `0` | 签名类型的可选回退值：`0` EOA、`1` Proxy、`2` Safe、`3` Deposit/Poly1271 |
 | `POLYMARKET_FUNDER` | 空 | 非 EOA 签名类型对应的代理/Safe 钱包地址的可选回退值；EOA 模式必须留空（兼容旧变量名 `POLYMARKET_MAKER_ADDRESS`） |
 | `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | CLOB 交易地址的默认值；可在网页「系统设置」中覆盖 |
+| `POLYGON_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | 钱包类型自动识别用的只读 Polygon RPC（`eth_getCode` / `eth_call`）；兼容旧变量名 `POLYMARKET_RPC_URL`，不支持网页修改 |
 | `POLYMARKET_API_KEY` | 空 | 可选，复用已有的 CLOB L2 API Key（**不是** polymarket.com 设置页的 Relayer API Key）；也可在网页中填写 |
 | `POLYMARKET_API_SECRET` | 空 | 可选，复用已有的 CLOB L2 API Secret；也可在网页中加密保存 |
 | `POLYMARKET_API_PASSPHRASE` | 空 | 可选，复用已有的 CLOB L2 API Passphrase；也可在网页中加密保存 |

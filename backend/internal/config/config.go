@@ -25,6 +25,7 @@ type Config struct {
 	PolymarketFunder        string
 	PolymarketSignatureType int
 	PolymarketCLOBURL       string
+	PolygonRPCURL           string
 	PolymarketAPIKey        string
 	PolymarketAPISecret     string
 	PolymarketAPIPassphrase string
@@ -41,6 +42,9 @@ func FromEnv() Config {
 		PolymarketFunder:        envAny([]string{"POLYMARKET_FUNDER", "POLYMARKET_MAKER_ADDRESS"}, ""),
 		PolymarketSignatureType: envInt("POLYMARKET_SIGNATURE_TYPE", 0),
 		PolymarketCLOBURL:       env("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
+		// Read-only Polygon RPC used by wallet auto-detection. The keyless public
+		// endpoint is fine for eth_getCode/eth_call; set your own for reliability.
+		PolygonRPCURL:           envAny([]string{"POLYGON_RPC_URL", "POLYMARKET_RPC_URL"}, "https://polygon-bor-rpc.publicnode.com"),
 		PolymarketAPIKey:        os.Getenv("POLYMARKET_API_KEY"),
 		PolymarketAPISecret:     os.Getenv("POLYMARKET_API_SECRET"),
 		PolymarketAPIPassphrase: os.Getenv("POLYMARKET_API_PASSPHRASE"),

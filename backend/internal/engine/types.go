@@ -372,6 +372,7 @@ func (s SystemSettings) MergeSecret(previous SystemSettings) SystemSettings {
 // environment at startup. The web UI uses it to show inheritance hints.
 type LiveEnvironment struct {
 	CLOBBaseURL      string `json:"clob_base_url"`
+	PolygonRPCURL    string `json:"polygon_rpc_url"`
 	PrivateKeySet    bool   `json:"private_key_set"`
 	Funder           string `json:"funder"`
 	SignatureType    int    `json:"signature_type"`
@@ -448,10 +449,43 @@ type relayerProbeRuntime interface {
 	ProbeRelayer(context.Context, LiveSettings, string, string, string) (RelayerProbe, error)
 }
 
-// funderDiscovery is implemented by executors that can ask the CLOB which
-// proxy / deposit wallets belong to a signer.
-type funderDiscovery interface {
-	DiscoverFunder(context.Context, LiveSettings, string) ([]string, error)
+// WalletEndpoints are the effective endpoints wallet discovery may use. The
+// CLOB is kept for the (retired) proxy-wallet endpoint, Gamma answers the
+// public profile lookup and RPC is only used for read-only on-chain checks.
+type WalletEndpoints struct {
+	CLOB  string `json:"clob_base_url"`
+	Gamma string `json:"gamma_base_url"`
+}
+
+// WalletCandidate is one wallet address that belongs to a signer, together with
+// the type that was inferred for it.
+type WalletCandidate struct {
+	Address    string `json:"address"`
+	WalletType int    `json:"wallet_type"`
+	WalletName string `json:"wallet_type_name"`
+	Deployed   bool   `json:"deployed"`
+	Source     string `json:"source"`
+}
+
+// WalletDiscovery is the result of resolving a signer to its Polymarket account
+// wallet. Funder is empty when the signer is a plain EOA (wallet type 0), which
+// is exactly the value the settings page should store.
+type WalletDiscovery struct {
+	Signer     string            `json:"signer"`
+	Funder     string            `json:"funder"`
+	WalletType int               `json:"wallet_type"`
+	WalletName string            `json:"wallet_type_name"`
+	Deployed   bool              `json:"deployed"`
+	Source     string            `json:"source"`
+	Wallets    []string          `json:"wallets"`
+	Candidates []WalletCandidate `json:"candidates"`
+	Notes      []string          `json:"notes"`
+}
+
+// walletDiscovery is implemented by executors that can resolve the account
+// wallet (and its type) of a signer without placing an order.
+type walletDiscovery interface {
+	DiscoverWallet(context.Context, LiveSettings, WalletEndpoints) (WalletDiscovery, error)
 }
 
 type Opportunity struct {

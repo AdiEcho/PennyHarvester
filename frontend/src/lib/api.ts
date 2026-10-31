@@ -152,7 +152,7 @@ export const api = {
       },
       signal,
     }),
-  discoverFunder: (live: LiveSettings, clobBaseURL: string, signal?: AbortSignal) =>
+  detectWallet: (live: LiveSettings, clobBaseURL: string, signal?: AbortSignal) =>
     request<FunderDiscoveryResult>('/system/live/funder', {
       method: 'POST',
       body: { live, clob_base_url: clobBaseURL },

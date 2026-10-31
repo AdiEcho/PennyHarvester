@@ -60,6 +60,7 @@ func run() error {
 		Funder:        cfg.PolymarketFunder,
 		SignatureType: cfg.PolymarketSignatureType,
 		CLOBURL:       cfg.PolymarketCLOBURL,
+		PolygonRPC:    cfg.PolygonRPCURL,
 		APIKey:        cfg.PolymarketAPIKey,
 		APISecret:     cfg.PolymarketAPISecret,
 		APIPassphrase: cfg.PolymarketAPIPassphrase,

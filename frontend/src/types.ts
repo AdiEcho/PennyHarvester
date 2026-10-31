@@ -254,14 +254,31 @@ export interface RelayerProbeResult {
   latency_ms?: number
 }
 
+export interface WalletCandidate {
+  address: string
+  wallet_type: number
+  wallet_type_name: string
+  deployed: boolean
+  source: string
+}
+
 export interface FunderDiscoveryResult {
   ok: boolean
   error?: string
+  signer?: string
+  funder?: string
+  wallet_type?: number
+  wallet_type_name?: string
+  deployed?: boolean
+  source?: string
   wallets?: string[]
+  candidates?: WalletCandidate[]
+  notes?: string[]
 }
 
 export interface LiveEnvironment {
   clob_base_url: string
+  polygon_rpc_url?: string
   private_key_set: boolean
   funder: string
   signature_type: number

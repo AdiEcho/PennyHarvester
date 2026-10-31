@@ -223,16 +223,21 @@ func (e *Engine) ProbeRelayer(ctx context.Context, settings LiveSettings, clobBa
 	return probe.ProbeRelayer(ctx, settings, clobBaseURL, apiKey, address)
 }
 
-// DiscoverFunder returns the proxy / deposit wallets the CLOB associates with
-// the configured signer. It works before a funder is set, so the settings page
-// can fill the field instead of asking the operator to copy an address.
-func (e *Engine) DiscoverFunder(ctx context.Context, settings LiveSettings, clobBaseURL string) ([]string, error) {
+// DiscoverWallet resolves the Polymarket account wallet (the funder) of the
+// configured signer and detects its wallet type (EOA / Proxy / Safe / Deposit).
+// It works before a funder is set, so the settings page can fill both fields
+// instead of asking the operator to copy an address and guess a type.
+func (e *Engine) DiscoverWallet(ctx context.Context, settings LiveSettings, endpoints WalletEndpoints) (WalletDiscovery, error) {
 	settings = settings.MergeSecret(e.SystemSettings().Live).Normalize()
-	discovery, ok := e.live.(funderDiscovery)
-	if !ok || discovery == nil {
-		return nil, fmt.Errorf("当前实盘执行器不支持自动获取 Funder")
+	runtime := e.SystemRuntime()
+	if strings.TrimSpace(endpoints.Gamma) == "" {
+		endpoints.Gamma = runtime.GammaBaseURL
 	}
-	return discovery.DiscoverFunder(ctx, settings, clobBaseURL)
+	discovery, ok := e.live.(walletDiscovery)
+	if !ok || discovery == nil {
+		return WalletDiscovery{}, fmt.Errorf("当前实盘执行器不支持钱包自动检测")
+	}
+	return discovery.DiscoverWallet(ctx, settings, endpoints)
 }
 
 // applyRuntimeSettings applies proxy, data-source and live credentials in

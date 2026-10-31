@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
@@ -21,6 +21,7 @@ import { cn } from '@/lib/utils'
 import { useToast } from '@/components/toast'
 import type {
   DataSourceSettings,
+  FunderDiscoveryResult,
   LiveEnvironment,
   LiveProbeResult,
   LiveSettings,
@@ -47,6 +48,11 @@ const modeLabels: Record<ProxyMode, string> = {
 }
 
 const REDACTED_SECRET = '******'
+const walletSourceLabels: Record<string, string> = {
+  'polymarket-profile': 'Polymarket 公开资料',
+  'create2-derivation': '链上 CREATE2 推导',
+  'clob-proxy-wallets': 'CLOB 关联钱包接口',
+}
 const PUBLIC_GAMMA_URL = 'https://gamma-api.polymarket.com'
 const PUBLIC_CLOB_URL = 'https://clob.polymarket.com'
 
@@ -206,7 +212,13 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
   const [relayerAddress, setRelayerAddress] = useState('')
   const [relayerTesting, setRelayerTesting] = useState(false)
   const [relayerProbe, setRelayerProbe] = useState<RelayerProbeResult | null>(null)
-  const [discoveringFunder, setDiscoveringFunder] = useState(false)
+  const [detectingWallet, setDetectingWallet] = useState(false)
+  const [detection, setDetection] = useState<FunderDiscoveryResult | null>(null)
+  // A manual choice of wallet mode wins over auto-detection until the private
+  // key changes; otherwise typing a key would immediately undo the operator's
+  // "self-custody EOA" selection.
+  const [manualMode, setManualMode] = useState(false)
+  const detectedKeyRef = useRef('')
   // Any edit invalidates the previous result so a stale "passed" badge cannot
   // be mistaken for a check of the current form values.
   useEffect(() => {
@@ -223,35 +235,92 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
   const environmentCredentialsSet = environment.api_key_set && environment.api_secret_set && environment.api_passphrase_set
   const environmentCredentialsPartial = (environment.api_key_set || environment.api_secret_set || environment.api_passphrase_set) && !environmentCredentialsSet
 
-  const discoverFunder = async () => {
-    setDiscoveringFunder(true)
+  // detectWallet resolves the Polymarket account wallet (funder) and its type
+  // (EOA / Proxy / Safe / Deposit) from the private key. The backend tries the
+  // public profile lookup first and falls back to CREATE2 derivation, so the
+  // operator never has to know the signature-type number.
+  const detectWallet = async (options: { silent?: boolean } = {}) => {
+    const key = draft.private_key.trim()
+    // An empty field is fine when the startup environment supplied the key: the
+    // backend resolves it before querying.
+    if (!key && !environment.private_key_set) {
+      if (!options.silent) {
+        toast({ title: '无法自动识别', description: '请先填写钱包私钥，或先保存一次私钥让系统记住它。', variant: 'error' })
+      }
+      return
+    }
+    setDetectingWallet(true)
     try {
-      const result = await api.discoverFunder(draft, clobBaseURL)
+      const result = await api.detectWallet(draft, clobBaseURL)
+      setDetection(result)
       if (!result.ok) {
-        toast({ title: '未能自动获取 Funder', description: result.error || '请检查私钥与 CLOB 地址。', variant: 'error' })
+        if (!options.silent) {
+          toast({
+            title: '未能自动识别钱包',
+            description: result.error || '请检查私钥、网络出口与 Polymarket 接口地址。',
+            variant: 'error',
+          })
+        }
         return
       }
-      const wallets = result.wallets ?? []
-      if (wallets.length === 0) {
+      const nextType = result.wallet_type ?? 3
+      const nextFunder = result.funder ?? ''
+      const currentType = draft.signature_type ?? environment.signature_type
+      const currentFunder = draft.funder.trim()
+      // Only touch the form when something actually differs, so an automatic
+      // check on page load cannot mark the section dirty.
+      if (nextType !== currentType || nextFunder.toLowerCase() !== currentFunder.toLowerCase()) {
+        onChange({ signature_type: nextType, funder: nextFunder })
+      }
+      if (!options.silent) {
         toast({
-          title: 'CLOB 未返回关联钱包',
-          description: '请先在 polymarket.com 用这个私钥对应的钱包登录一次，让平台为它创建 Deposit 钱包；或从个人菜单复制地址后手动填入。',
-          variant: 'info',
+          title: `已识别为${result.wallet_type_name || '代理钱包'}`,
+          description: nextFunder
+            ? `${nextFunder}${result.deployed === false ? '（尚未在链上部署）' : ''}`
+            : '该私钥没有关联的 Polymarket 账户钱包，按自托管 EOA 处理，Funder 留空。',
+          variant: 'success',
         })
-        return
       }
-      onChange({ funder: wallets[0] })
-      toast({
-        title: '已填入 Funder',
-        description: wallets.length > 1 ? `共 ${wallets.length} 个关联钱包，已填入第一个：${wallets[0]}` : wallets[0],
-        variant: 'success',
-      })
     } catch (caught) {
-      toast({ title: '查询失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+      if (!options.silent) {
+        toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+      }
     } finally {
-      setDiscoveringFunder(false)
+      setDetectingWallet(false)
     }
   }
+
+  // Auto-detect once per private key: a freshly pasted key immediately fills
+  // both the wallet type and the funder. Two other cases are covered as well:
+  // the masked placeholder (the backend restores the stored key) and an empty
+  // field when the startup environment supplied the key.
+  const privateKeyValue = draft.private_key.trim()
+  const usingEnvironmentKey = privateKeyValue === '' && environment.private_key_set
+  const privateKeyDetectable = usingEnvironmentKey
+    || privateKeyValue === REDACTED_SECRET
+    || /^0x[0-9a-fA-F]{64}$/.test(privateKeyValue)
+  const detectionKey = usingEnvironmentKey ? '__environment__' : privateKeyValue
+  const previousKeyRef = useRef(detectionKey)
+  // Editing the key re-enables auto-detection even after a manual mode choice.
+  useEffect(() => {
+    if (previousKeyRef.current === detectionKey) return
+    previousKeyRef.current = detectionKey
+    setManualMode(false)
+  }, [detectionKey])
+  useEffect(() => {
+    if (!privateKeyDetectable) {
+      detectedKeyRef.current = ''
+      return
+    }
+    if (manualMode || detectedKeyRef.current === detectionKey) return
+    const timer = window.setTimeout(() => {
+      detectedKeyRef.current = detectionKey
+      void detectWallet({ silent: true })
+    }, 600)
+    return () => window.clearTimeout(timer)
+    // detectWallet is intentionally excluded: it closes over the same draft.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectionKey, privateKeyDetectable, manualMode])
 
   const testRelayer = async () => {
     setRelayerTesting(true)
@@ -323,15 +392,15 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
 
       <div className="mt-5">
         <p className="text-sm font-medium text-slate-700">钱包模式</p>
-        <p className="mt-1 text-xs leading-4 text-slate-400">决定资金在哪里、以及 CLOB 如何校验签名。两种模式都需要私钥，仅用 Relayer API Key 无法下单。</p>
+        <p className="mt-1 text-xs leading-4 text-slate-400">决定资金在哪里、以及 CLOB 如何校验签名。填入私钥后系统会自动识别该钱包属于自托管 EOA 还是哪种 Polymarket 代理钱包，并填好 Funder；你也可以手动选择覆盖识别结果。</p>
         <div className="mt-2 grid gap-3 sm:grid-cols-2">
           <button
             type="button"
             aria-pressed={mode === 'eoa'}
-            onClick={() => onChange({ signature_type: 0, funder: '' })}
+            onClick={() => { setManualMode(true); onChange({ signature_type: 0, funder: '' }) }}
             className={cn(
               'rounded-xl border p-4 text-left transition',
-              mode === 'eoa' ? 'border-emerald-300 bg-emerald-50/70 ring-1 ring-emerald-200' : 'border-slate-200 bg-white hover:border-slate-300',
+              mode === 'eoa' ? 'border-emerald-300 bg-emerald-50/70 ring-1 ring-emerald-200' : 'border-slate-200 bg-surface hover:border-slate-300',
             )}
           >
             <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
@@ -343,10 +412,10 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
           <button
             type="button"
             aria-pressed={mode === 'proxy'}
-            onClick={() => onChange({ signature_type: proxyType })}
+            onClick={() => { setManualMode(true); onChange({ signature_type: proxyType }) }}
             className={cn(
               'rounded-xl border p-4 text-left transition',
-              mode === 'proxy' ? 'border-emerald-300 bg-emerald-50/70 ring-1 ring-emerald-200' : 'border-slate-200 bg-white hover:border-slate-300',
+              mode === 'proxy' ? 'border-emerald-300 bg-emerald-50/70 ring-1 ring-emerald-200' : 'border-slate-200 bg-surface hover:border-slate-300',
             )}
           >
             <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
@@ -376,12 +445,14 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
               placeholder={environment.private_key_set ? '环境变量已提供，留空沿用' : '0x...'}
               spellCheck={false}
               autoComplete="off"
-              className="font-mono text-xs"
+              className="min-w-0 flex-1 font-mono text-xs"
             />
+            <Button variant="secondary" size="sm" onClick={() => void detectWallet()} loading={detectingWallet} disabled={busy}>自动识别</Button>
             {draft.private_key && (
               <Button variant="secondary" size="sm" onClick={() => onChange({ private_key: '' })}>清除</Button>
             )}
           </div>
+          <p className="mt-1.5 text-xs leading-4 text-slate-400">填入完整私钥后会自动识别钱包类型（EOA / Proxy / Safe / Deposit）并填好 Funder，也可点「自动识别」重试。识别结果只填表，保存后才落库。</p>
           {draft.private_key === REDACTED_SECRET && <p className="mt-1.5 text-xs text-slate-400">已保存的私钥不会回显。直接输入新值会覆盖，点击「清除」可恢复环境变量。</p>}
         </div>
 
@@ -389,7 +460,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
           <div>
             <label htmlFor="live-signature-type" className="text-sm font-medium text-slate-700">代理钱包类型</label>
             <p className="mt-1 min-h-8 text-xs leading-4 text-slate-400">1=旧版 Magic/Google Proxy，2=旧版 Safe（MetaMask 等），3=Deposit Wallet（2026-05 之后新注册账号默认）。环境变量默认 {environment.signature_type}。</p>
-            <Select value={String(proxyType)} onValueChange={(value) => onChange({ signature_type: Number(value) })}>
+            <Select value={String(proxyType)} onValueChange={(value) => { setManualMode(true); onChange({ signature_type: Number(value) }) }}>
               <SelectTrigger id="live-signature-type" className="mt-2">
                 <SelectValue />
               </SelectTrigger>
@@ -410,15 +481,15 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
               <Input
                 id="live-funder"
                 value={draft.funder}
-                onChange={(event) => onChange({ funder: event.target.value })}
+                onChange={(event) => { setManualMode(true); onChange({ funder: event.target.value }) }}
                 placeholder={environment.funder || '0x...'}
                 spellCheck={false}
                 autoComplete="off"
                 className="font-mono text-xs"
               />
-              <Button variant="secondary" size="sm" onClick={() => void discoverFunder()} loading={discoveringFunder} disabled={busy}>自动获取</Button>
+              <Button variant="secondary" size="sm" onClick={() => void detectWallet()} loading={detectingWallet} disabled={busy}>自动检测</Button>
             </div>
-            <p className="mt-1.5 text-xs leading-4 text-slate-400">「自动获取」向 CLOB 查询该私钥关联的 Proxy / Deposit 钱包，不会保存也不会下单。旧版 Proxy 钱包通常能查到；Deposit 钱包若查不到，请从 Polymarket 个人菜单复制。</p>
+            <p className="mt-1.5 text-xs leading-4 text-slate-400">「自动检测」先用 Polymarket 公开资料把私钥地址解析成账户钱包，再用链上字节码判断它是 Proxy / Safe / Deposit 钱包；查不到时用 CREATE2 推导旧版 Proxy / Safe 地址做链上校验。检测只读，不会保存、派生 L2 凭据或下单。链上校验使用 <code className="break-all rounded bg-slate-100 px-1">{environment.polygon_rpc_url || 'https://polygon-bor-rpc.publicnode.com'}</code>（可用环境变量 POLYGON_RPC_URL 覆盖）。</p>
           </div>
         ) : (
           <div className="lg:col-span-3 rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs leading-5 text-slate-500">
@@ -426,6 +497,40 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
           </div>
         )}
       </div>
+
+      {detection && (
+        <div className={cn(
+          'mt-4 rounded-xl border px-4 py-3 text-xs leading-5',
+          detection.ok
+            ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+            : mode === 'eoa'
+              ? 'border-slate-200 bg-slate-50 text-slate-600'
+              : 'border-amber-200 bg-amber-50 text-amber-900',
+        )} role="status">
+          {detection.ok ? (
+            <div className="space-y-1">
+              <p className="font-medium">钱包自动识别：{detection.wallet_type_name || '代理钱包'} · 来源 {walletSourceLabels[detection.source ?? ''] || detection.source || '—'}{detection.deployed === false ? ' · 链上尚未部署' : ''}</p>
+              {detection.signer && <p className="break-all font-mono">Signer {detection.signer}</p>}
+              {detection.funder
+                ? <p className="break-all font-mono">Funder {detection.funder}</p>
+                : <p>该私钥没有关联的 Polymarket 账户钱包，按自托管 EOA 处理（Funder 留空）。</p>}
+              {(detection.candidates ?? []).length > 1 && (
+                <p>共 {(detection.candidates ?? []).length} 个关联钱包，已填入第一个；其余：{(detection.candidates ?? []).slice(1).map((candidate) => `${candidate.address.slice(0, 6)}…${candidate.address.slice(-4)}（${candidate.wallet_type_name}）`).join('、')}</p>
+              )}
+              {(detection.notes ?? []).map((note) => <p key={note} className="text-amber-700">{note}</p>)}
+            </div>
+          ) : (
+            <div className="space-y-1">
+              <p className="font-medium">
+                {mode === 'eoa' ? '该私钥没有关联的 Polymarket 账户钱包' : '未能自动识别钱包'}
+              </p>
+              {mode === 'eoa' && <p>自托管 EOA 模式下这属于正常情况：资金与签名都在私钥地址上，Funder 留空即可。</p>}
+              <p className="break-words">{detection.error || '请检查私钥、网络出口与 Polymarket 接口地址。'}</p>
+              {(detection.notes ?? []).map((note) => <p key={note} className="break-words">{note}</p>)}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="mt-6 border-t border-slate-100 pt-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -536,7 +641,10 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
               {(probe.cash ?? 0) <= 0 && <p className="text-amber-700">抵押余额为 0：请确认 Funder 是该账户真实钱包地址，或该钱包尚未存入 USDC（余额不足时下单会被拒绝）。</p>}
             </div>
           ) : (
-            <p className="break-words">{probe.error || '检测失败，请检查私钥、Funder、签名类型与网络出口。'}</p>
+            <div className="space-y-1">
+              <p className="break-words">{probe.error || '检测失败，请检查私钥、Funder、签名类型与网络出口。'}</p>
+              <p className="text-rose-600">若提示签名或钱包不匹配，先点上方「自动识别」让系统重新判断钱包类型与 Funder，再重新检测。</p>
+            </div>
           )}
         </div>
       )}
