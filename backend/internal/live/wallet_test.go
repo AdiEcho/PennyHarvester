@@ -150,12 +150,34 @@ func retiredCLOB(t *testing.T) *httptest.Server {
 	}))
 }
 
+// TestWalletDiscoveryDoesNotCallRetiredCLOBEndpoint guards the removal of GET
+// /auth/get-proxy-wallets: the public CLOB answers 404 for it, so a discovery
+// run must not spend a request on it (or report it as an operator-visible note).
+func TestWalletDiscoveryDoesNotCallRetiredCLOBEndpoint(t *testing.T) {
+	called := false
+	clob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		http.NotFound(w, r)
+	}))
+	defer clob.Close()
+	profile := profileServer(t, "")
+	defer profile.Close()
+	rpc := rpcServer(t, nil, nil)
+	defer rpc.Close()
+
+	executor := New(Config{PrivateKey: testSignerKey, PolygonRPC: rpc.URL})
+	_, _ = executor.DiscoverWallet(context.Background(), engine.LiveSettings{}, engine.WalletEndpoints{
+		CLOB: clob.URL, Gamma: profile.URL,
+	})
+	if called {
+		t.Fatal("wallet discovery must not call the retired /auth/get-proxy-wallets endpoint")
+	}
+}
+
 func TestDiscoverWalletUsesPublicProfile(t *testing.T) {
 	deposit := common.HexToAddress("0x96CfCB0C30942cFCd1CDf76C7d408794D66B1aCb")
 	profile := profileServer(t, deposit.Hex())
 	defer profile.Close()
-	clob := retiredCLOB(t)
-	defer clob.Close()
 	rpc := rpcServer(t, map[string]string{
 		strings.ToLower(deposit.Hex()): "0x363d3d373d3d363d602036600436635c60da1b60e01b36527fa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50545afa5036515af43d6000803e604d573d6000fd5b3d6000f3",
 	}, nil)
@@ -163,7 +185,7 @@ func TestDiscoverWalletUsesPublicProfile(t *testing.T) {
 
 	executor := New(Config{PrivateKey: testSignerKey, PolygonRPC: rpc.URL})
 	discovery, err := executor.DiscoverWallet(context.Background(), engine.LiveSettings{}, engine.WalletEndpoints{
-		CLOB: clob.URL, Gamma: profile.URL,
+		Gamma: profile.URL,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -177,10 +199,6 @@ func TestDiscoverWalletUsesPublicProfile(t *testing.T) {
 	if discovery.Source != string(sourceProfile) {
 		t.Fatalf("source = %q", discovery.Source)
 	}
-	// A retired CLOB endpoint must be reported as a note, never as a failure.
-	if !containsNote(discovery.Notes, "已下线") {
-		t.Fatalf("expected a retired-endpoint note, got %v", discovery.Notes)
-	}
 }
 
 func TestDiscoverWalletFallsBackToDerivation(t *testing.T) {
@@ -188,8 +206,6 @@ func TestDiscoverWalletFallsBackToDerivation(t *testing.T) {
 	safe := DeriveSafeAddress(signer)
 	profile := profileServer(t, "")
 	defer profile.Close()
-	clob := retiredCLOB(t)
-	defer clob.Close()
 	rpc := rpcServer(t, map[string]string{
 		strings.ToLower(safe.Hex()): "0x6080604052",
 	}, map[string]string{
@@ -201,7 +217,7 @@ func TestDiscoverWalletFallsBackToDerivation(t *testing.T) {
 
 	executor := New(Config{PrivateKey: testSignerKey, PolygonRPC: rpc.URL})
 	discovery, err := executor.DiscoverWallet(context.Background(), engine.LiveSettings{}, engine.WalletEndpoints{
-		CLOB: clob.URL, Gamma: profile.URL,
+		Gamma: profile.URL,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -220,14 +236,12 @@ func TestDiscoverWalletFallsBackToDerivation(t *testing.T) {
 func TestDiscoverWalletReportsMissingAccount(t *testing.T) {
 	profile := profileServer(t, "")
 	defer profile.Close()
-	clob := retiredCLOB(t)
-	defer clob.Close()
 	rpc := rpcServer(t, nil, nil)
 	defer rpc.Close()
 
 	executor := New(Config{PrivateKey: testSignerKey, PolygonRPC: rpc.URL})
 	discovery, err := executor.DiscoverWallet(context.Background(), engine.LiveSettings{}, engine.WalletEndpoints{
-		CLOB: clob.URL, Gamma: profile.URL,
+		Gamma: profile.URL,
 	})
 	if err == nil {
 		t.Fatalf("an unknown account must be reported: %+v", discovery)

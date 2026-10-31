@@ -92,26 +92,38 @@ func (g *GammaClient) httpClient() *http.Client {
 func (g *GammaClient) Name() string { return "Polymarket Gamma" }
 
 type gammaMarket struct {
-	ID                  string          `json:"id"`
-	ConditionID         string          `json:"conditionId"`
-	Question            string          `json:"question"`
-	GroupItemTitle      string          `json:"groupItemTitle"`
-	Slug                string          `json:"slug"`
-	Outcomes            json.RawMessage `json:"outcomes"`
-	OutcomePrices       json.RawMessage `json:"outcomePrices"`
-	ClobTokenIDs        json.RawMessage `json:"clobTokenIds"`
-	EndDate             string          `json:"endDate"`
-	GameStartTime       string          `json:"gameStartTime"`
-	OneDayPriceChange   *float64        `json:"oneDayPriceChange"`
-	Tags                []Tag           `json:"tags"`
-	LiquidityNum        float64         `json:"liquidityNum"`
-	VolumeNum           float64         `json:"volumeNum"`
-	Liquidity           json.Number     `json:"liquidity"`
-	Volume              json.Number     `json:"volume"`
-	Active              bool            `json:"active"`
-	Closed              bool            `json:"closed"`
-	UmaResolutionStatus string          `json:"umaResolutionStatus"`
-	Events              []struct {
+	ID             string          `json:"id"`
+	ConditionID    string          `json:"conditionId"`
+	Question       string          `json:"question"`
+	GroupItemTitle string          `json:"groupItemTitle"`
+	Slug           string          `json:"slug"`
+	Outcomes       json.RawMessage `json:"outcomes"`
+	OutcomePrices  json.RawMessage `json:"outcomePrices"`
+	// Version selects which outcome identifier field is authoritative: "v1"
+	// (CTF) uses clobTokenIds, "v2" (Polymarket Protocol V2) uses positionIds.
+	// A market can populate both, so the version decides, not the presence.
+	Version       string          `json:"version"`
+	ClobTokenIDs  json.RawMessage `json:"clobTokenIds"`
+	PositionIDs   json.RawMessage `json:"positionIds"`
+	EndDate       string          `json:"endDate"`
+	GameStartTime string          `json:"gameStartTime"`
+	// ResolutionStatus is the V2 settlement lifecycle (inactive/active/resolved);
+	// V1 markets report the UMA proposal instead.
+	ResolutionStatus    string      `json:"resolutionStatus"`
+	UmaResolutionStatus string      `json:"umaResolutionStatus"`
+	OneDayPriceChange   *float64    `json:"oneDayPriceChange"`
+	Tags                []Tag       `json:"tags"`
+	LiquidityNum        float64     `json:"liquidityNum"`
+	VolumeNum           float64     `json:"volumeNum"`
+	Liquidity           json.Number `json:"liquidity"`
+	Volume              json.Number `json:"volume"`
+	Active              bool        `json:"active"`
+	Closed              bool        `json:"closed"`
+	// AcceptingOrders says whether the book is open for new orders. A market can
+	// stay active and unclosed while orders are paused, so this is the field to
+	// gate trading on.
+	AcceptingOrders *bool `json:"acceptingOrders"`
+	Events          []struct {
 		ID    string `json:"id"`
 		Slug  string `json:"slug"`
 		Title string `json:"title"`
@@ -167,40 +179,51 @@ func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, erro
 	return markets, nil
 }
 
+// listMarkets pages one Gamma view with /markets/keyset. Polymarket replaced
+// offset paging with opaque cursors (GET /markets/keyset, 2026-04) and rejects
+// offset on the keyset route, so this walks next_cursor instead. The server
+// ignores `active`, which is why ListOpen does not send it; the engine filters
+// on the parsed Active flag.
 func (g *GammaClient) listMarkets(ctx context.Context, endMin, endMax, order, ascending string, pages int) ([]Market, error) {
 	markets := make([]Market, 0, pages*100)
+	cursor := ""
 	for page := 0; page < pages; page++ {
 		query := url.Values{
-			"active":       {"true"},
 			"closed":       {"false"},
 			"limit":        {"100"},
-			"offset":       {strconv.Itoa(page * 100)},
 			"order":        {order},
 			"ascending":    {ascending},
 			"include_tag":  {"true"},
 			"end_date_min": {endMin},
 			"end_date_max": {endMax},
 		}
-		var raw []gammaMarket
-		if err := g.getJSON(ctx, "/markets?"+query.Encode(), &raw); err != nil {
+		if cursor != "" {
+			query.Set("after_cursor", cursor)
+		}
+		var response struct {
+			Markets    []gammaMarket `json:"markets"`
+			NextCursor string        `json:"next_cursor"`
+		}
+		if err := g.getJSON(ctx, "/markets/keyset?"+query.Encode(), &response); err != nil {
 			return nil, err
 		}
-		for _, item := range raw {
-			parsed, err := parseGammaMarket(item)
-			if err == nil {
+		for _, item := range response.Markets {
+			if parsed, err := parseGammaMarket(item); err == nil {
 				markets = append(markets, parsed)
 			}
 		}
-		if len(raw) < 100 {
+		if response.NextCursor == "" || response.NextCursor == cursor || len(response.Markets) == 0 {
 			break
 		}
+		cursor = response.NextCursor
 	}
 	return markets, nil
 }
 
 // MarketsLocale fetches a batch of markets with Polymarket's localized text.
 // Gamma applies the locale to user-generated fields such as question and
-// outcomes; ids are batched to stay within the API's identifier limit.
+// outcomes. locale is documented on /markets/keyset (not on /markets), and ids
+// are batched to stay within the 100-identifier limit.
 func (g *GammaClient) MarketsLocale(ctx context.Context, ids []string, locale string) ([]Market, error) {
 	locale = strings.TrimSpace(locale)
 	if locale == "" || len(ids) == 0 {
@@ -221,13 +244,14 @@ func (g *GammaClient) MarketsLocale(ctx context.Context, ids []string, locale st
 		if len(query["id"]) == 0 {
 			continue
 		}
-		var raw []gammaMarket
-		if err := g.getJSON(ctx, "/markets?"+query.Encode(), &raw); err != nil {
+		var response struct {
+			Markets []gammaMarket `json:"markets"`
+		}
+		if err := g.getJSON(ctx, "/markets/keyset?"+query.Encode(), &response); err != nil {
 			return nil, err
 		}
-		for _, item := range raw {
-			parsed, err := parseGammaMarket(item)
-			if err == nil {
+		for _, item := range response.Markets {
+			if parsed, err := parseGammaMarket(item); err == nil {
 				markets = append(markets, parsed)
 			}
 		}
@@ -306,13 +330,14 @@ func (g *GammaClient) getJSON(ctx context.Context, path string, target any) erro
 }
 
 func parseGammaMarket(raw gammaMarket) (Market, error) {
-	var names, tokenIDs []string
+	var names []string
 	var prices []float64
 	if err := decodeStringArray(raw.Outcomes, &names); err != nil {
 		return Market{}, fmt.Errorf("解析 outcomes: %w", err)
 	}
-	if err := decodeStringArray(raw.ClobTokenIDs, &tokenIDs); err != nil {
-		return Market{}, fmt.Errorf("解析 clobTokenIds: %w", err)
+	tokenIDs, err := gammaOutcomeIDs(raw)
+	if err != nil {
+		return Market{}, err
 	}
 	if err := decodeFloatArray(raw.OutcomePrices, &prices); err != nil {
 		return Market{}, fmt.Errorf("解析 outcomePrices: %w", err)
@@ -323,6 +348,14 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 	endDate, err := time.Parse(time.RFC3339, raw.EndDate)
 	if err != nil {
 		return Market{}, fmt.Errorf("市场 %s 的结束时间无效: %w", raw.ID, err)
+	}
+
+	// V2 markets report a settlement lifecycle in resolutionStatus and leave
+	// umaResolutionStatus empty; V1 markets do the opposite. Prefer whichever
+	// field the market actually carries.
+	resolutionStatus := strings.TrimSpace(raw.ResolutionStatus)
+	if resolutionStatus == "" {
+		resolutionStatus = raw.UmaResolutionStatus
 	}
 
 	outcomes := make([]Outcome, len(names))
@@ -353,8 +386,42 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 		Slug: slug, Outcomes: outcomes, EndDate: endDate, Tags: raw.Tags,
 		GameStartTime: parseGammaTime(raw.GameStartTime), PriceChange24h: raw.OneDayPriceChange,
 		Liquidity: liquidity, Volume: volume, Active: raw.Active,
-		Closed: raw.Closed, ResolutionStatus: raw.UmaResolutionStatus,
+		Closed: raw.Closed, ResolutionStatus: resolutionStatus,
+		Version: strings.ToLower(strings.TrimSpace(raw.Version)), AcceptingOrders: raw.AcceptingOrders,
 	}, nil
+}
+
+// gammaOutcomeIDs resolves the trading identifier Gamma publishes for each
+// outcome. Polymarket Protocol V2 markets trade position IDs and set
+// clobTokenIds to null, while CTF markets publish a JSON-encoded clobTokenIds.
+// Version decides which field to read because a market can carry both; treating
+// presence as the selector would mix a V2 position ID with a CTF token ID.
+func gammaOutcomeIDs(raw gammaMarket) ([]string, error) {
+	version := strings.ToLower(strings.TrimSpace(raw.Version))
+	switch version {
+	case "v2":
+		return decodeOutcomeIDs(raw.PositionIDs, "positionIds")
+	case "v1":
+		return decodeOutcomeIDs(raw.ClobTokenIDs, "clobTokenIds")
+	case "":
+		// Older mirrors do not send version. Keep working with whichever field
+		// they populated, preferring the CTF field.
+		ids, err := decodeOutcomeIDs(raw.ClobTokenIDs, "clobTokenIds")
+		if err != nil || len(ids) > 0 {
+			return ids, err
+		}
+		return decodeOutcomeIDs(raw.PositionIDs, "positionIds")
+	default:
+		return nil, fmt.Errorf("市场 %s 的协议版本 %q 不受支持", raw.ID, raw.Version)
+	}
+}
+
+func decodeOutcomeIDs(raw json.RawMessage, field string) ([]string, error) {
+	var ids []string
+	if err := decodeStringArray(raw, &ids); err != nil {
+		return nil, fmt.Errorf("解析 %s: %w", field, err)
+	}
+	return ids, nil
 }
 
 func parseGammaTime(raw string) *time.Time {

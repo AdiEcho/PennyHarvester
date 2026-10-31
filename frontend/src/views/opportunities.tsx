@@ -92,12 +92,28 @@ function RealYield({ state, onQuote }: { state?: QuoteState; onQuote: () => void
   )
 }
 
+// ProtocolBadge marks Polymarket Protocol V2 markets. They quote themselves
+// through positionIds and settle on ExchangeV3, which the live executor cannot
+// sign for yet, so a live order is refused with an explicit reason while paper
+// accounts still rehearse on them.
+function ProtocolBadge({ item }: { item: Opportunity }) {
+  if (item.version !== 'v2') return null
+  return (
+    <Badge
+      variant="danger"
+      title="Polymarket Protocol V2 市场（positionId + ExchangeV3）：模拟账户可正常演练，实盘下单会被明确拒绝"
+    >
+      协议 V2 · 实盘不支持
+    </Badge>
+  )
+}
+
 function OpportunityCard({ item, onBuy, onQuote, quote, orderSize, isLive, language }: { item: Opportunity; onBuy: (item: Opportunity) => void; onQuote: () => void; quote?: QuoteState; orderSize: number | null; isLive: boolean; language: MarketLanguage }) {
   return (
     <Card className="p-4">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          <div className="mb-2 flex flex-wrap items-center gap-1.5"><Badge variant="info">{marketOutcome(item, language)}</Badge><Badge variant="default">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
+          <div className="mb-2 flex flex-wrap items-center gap-1.5"><Badge variant="info">{marketOutcome(item, language)}</Badge><Badge variant="default">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
           <h3 className="text-sm font-medium leading-6 text-slate-900">{marketQuestion(item, language)}</h3>
         </div>
         <MarketLink url={marketURL(item.url, language)} compact />
@@ -321,7 +337,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
                 <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>
                   {filtered.map((item) => (
                     <tr key={`${item.market_id}-${item.token_id}`} className="group hover:bg-slate-50/70">
-                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex flex-wrap items-center gap-1.5"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><Badge variant="default" className="px-2 py-0.5 text-[11px]">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" className="px-2 py-0.5 text-[11px]" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
+                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex flex-wrap items-center gap-1.5"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><Badge variant="default" className="px-2 py-0.5 text-[11px]">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" className="px-2 py-0.5 text-[11px]" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
                       <td className="px-4 py-4 text-right"><div className="font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</div>{item.price_change_24h != null && <p className={cn('mt-1 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}</td>
                       <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
                       <td className="px-4 py-4 text-right"><RealYield state={quotes[item.token_id]} onQuote={() => fetchQuote(item)} /></td>
@@ -348,7 +364,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
             </div>
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
               <p className="pr-4 text-sm font-medium leading-6 text-slate-900">{marketQuestion(selected, marketLanguage)}</p>
-              <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><Badge variant="default">{categoryLabel(selected.category)}</Badge>{selected.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
+              <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><Badge variant="default">{categoryLabel(selected.category)}</Badge>{selected.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={selected} /><span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
             </div>
             {selected.sports_game && <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">体育赛事盘口：</span>可能包含加时、延长赛或点球决胜，临近结算时价格波动明显。请确认你已理解该风险。</span></div>}
             <div>
@@ -378,7 +394,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} className="mt-0.5 h-4 w-4 rounded border-slate-300 accent-emerald-600 dark:accent-emerald-500" />
               <span className="text-xs leading-5 text-slate-600">{isLive ? <><span className="font-medium text-rose-800">我确认这是真实资金实盘买入。</span> 我理解订单会立即提交到 Polymarket，且高价结果失败时可能损失大部分本金。</> : <><span className="font-medium text-slate-800">我确认这是模拟买入。</span> 仅使用虚拟资金；当前价格不保证最终结算。</>}</span>
             </label>
-            {!liveReady && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">{account?.live_configured ? '实盘凭据未就绪。' : '实盘凭据未配置。'}</span> {account?.live_configured ? (account.live_error || '请检查 Funder、CLOB 凭据与 USDC 授权。') : '可在「系统设置 → 实盘交易凭据」中填写私钥，或设置 POLYMARKET_PRIVATE_KEY 后重启服务。'}</span></div>}
+            {!liveReady && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">{account?.live_configured ? '实盘凭据未就绪。' : '实盘凭据未配置。'}</span> {account?.live_configured ? (account.live_error || '请检查 Funder、CLOB 凭据与 pUSD 授权。') : '可在「系统设置 → 实盘交易凭据」中填写私钥，或设置 POLYMARKET_PRIVATE_KEY 后重启服务。'}</span></div>}
             {orderError && <div className="break-words rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><span className="font-medium">订单未提交：</span>{orderError}</div>}
             <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
               <Button variant="secondary" onClick={() => setSelected(null)} disabled={submitting}>取消</Button>

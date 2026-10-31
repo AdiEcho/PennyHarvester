@@ -98,7 +98,7 @@ function Navigation({ view, onNavigate }: { view: View; onNavigate: (view: View)
             <span className="text-xs font-semibold">{isLive ? '实盘交易模式' : '模拟演练模式'}</span>
           </div>
           <p className="mt-2 text-[11px] leading-5 text-slate-400">
-            {isLive ? <>直接连接 Polymarket 真实盘口<br />使用真实 USDC 下单交易</> : <>同步 Polymarket 实时公开行情<br />使用虚拟资金，不会真实下单</>}
+            {isLive ? <>直接连接 Polymarket 真实盘口<br />使用真实 pUSD 下单交易</> : <>同步 Polymarket 实时公开行情<br />使用虚拟资金，不会真实下单</>}
           </p>
           <div className="mt-3 flex items-center gap-1.5 text-[10px] text-slate-500">
             {isLive ? <ShieldAlert className="h-3.5 w-3.5" /> : <ShieldCheck className="h-3.5 w-3.5" />}
@@ -203,7 +203,7 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
               <div>
                 <p className="font-semibold">{account.live_configured ? '实盘账户还差一步即可就绪' : '实盘账户尚未配置钱包私钥'}</p>
                 <p className="mt-1 text-xs leading-5 text-rose-700">
-                  {account.live_configured ? <>{account.live_error || '请检查代理钱包地址（POLYMARKET_FUNDER）、API 凭据以及 Polymarket 上的 USDC 授权状态。'}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code> 后重启服务。你也可以先在右上角切换到「模拟账户」体验策略。</>}
+                  {account.live_configured ? <>{account.live_error || '请检查代理钱包地址（POLYMARKET_FUNDER）、API 凭据以及 Polymarket 上的 pUSD 授权状态。'}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code> 后重启服务。你也可以先在右上角切换到「模拟账户」体验策略。</>}
                 </p>
               </div>
             </div>

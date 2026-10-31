@@ -512,6 +512,15 @@ type Opportunity struct {
 	SportsGame     bool     `json:"sports_game"`
 	OvertimeRisk   bool     `json:"overtime_risk"`
 	PriceChange24h *float64 `json:"price_change_24h,omitempty"`
+	// Version is the market's Polymarket protocol version ("v1" or "v2"). Live
+	// orders are refused for "v2" because those markets settle through
+	// ExchangeV3 with a different signing domain than this build supports.
+	Version string `json:"version,omitempty"`
+}
+
+// IsV2 reports whether the opportunity trades on Polymarket Protocol V2.
+func (o Opportunity) IsV2() bool {
+	return strings.EqualFold(strings.TrimSpace(o.Version), "v2")
 }
 
 // OpportunityQuote is a read-only, executable estimate for one radar row. It
@@ -537,7 +546,7 @@ type OpportunityQuote struct {
 	NetProfit  float64 `json:"net_profit"`
 	NetYield   float64 `json:"net_yield"`
 	GrossYield float64 `json:"gross_yield"`
-	// AvailableNotional is the USDC depth on the ask side at quote time.
+	// AvailableNotional is the pUSD depth on the ask side at quote time.
 	AvailableNotional float64 `json:"available_notional"`
 	FullyFilled       bool    `json:"fully_filled"`
 	// ExceedsMaxPrice marks a fill price the strategy's max_price would reject.
@@ -671,8 +680,9 @@ type LiveFill struct {
 	Status  string
 }
 
-// CashSnapshot is the real USDC collateral balance and allowance of the live
-// wallet. Both values are denominated in USDC.
+// CashSnapshot is the real pUSD collateral balance and allowance of the live
+// wallet. Both values are denominated in pUSD, the collateral token Polymarket
+// has used since the CLOB V2 cutover (it replaced USDC.e).
 type CashSnapshot struct {
 	Amount    float64
 	Allowance float64
@@ -754,12 +764,16 @@ func opportunityFor(m market.Market, outcome market.Outcome, now time.Time) Oppo
 		Slug: m.Slug, Outcome: outcome.Name, TokenID: outcome.TokenID, Price: outcome.Price,
 		Liquidity: m.Liquidity, Volume: m.Volume, EndDate: m.EndDate, DaysToEnd: days,
 		GrossYield: grossYield, URL: m.URL(), PriceChange24h: m.PriceChange24h,
+		Version: m.Version,
 	}
 }
 
 func findOpportunity(m market.Market, outcomeName, tokenID string, settings Settings, now time.Time) (Opportunity, error) {
 	if !m.Active || m.Closed || m.EndDate.IsZero() || !m.EndDate.After(now) || m.EndDate.After(now.AddDate(0, 0, settings.MaxDays)) {
 		return Opportunity{}, fmt.Errorf("%w: 市场未开放或不在到期范围内", ErrInvalidOrder)
+	}
+	if !m.TradeReady() {
+		return Opportunity{}, fmt.Errorf("%w: 市场已暂停接受订单（acceptingOrders=false）", ErrInvalidOrder)
 	}
 	if len(m.Outcomes) != 2 || m.Liquidity < settings.MinLiquidity {
 		return Opportunity{}, fmt.Errorf("%w: 非二元市场或流动性不足", ErrInvalidOrder)

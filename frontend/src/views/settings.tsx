@@ -305,7 +305,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
             {isLive && !account.live_ready && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-rose-200 bg-surface/70 p-3 text-xs leading-5 text-rose-700">
                 <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>{account.live_configured ? <>实盘凭据未就绪：{account.live_error || '请检查 Funder、API 凭据与 USDC 授权。'}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启服务。可先使用模拟账户测试策略。</>}</span>
+                <span>{account.live_configured ? <>实盘凭据未就绪：{account.live_error || '请检查 Funder、API 凭据与 pUSD 授权。'}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启服务。可先使用模拟账户测试策略。</>}</span>
               </div>
             )}
             {isLive && account.live_error && <p className="mt-2 break-words text-xs leading-5 text-rose-600">实盘错误：{account.live_error}</p>}
@@ -321,7 +321,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
 
         <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs leading-5 text-slate-500">
           <Info className="mr-1 inline h-3.5 w-3.5 align-[-2px]" />
-          实盘账户使用「系统设置」或服务端环境变量中的钱包和 CLOB 凭据，下单前需在 Polymarket 完成 USDC 授权；模拟账户只写本地数据库。实盘账户不可删除，每个实例只允许一个实盘账户。
+          实盘账户使用「系统设置」或服务端环境变量中的钱包和 CLOB 凭据，下单前需在 Polymarket 完成 pUSD 授权；模拟账户只写本地数据库。实盘账户不可删除，每个实例只允许一个实盘账户。
         </div>
       </CardContent>
 

@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"math"
 	"net/http"
@@ -196,7 +197,7 @@ func TestLookupOrderAddsFee(t *testing.T) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/data/order/"):
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.98","avg_price":"0.98"}`))
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.98"}`))
 		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
@@ -230,6 +231,149 @@ func TestLookupOrderAddsFee(t *testing.T) {
 	fee, err := executor.EstimateBuyFee(context.Background(), "condition-1", 98, 0.98)
 	if err != nil || fee <= 0 {
 		t.Fatalf("unexpected estimated fee: %v %v", fee, err)
+	}
+}
+
+// TestLookupOrderUsesRealFillPrices covers the reason /data/trades is read: the
+// order response only carries the FAK limit price, so an order that filled at
+// better prices must be booked at what its matches actually paid.
+func TestLookupOrderUsesRealFillPrices(t *testing.T) {
+	var tradeQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			// The exchange reports the tick-ceiled limit price, not the average.
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.99"}`))
+		case r.URL.Path == "/data/trades":
+			tradeQuery = r.URL.RawQuery
+			if r.Header.Get("POLY_API_KEY") == "" || r.Header.Get("POLY_SIGNATURE") == "" || r.Header.Get("POLY_ADDRESS") == "" {
+				t.Errorf("trades read must be L2 authenticated: %v", r.Header)
+			}
+			_, _ = w.Write([]byte(`{"data":[
+				{"taker_order_id":"order-1","price":"0.98","size":"60","status":"MATCHED"},
+				{"taker_order_id":"order-1","price":"0.985","size":"40","status":"MATCHED"},
+				{"taker_order_id":"other-order","price":"0.5","size":"900","status":"MATCHED"}
+			]}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       server.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if err != nil || !found {
+		t.Fatalf("lookup failed: %v found=%v", err, found)
+	}
+	if !strings.Contains(tradeQuery, "market=condition-1") {
+		t.Fatalf("trades must be scoped to the market: %q", tradeQuery)
+	}
+	// 60 × 0.98 + 40 × 0.985 = 98.2, so the average is 0.982 rather than the
+	// 0.99 limit price the order response reports.
+	if math.Abs(fill.Price-0.982) > 1e-9 || math.Abs(fill.Cost-(98.2+fill.Fee)) > 1e-9 {
+		t.Fatalf("reconciliation must use the real fills: %+v", fill)
+	}
+}
+
+// TestCollateralReadsAllowanceMap covers the response contract change: a wallet
+// holds one approval per exchange, so GET /balance-allowance answers with an
+// `allowances` map and no scalar `allowance`. Reading the scalar alone reports
+// zero and silently disables the pre-trade allowance guard.
+func TestCollateralReadsAllowanceMap(t *testing.T) {
+	var sawAuth bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/balance-allowance" {
+			http.NotFound(w, r)
+			return
+		}
+		sawAuth = r.Header.Get("POLY_API_KEY") == "test-key" &&
+			r.Header.Get("POLY_SIGNATURE") != "" &&
+			r.Header.Get("POLY_ADDRESS") != "" &&
+			r.Header.Get("POLY_PASSPHRASE") == "test-passphrase"
+		if got := r.URL.Query().Get("asset_type"); got != "COLLATERAL" {
+			t.Errorf("asset_type = %q, want COLLATERAL", got)
+		}
+		if got := r.URL.Query().Get("signature_type"); got != "1" {
+			t.Errorf("signature_type = %q, want the wallet mode", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"balance":"12345678",
+			"allowances":{"0x1111111111111111111111111111111111111111":"1000000","0x2222222222222222222222222222222222222222":"9000000"}
+		}`))
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 1,
+		Funder:        "0x0000000000000000000000000000000000000002",
+		CLOBURL:       server.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	snapshot, err := executor.Collateral(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawAuth {
+		t.Fatal("the balance read must carry L2 authentication headers")
+	}
+	if math.Abs(snapshot.Amount-12.345678) > 1e-9 {
+		t.Fatalf("balance = %v, want 12.345678", snapshot.Amount)
+	}
+	if math.Abs(snapshot.Allowance-9) > 1e-9 {
+		t.Fatalf("allowance = %v, want the largest approval (9)", snapshot.Allowance)
+	}
+}
+
+// TestCollateralFallsBackWhenL2ReadFails keeps a rejected direct read from
+// breaking the balance: the client path still answers with what it can decode.
+func TestCollateralFallsBackWhenL2ReadFails(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/balance-allowance" {
+			requests++
+			w.Header().Set("Content-Type", "application/json")
+			if requests == 1 {
+				// The direct L2 read is the first caller; reject it so the client
+				// fallback has to answer.
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"invalid signature"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"balance":"5000000","allowance":"5000000"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       server.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	snapshot, err := executor.Collateral(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(snapshot.Amount-5) > 1e-9 || math.Abs(snapshot.Allowance-5) > 1e-9 {
+		t.Fatalf("fallback lost the balance: %+v", snapshot)
 	}
 }
 
@@ -499,5 +643,81 @@ func TestProbeRelayerChecksKeyOwnerAndSigner(t *testing.T) {
 	})
 	if _, err := executor.ProbeRelayer(context.Background(), engine.LiveSettings{}, "", otherKey, signer); err == nil || !strings.Contains(err.Error(), "不包含") {
 		t.Fatalf("an unknown key must be reported: %v", err)
+	}
+}
+
+// TestL2SignatureMatchesCLOBScheme pins the HMAC construction: a wrong variant
+// would still compile and only surface as a 401 from the exchange.
+func TestL2SignatureMatchesCLOBScheme(t *testing.T) {
+	signature, err := l2Signature(base64.URLEncoding.EncodeToString([]byte("test-secret")), 1700000000, http.MethodGet, "/balance-allowance", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// base64url(HMAC-SHA256("test-secret", "1700000000GET/balance-allowance")),
+	// cross-checked against an independent implementation.
+	if signature != "7sNNKh8J45Qt3mybPDV2Wal05yNQuc0jn4exnFlxjm8=" {
+		t.Fatalf("signature = %q", signature)
+	}
+	if _, err := l2Signature("not-base64!", 1, http.MethodGet, "/x", nil); err == nil {
+		t.Fatal("a malformed secret must fail loudly")
+	}
+}
+
+func TestCollateralUnitsAcceptsNumberAndStringForm(t *testing.T) {
+	// The CLOB spec shows quoted fixed-point values, but the response has also
+	// carried bare JSON numbers; both must decode.
+	for _, raw := range []string{
+		`{"balance":"12345678","allowances":{"0x1":"9000000"}}`,
+		`{"balance":12345678,"allowances":{"0x1":9000000}}`,
+	} {
+		var response struct {
+			Balance    json.Number            `json:"balance"`
+			Allowances map[string]json.Number `json:"allowances"`
+		}
+		if err := json.Unmarshal([]byte(raw), &response); err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		balance, err := collateralUnits(response.Balance)
+		if err != nil || math.Abs(balance-12.345678) > 1e-9 {
+			t.Fatalf("%s: balance = %v, err = %v", raw, balance, err)
+		}
+		allowance, err := maxAllowance(response.Allowances)
+		if err != nil || math.Abs(allowance-9) > 1e-9 {
+			t.Fatalf("%s: allowance = %v, err = %v", raw, allowance, err)
+		}
+	}
+}
+
+// TestTradesForOrderSkipsUnrelatedAndFailedFills keeps a reconciliation from
+// booking another order's fills or a failed match.
+func TestTradesForOrderSkipsUnrelatedAndFailedFills(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/data/trades" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"taker_order_id":"order-1","price":"0.98","size":"10","status":"MATCHED"},
+			{"taker_order_id":"order-1","price":"0.98","size":"10","status":"FAILED"},
+			{"taker_order_id":"order-2","price":"0.98","size":"10","status":"MATCHED"}
+		]}`))
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       server.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	shares, notional, found, err := executor.tradesForOrder(context.Background(), "order-1", "condition-1")
+	if err != nil || !found {
+		t.Fatalf("unexpected read: %v found=%v", err, found)
+	}
+	if math.Abs(shares-10) > 1e-9 || math.Abs(notional-9.8) > 1e-9 {
+		t.Fatalf("shares = %v, notional = %v; failed and unrelated fills must be ignored", shares, notional)
 	}
 }

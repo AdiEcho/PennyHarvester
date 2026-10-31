@@ -157,7 +157,7 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
         icon={Wallet}
         loading={loading}
         detail={metrics ? (isLive
-          ? <span>钱包 USDC <span className="font-medium tabular-nums text-slate-700">{formatCurrency(metrics.wallet_cash)}</span>{metrics.wallet_cash_stale && <span className="text-amber-600"> · 暂显上次余额</span>}</span>
+          ? <span>钱包 pUSD <span className="font-medium tabular-nums text-slate-700">{formatCurrency(metrics.wallet_cash)}</span>{metrics.wallet_cash_stale && <span className="text-amber-600"> · 暂显上次余额</span>}</span>
           : `初始本金 ${formatCurrency(metrics.initial_bankroll)}`) : '正在加载账户数据'}
       />
       <StatCard

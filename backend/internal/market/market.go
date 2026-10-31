@@ -32,6 +32,27 @@ type Market struct {
 	Active           bool       `json:"active"`
 	Closed           bool       `json:"closed"`
 	ResolutionStatus string     `json:"resolution_status"`
+	// Version is Polymarket's market protocol: "v1" for CTF markets, "v2" for
+	// Polymarket Protocol V2 markets, whose outcome identifiers are position IDs
+	// settled through ExchangeV3. Empty means the upstream did not report it.
+	Version string `json:"version,omitempty"`
+	// AcceptingOrders mirrors Gamma's acceptingOrders. Nil means "not reported",
+	// so providers and tests that cannot supply it are never treated as paused.
+	AcceptingOrders *bool `json:"accepting_orders,omitempty"`
+}
+
+// IsV2 reports whether the market trades on Polymarket Protocol V2. Those
+// markets use position IDs, the ExchangeV3 signing domain and pUSD approvals,
+// which this build cannot sign for yet, so live orders must refuse them.
+func (m Market) IsV2() bool {
+	return strings.EqualFold(strings.TrimSpace(m.Version), "v2")
+}
+
+// TradeReady reports whether Gamma says the order book accepts new orders. A
+// market can stay active and unclosed while its book is paused, so trading
+// gates must consult this in addition to Active and Closed.
+func (m Market) TradeReady() bool {
+	return m.AcceptingOrders == nil || *m.AcceptingOrders
 }
 
 func (m Market) URL() string {

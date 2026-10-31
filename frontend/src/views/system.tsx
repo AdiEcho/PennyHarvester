@@ -422,7 +422,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
               <ShieldCheck className="h-4 w-4 text-slate-500" />Polymarket 代理钱包
               {mode === 'proxy' && <CheckCircle2 className="ml-auto h-4 w-4 text-emerald-500" />}
             </span>
-            <span className="mt-1 block text-xs leading-5 text-slate-500">私钥只负责签名，USDC 与持仓在 Funder（Proxy / Safe / Deposit）地址。下单仍由私钥签名后提交 CLOB。</span>
+            <span className="mt-1 block text-xs leading-5 text-slate-500">私钥只负责签名，pUSD 与持仓在 Funder（Proxy / Safe / Deposit）地址。下单仍由私钥签名后提交 CLOB。</span>
           </button>
         </div>
         <p className="mt-2 text-xs leading-5 text-slate-400">邮箱 / Magic 登录的账号私钥由 Polymarket 托管、无法导出，不能直接用于本系统实盘；请改用可导出私钥的钱包（步骤见 README「邮箱登录账号如何实盘」）。</p>
@@ -476,7 +476,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
         {mode === 'proxy' ? (
           <div className="lg:col-span-3">
             <label htmlFor="live-funder" className="text-sm font-medium text-slate-700">Funder（代理 / Deposit 钱包地址）</label>
-            <p className="mt-1 text-xs leading-4 text-slate-400">Polymarket 账户里显示的钱包地址，也是 USDC 与持仓所在地址。必须填写，且不能等于上面的私钥地址。</p>
+            <p className="mt-1 text-xs leading-4 text-slate-400">Polymarket 账户里显示的钱包地址，也是 pUSD 与持仓所在地址。必须填写，且不能等于上面的私钥地址。</p>
             <div className="mt-2 flex gap-2">
               <Input
                 id="live-funder"
@@ -638,7 +638,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
               <p className="break-all font-mono">Maker {probe.maker}</p>
               {probe.mode === 'proxy' && <p>代理钱包模式下 Maker 应等于你填写的 Funder；若不等，说明代理钱包类型或 Funder 填错。</p>}
               <p>API Key {probe.api_key || '—'} · 抵押余额 {formatCurrency(probe.cash ?? 0)} · 授权额度 {formatCurrency(probe.allowance ?? 0)}</p>
-              {(probe.cash ?? 0) <= 0 && <p className="text-amber-700">抵押余额为 0：请确认 Funder 是该账户真实钱包地址，或该钱包尚未存入 USDC（余额不足时下单会被拒绝）。</p>}
+              {(probe.cash ?? 0) <= 0 && <p className="text-amber-700">抵押余额为 0：请确认 Funder 是该账户真实钱包地址，或该钱包尚未存入 pUSD（余额不足时下单会被拒绝）。</p>}
             </div>
           ) : (
             <div className="space-y-1">

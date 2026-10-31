@@ -686,6 +686,50 @@ func TestLiveOrderRecordsExchangeFill(t *testing.T) {
 	}
 }
 
+// TestLiveOrderRefusesProtocolV2Market guards the Protocol V2 boundary: those
+// markets settle through ExchangeV3 with signing domain version "3" and pUSD
+// approvals, so signing one with the CTFExchangeV2 domain would be rejected by
+// the exchange after the order had already been submitted.
+func TestLiveOrderRefusesProtocolV2Market(t *testing.T) {
+	item := binary("v2", 0.98, 20000, 2)
+	item.Version = "v2"
+	provider := &fakeProvider{markets: map[string]market.Market{"v2": item}}
+	executor := &fakeLive{
+		balance: 1000,
+		fill:    engine.LiveFill{OrderID: "must-not-submit", Shares: 1, Cost: 1, Price: 0.98},
+	}
+	instance, _ := newTestEngine(t, provider, executor)
+	liveAccount := accountByMode(t, instance, engine.AccountModeLive)
+	_, err := instance.PlaceOrder(context.Background(), liveAccount.ID, engine.OrderRequest{
+		MarketID: "v2", Outcome: "Yes", TokenID: "v2-yes", Amount: 100,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Protocol V2") {
+		t.Fatalf("a Protocol V2 market must be refused before signing: %v", err)
+	}
+	orders, orderErr := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0)
+	if orderErr != nil || orders.Total != 1 || orders.Items[0].Status != "rejected" {
+		t.Fatalf("the refusal must be recorded as a rejected order: %+v, %v", orders, orderErr)
+	}
+}
+
+// TestOrderRefusesPausedOrderBook covers acceptingOrders: a market can stay
+// active and unclosed while its book is paused, and only the acceptingOrders
+// flag says so.
+func TestOrderRefusesPausedOrderBook(t *testing.T) {
+	item := binary("paused", 0.98, 20000, 2)
+	paused := false
+	item.AcceptingOrders = &paused
+	provider := &fakeProvider{markets: map[string]market.Market{"paused": item}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	_, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{
+		MarketID: "paused", Outcome: "Yes", TokenID: "paused-yes", Amount: 100,
+	})
+	if err == nil || !strings.Contains(err.Error(), "暂停") {
+		t.Fatalf("a paused order book must be refused: %v", err)
+	}
+}
+
 func TestPaperBaselineIsStableWhenDefaultChanges(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
 	instance, _ := newTestEngine(t, provider, nil)

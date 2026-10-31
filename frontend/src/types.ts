@@ -99,6 +99,8 @@ export interface Opportunity {
   sports_game: boolean
   overtime_risk: boolean
   price_change_24h?: number | null
+  /** Polymarket 协议版本：v2 市场走 positionId + ExchangeV3，实盘暂不支持 */
+  version?: string | null
 }
 
 export interface OpportunitiesResponse {

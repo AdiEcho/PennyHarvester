@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -13,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	clobclient "github.com/Cyvadra/polymarket-clob-client"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 
@@ -29,9 +27,9 @@ import (
 //	2 Safe           legacy 1-of-1 Gnosis Safe
 //	3 Deposit Wallet ERC-1271 wallet (default for accounts created after 2026-05)
 //
-// The CLOB used to answer GET /auth/get-proxy-wallets, but the public
-// deployment now returns 404 for that path (verified 2026-10-31), so discovery
-// relies on two independent sources instead:
+// The CLOB's GET /auth/get-proxy-wallets is retired: the public deployment
+// answers 404 and the path is gone from the CLOB spec, so discovery relies on
+// two independent sources instead:
 //
 //  1. Polymarket's public profile service (Gamma /public-profile), which maps an
 //     owner EOA to the account wallet. No key, signature or RPC needed.
@@ -158,7 +156,6 @@ type walletSource string
 const (
 	sourceProfile    walletSource = "polymarket-profile"
 	sourceDerivation walletSource = "create2-derivation"
-	sourceCLOB       walletSource = "clob-proxy-wallets"
 )
 
 // walletCandidate is an address that belongs to the signer, in discovery order.
@@ -383,17 +380,7 @@ func (e *Executor) DiscoverWallet(ctx context.Context, settings engine.LiveSetti
 		addCandidate(common.HexToAddress(wallet), sourceProfile)
 	}
 
-	// 2) Legacy CLOB endpoint. It is retired on the public deployment, so a
-	// failure here is a note, never a hard error.
-	if clobWallet, err := e.legacyProxyWallets(ctx, cfg); err != nil {
-		result.Notes = append(result.Notes, "CLOB 关联钱包接口不可用（已下线："+strings.TrimSpace(err.Error())+"），已改用 Polymarket 公开资料与链上校验。")
-	} else {
-		for _, wallet := range clobWallet {
-			addCandidate(common.HexToAddress(wallet), sourceCLOB)
-		}
-	}
-
-	// 3) CREATE2 derivation of the deterministic wallets, verified on-chain.
+	// 2) CREATE2 derivation of the deterministic wallets, verified on-chain.
 	// Order matters: the deposit wallet is the current account type, so it wins
 	// over a legacy Proxy/Safe that may still be deployed for a migrated account.
 	rpc := newRPCClient(cfg)
@@ -515,45 +502,6 @@ func walletTypeNameForCandidate(signatureType int) string {
 		return "未识别"
 	}
 	return walletTypeName(signatureType)
-}
-
-// legacyProxyWallets calls the retired CLOB discovery endpoint. It stays as a
-// best-effort source because a self-hosted CLOB build may still expose it.
-func (e *Executor) legacyProxyWallets(ctx context.Context, cfg Config) ([]string, error) {
-	client, err := newClobClient(cfg, nil)
-	if err != nil {
-		return nil, fmt.Errorf("初始化 Polymarket CLOB 客户端: %w", err)
-	}
-	wallets, err := client.ProxyWallets(ctx)
-	if err != nil {
-		return nil, simplifyProxyWalletError(err)
-	}
-
-	out := make([]string, 0, len(wallets))
-	for _, wallet := range wallets {
-		wallet = normalizeKeyPrefix(strings.TrimSpace(wallet))
-		if common.IsHexAddress(wallet) {
-			out = append(out, wallet)
-		}
-	}
-	return out, nil
-}
-
-// simplifyProxyWalletError keeps the HTTP status visible without wrapping the
-// whole SDK error chain, which is long and not actionable for the operator.
-func simplifyProxyWalletError(err error) error {
-	if err == nil {
-		return nil
-	}
-	var apiError *clobclient.APIError
-	if errors.As(err, &apiError) {
-		return fmt.Errorf("HTTP %d for %s %s", apiError.StatusCode, apiError.Method, apiError.Path)
-	}
-	message := strings.TrimSpace(err.Error())
-	if len(message) > 200 {
-		message = message[:200] + "…"
-	}
-	return errors.New(message)
 }
 
 // resolveSigner merges only the signer fields so wallet discovery is not

@@ -4,6 +4,7 @@ package live
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -737,6 +738,9 @@ func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amoun
 }
 
 // LookupOrder reconciles an order by its signed digest / exchange order ID.
+// The exchange reports the order's limit price, not its average execution
+// price, so the real fills are read from /data/trades and charged at what they
+// actually paid.
 func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string) (engine.LiveFill, bool, error) {
 	if orderID == "" {
 		return engine.LiveFill{}, false, nil
@@ -763,6 +767,14 @@ func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string)
 	if fill.OrderID == "" {
 		fill.OrderID = orderID
 	}
+	// Replace the limit-price estimate with the real average execution price
+	// whenever the fills are available. A trade read failure must not lose the
+	// reconciled order: the limit price stays as a conservative fallback.
+	if shares, notional, found, tradeErr := e.tradesForOrder(ctx, orderID, conditionID); tradeErr == nil && found && shares > 0 {
+		fill.Shares = shares
+		fill.Cost = notional
+		fill.Price = notional / shares
+	}
 	if conditionID != "" {
 		schedule, scheduleErr := client.FeeSchedule(ctx, conditionID)
 		if scheduleErr != nil {
@@ -778,6 +790,11 @@ func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string)
 // maxFeeRate bounds the taker rate the exchange is allowed to report. The
 // documented categories top out at 0.07; anything higher means the schedule is
 // being read wrong, and silently booking a smaller fee would overstate PnL.
+//
+// The schedule must come from /clob-markets/{condition_id} (the `fd` object),
+// never from the legacy /fee-rate route: that route still answers with the old
+// base fee in basis points (1000 = 10% on a fee-free market), which is not the
+// rate the exchange charges at match time.
 const maxFeeRate = 0.10
 
 // feeRate validates and parses a schedule's rate. An empty rate means the
@@ -857,7 +874,7 @@ func feeFromLevels(schedule clobclient.FeeSchedule, levels []fillLevel) (float64
 
 // applyFee books the taker fee on top of the fill cost. Polymarket documents a
 // market BUY's amount as the pre-fee notional with the taker fee charged on
-// top in USDC (docs.polymarket.com/trading/fees), so the shares bought are left
+// top in pUSD (docs.polymarket.com/trading/fees), so the shares bought are left
 // untouched and the fee is added to Cost. Price stays the execution price; the
 // fee is carried separately so paper and live entry prices are comparable.
 //
@@ -909,22 +926,11 @@ func (e *Executor) Collateral(ctx context.Context) (engine.CashSnapshot, error) 
 	if err != nil {
 		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, err
 	}
-	balance, err := client.BalanceAllowance(ctx, "COLLATERAL", "")
+	balanceUnits, allowanceUnits, err := e.collateralBalance(ctx, client)
 	if err != nil {
-		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("读取实盘 USDC 余额: %w", err)
+		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("读取实盘 pUSD 余额: %w", err)
 	}
-	units, err := strconv.ParseFloat(strings.TrimSpace(balance.Balance), 64)
-	if err != nil {
-		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("解析实盘 USDC 余额 %q: %w", balance.Balance, err)
-	}
-	allowanceUnits := 0.0
-	if raw := strings.TrimSpace(balance.Allowance); raw != "" {
-		allowanceUnits, err = strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("解析实盘 USDC 授权额度 %q: %w", balance.Allowance, err)
-		}
-	}
-	snapshot := engine.CashSnapshot{Amount: units / 1_000_000, Allowance: allowanceUnits / 1_000_000, At: time.Now().UTC()}
+	snapshot := engine.CashSnapshot{Amount: balanceUnits, Allowance: allowanceUnits, At: time.Now().UTC()}
 	e.mu.Lock()
 	e.cash = snapshot
 	e.cashAt = snapshot.At
@@ -932,15 +938,99 @@ func (e *Executor) Collateral(ctx context.Context) (engine.CashSnapshot, error) 
 	return snapshot, nil
 }
 
+// collateralBalance reads the wallet's pUSD (COLLATERAL) balance and the
+// approval it granted to the settling exchange.
+//
+// GET /balance-allowance answers with `allowances`, a map of spender address to
+// amount, since a wallet holds one approval per exchange. The legacy scalar
+// `allowance` field is no longer part of the response, and the CLOB client this
+// build uses still decodes only that scalar, so reading it alone yields zero
+// and the pre-trade allowance guard disappears without an error. The map is
+// therefore the source of truth, with the scalar kept for older deployments and
+// a fallback to the client so a rejected direct call never breaks the balance
+// read.
+func (e *Executor) collateralBalance(ctx context.Context, client *clobclient.Client) (float64, float64, error) {
+	var response struct {
+		Balance    json.Number            `json:"balance"`
+		Allowance  json.Number            `json:"allowance"`
+		Allowances map[string]json.Number `json:"allowances"`
+	}
+	query := url.Values{
+		"asset_type":     {"COLLATERAL"},
+		"signature_type": {strconv.Itoa(e.signatureType())},
+	}
+	if err := e.l2Get(ctx, "/balance-allowance", query, &response); err != nil {
+		balance, allowance, sdkErr := e.collateralFromSDK(ctx, client)
+		if sdkErr != nil {
+			return 0, 0, err
+		}
+		return balance, allowance, nil
+	}
+	if strings.TrimSpace(response.Balance.String()) == "" {
+		// A response without a balance must not be booked as zero: zero cash
+		// would silently block every strategy order and misreport the wallet.
+		balance, allowance, sdkErr := e.collateralFromSDK(ctx, client)
+		if sdkErr != nil {
+			return 0, 0, fmt.Errorf("CLOB 未返回 pUSD 余额")
+		}
+		return balance, allowance, nil
+	}
+	balance, err := collateralUnits(response.Balance)
+	if err != nil {
+		return 0, 0, fmt.Errorf("解析 pUSD 余额: %w", err)
+	}
+	allowance, err := maxAllowance(response.Allowances)
+	if err != nil {
+		return 0, 0, fmt.Errorf("解析 pUSD 授权额度: %w", err)
+	}
+	if allowance == 0 {
+		// Older deployments answered with a single scalar instead of the map.
+		if scalar, scalarErr := collateralUnits(response.Allowance); scalarErr == nil {
+			allowance = scalar
+		}
+	}
+	return balance, allowance, nil
+}
+
+// collateralFromSDK is the fallback read through the CLOB client. It can only
+// see the legacy scalar allowance, so it is used when the direct call fails.
+func (e *Executor) collateralFromSDK(ctx context.Context, client *clobclient.Client) (float64, float64, error) {
+	balance, err := client.BalanceAllowance(ctx, "COLLATERAL", "")
+	if err != nil {
+		return 0, 0, err
+	}
+	units, err := strconv.ParseFloat(strings.TrimSpace(balance.Balance), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("解析实盘 pUSD 余额 %q: %w", balance.Balance, err)
+	}
+	allowanceUnits := 0.0
+	if raw := strings.TrimSpace(balance.Allowance); raw != "" {
+		allowanceUnits, err = strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("解析实盘 pUSD 授权额度 %q: %w", balance.Allowance, err)
+		}
+	}
+	return units / 1_000_000, allowanceUnits / 1_000_000, nil
+}
+
+// signatureType reports the wallet mode the L2 read must use so the CLOB
+// answers for the maker (funder) rather than the bare signer.
+func (e *Executor) signatureType() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg.SignatureType
+}
+
+// fillFromOrder turns an exchange order into a fill. The order response carries
+// no average execution price (avg_price is not part of GET /data/order), so this
+// is a limit-price estimate; LookupOrder overrides it with the real trade rows
+// whenever they are available.
 func fillFromOrder(detail *clobclient.Order, limitPrice float64) (engine.LiveFill, bool) {
 	if detail == nil {
 		return engine.LiveFill{}, false
 	}
 	shares := parseAmount(detail.SizeMatched)
-	price := parseAmount(detail.AvgPrice)
-	if price <= 0 {
-		price = parseAmount(detail.Price)
-	}
+	price := parseAmount(detail.Price)
 	if price <= 0 {
 		price = limitPrice
 	}

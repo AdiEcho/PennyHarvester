@@ -845,7 +845,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	strategyCash := account.BaselineEquity + realized - totalExposure
 	snapshot, err := e.live.Collateral(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: 读取实盘 USDC 余额失败: %v", ErrLiveUnavailable, err)
+		return fmt.Errorf("%w: 读取实盘 pUSD 余额失败: %v", ErrLiveUnavailable, err)
 	}
 	cash := math.Min(strategyCash, snapshot.Amount)
 	for _, opportunity := range opportunities {
@@ -853,6 +853,12 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 			continue
 		}
 		if opportunity.ConditionID == "" {
+			continue
+		}
+		if opportunity.IsV2() {
+			// Protocol V2 markets cannot be signed by this build. Skip them
+			// instead of writing a rejected order on every scan; a manual order
+			// still reports the reason explicitly.
 			continue
 		}
 		budget := settings.OrderSize
@@ -1002,6 +1008,15 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
 			"缺少 condition_id，无法加载实盘手续费", "")
 	}
+	if opportunity.IsV2() {
+		// Protocol V2 orders settle through ExchangeV3, which requires a
+		// different EIP-712 domain (version "3"), pUSD/PositionManager approvals
+		// and CONDITIONAL-V2 balances. Signing one with the CTFExchangeV2 domain
+		// would be rejected by the exchange after the order is already on the
+		// wire, so refuse it here with an actionable message instead.
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
+			"该市场属于 Polymarket Protocol V2（positionId + ExchangeV3），当前实盘执行器只支持 CTF（v1）市场；请改用模拟账户或等待 V2 签名支持", "")
+	}
 	settings := e.Settings()
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
 	if err != nil {
@@ -1024,8 +1039,8 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	strategyCash := account.BaselineEquity + realized - totalExposure
 	snapshot, cashErr := e.live.Collateral(ctx)
 	if cashErr != nil {
-		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法读取实盘 USDC 余额："+cashErr.Error(), "")
-		return Position{}, fmt.Errorf("%w: 无法读取实盘 USDC 余额: %v", ErrLiveUnavailable, cashErr)
+		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法读取实盘 pUSD 余额："+cashErr.Error(), "")
+		return Position{}, fmt.Errorf("%w: 无法读取实盘 pUSD 余额: %v", ErrLiveUnavailable, cashErr)
 	}
 	estimatedFee, feeErr := e.live.EstimateBuyFee(ctx, opportunity.ConditionID, amount, opportunity.Price)
 	if feeErr != nil {
@@ -1041,7 +1056,7 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	case totalCost > cash+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘策略资金不足（含预估手续费）", "")
 	case snapshot.Allowance > 0 && totalCost > snapshot.Allowance+1e-9:
-		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘 USDC 授权额度不足，请先在 Polymarket 完成授权", "")
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘 pUSD 授权额度不足，请先在 Polymarket 完成授权", "")
 	case totalExposure+totalCost > settings.MaxExposure+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过总敞口上限（含预估手续费）", "")
 	case marketExposure+totalCost > settings.MaxPosition+1e-9:
