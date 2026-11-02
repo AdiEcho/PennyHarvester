@@ -34,11 +34,11 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { ModeBadge } from '@/components/status-badges'
 
-const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes'] as const
+const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes', 'stop_loss_ratio'] as const
 const selectKeys = ['default_category', 'sports_policy'] as const
 type NumericKey = typeof numericKeys[number]
 type SelectKey = typeof selectKeys[number]
-type Draft = Record<NumericKey, string> & Record<SelectKey, string>
+type Draft = Record<NumericKey, string> & Record<SelectKey, string> & { stop_loss_enabled: boolean }
 type FieldErrors = Partial<Record<NumericKey | SelectKey, string>>
 
 const defaultCategoryOptions = [
@@ -77,6 +77,8 @@ function toDraft(settings: Settings): Draft {
     max_price_change_24h: String(settings.max_price_change_24h),
     entry_window_minutes: String(settings.entry_window_minutes),
     sports_entry_window_minutes: String(settings.sports_entry_window_minutes),
+    stop_loss_ratio: String(settings.stop_loss_ratio),
+    stop_loss_enabled: settings.stop_loss_enabled,
   }
 }
 
@@ -98,6 +100,8 @@ function toSettings(draft: Draft): Settings {
     max_price_change_24h: Number(draft.max_price_change_24h),
     entry_window_minutes: Number(draft.entry_window_minutes),
     sports_entry_window_minutes: Number(draft.sports_entry_window_minutes),
+    stop_loss_ratio: Number(draft.stop_loss_ratio),
+    stop_loss_enabled: draft.stop_loss_enabled,
   }
 }
 
@@ -126,6 +130,7 @@ function validate(settings: Settings): FieldErrors {
   if (settings.max_price_change_24h < 0 || settings.max_price_change_24h > 1) errors.max_price_change_24h = '请输入 0–1 之间的数值（0 表示不限制）。'
   if (!Number.isInteger(settings.entry_window_minutes) || settings.entry_window_minutes < 0 || settings.entry_window_minutes > 1440) errors.entry_window_minutes = '请输入 0–1440 之间的整数分钟数。'
   if (!Number.isInteger(settings.sports_entry_window_minutes) || settings.sports_entry_window_minutes < 0 || settings.sports_entry_window_minutes > 1440) errors.sports_entry_window_minutes = '请输入 0–1440 之间的整数分钟数。'
+  if (settings.stop_loss_ratio <= 0 || settings.stop_loss_ratio >= 1) errors.stop_loss_ratio = '请输入 0–1 之间的小数，例如 0.70。'
   return errors
 }
 
@@ -403,10 +408,15 @@ export function SettingsView() {
 
   useEffect(() => () => saveController.current?.abort(), [])
 
-  const update = (key: keyof Draft, value: string) => {
+  const update = (key: NumericKey | SelectKey, value: string) => {
     setDraft((current) => current ? { ...current, [key]: value } : current)
     setDirty(true)
     setErrors((current) => ({ ...current, [key]: undefined }))
+  }
+
+  const updateStopLoss = (enabled: boolean) => {
+    setDraft((current) => current ? { ...current, stop_loss_enabled: enabled } : current)
+    setDirty(true)
   }
 
   const reset = () => {
@@ -515,6 +525,26 @@ export function SettingsView() {
             <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
               <div className="rounded-xl bg-surface p-2.5 text-slate-500"><Info className="h-5 w-5" /></div>
               <div className="flex-1"><p className="text-sm font-semibold text-slate-800">每个盘口只会自动下单一次</p><p className="mt-1 text-xs leading-5 text-slate-500">自动买入成功后会把该盘口标记为已下单；之后无论持仓是否已结算、盘口是否重新出现，都不会再次自动买入。窗口以市场到期时间为准，实际成交时点还受扫描间隔影响，可能晚于窗口起点最多一个扫描周期。</p></div>
+            </div>
+          </SettingsSection>
+
+          <SettingsSection icon={ShieldAlert} title="止损保护" description="Polymarket 没有交易所原生止损单。开启后，扫描引擎会在每次扫描时检查未平仓头寸的参考价，跌到入场价的止损比例时自动提交市价卖出。">
+            <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-start gap-3">
+                <div className={cn('rounded-xl p-2.5', draft.stop_loss_enabled ? 'bg-amber-50 text-amber-600' : 'bg-surface text-slate-400')}><ShieldAlert className="h-5 w-5" /></div>
+                <div><p className="text-sm font-semibold text-slate-800">自动止损</p><p className="mt-1 text-xs leading-5 text-slate-500">扫描引擎运行时对所有账户的未平仓头寸生效，不要求开启自动交易；自动交易开关只控制新的自动买入。</p></div>
+              </div>
+              <div className="flex items-center gap-3 sm:flex-col sm:items-end">
+                <Switch checked={draft.stop_loss_enabled} onCheckedChange={updateStopLoss} aria-label="开启或关闭自动止损" />
+                <span className="text-xs text-slate-400">{draft.stop_loss_enabled ? '已开启' : '已关闭'}</span>
+              </div>
+            </div>
+            <div className="mt-6 grid gap-x-5 gap-y-6 sm:grid-cols-2">
+              <NumberField id="stop_loss_ratio" label="止损线（入场价比例）" description="默认 0.70；例如 0.70 表示当前参考价跌到平均入场价的 70% 时卖出，不是绝对价格 0.70。" value={draft.stop_loss_ratio} unit="× 入场价" min={0} max={1} step="0.01" error={errors.stop_loss_ratio} onChange={(value) => update('stop_loss_ratio', value)} />
+            </div>
+            <div className="mt-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+              <div className="rounded-xl bg-surface p-2.5 text-amber-600"><Info className="h-5 w-5" /></div>
+              <div className="flex-1"><p className="text-sm font-semibold text-amber-900">止损不是保证成交价</p><p className="mt-1 text-xs leading-5 text-amber-800">止损触发依赖扫描间隔（暂停扫描引擎时不会检查），行情跳空或盘口深度不足时可能卖不出去，或成交价明显低于止损线。实盘卖单使用 FOK 立即成交或全部取消，未成交时会在下一次扫描重试。请先用模拟账户验证。</p></div>
             </div>
           </SettingsSection>
 

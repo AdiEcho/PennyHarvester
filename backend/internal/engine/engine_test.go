@@ -73,6 +73,8 @@ type fakeLive struct {
 	allowance float64
 	fee       float64
 	fill      engine.LiveFill
+	sellFill  engine.LiveFill
+	sellErr   error
 	quote     engine.LiveQuote
 	quoteErr  error
 	err       error
@@ -97,6 +99,22 @@ func (f *fakeLive) Buy(_ context.Context, _, _ string, _, _ float64, onSigned fu
 		}
 	}
 	return f.fill, f.err
+}
+func (f *fakeLive) Sell(_ context.Context, _, _ string, shares float64, onSigned func(string) error) (engine.LiveFill, error) {
+	orderID := f.sellFill.OrderID
+	if orderID == "" {
+		orderID = "fake-sell"
+	}
+	if onSigned != nil {
+		if err := onSigned(orderID); err != nil {
+			return engine.LiveFill{}, err
+		}
+	}
+	fill := f.sellFill
+	if fill.Shares == 0 && f.sellErr == nil {
+		fill.Shares = shares
+	}
+	return fill, f.sellErr
 }
 func (f *fakeLive) LookupOrder(_ context.Context, orderID, _ string) (engine.LiveFill, bool, error) {
 	fill, ok := f.lookup[orderID]
@@ -432,6 +450,9 @@ func TestSettingsValidateCategoryAndVolatility(t *testing.T) {
 	if settings.DefaultCategory != engine.RadarCategoryNonSports || settings.SportsPolicy != engine.SportsPolicyExcludeGames {
 		t.Fatalf("unexpected radar defaults: %+v", settings)
 	}
+	if settings.StopLossEnabled || settings.StopLossRatio != 0.70 {
+		t.Fatalf("stop-loss must default to disabled with a 70%% trigger: %+v", settings)
+	}
 	if err := settings.Validate(); err != nil {
 		t.Fatalf("default settings must be valid: %v", err)
 	}
@@ -448,6 +469,11 @@ func TestSettingsValidateCategoryAndVolatility(t *testing.T) {
 	settings.MaxPriceChange24h = 1.5
 	if err := settings.Validate(); err == nil {
 		t.Fatal("out-of-range volatility limit must be rejected")
+	}
+	settings = engine.DefaultSettings()
+	settings.StopLossRatio = 1.2
+	if err := settings.Validate(); err == nil {
+		t.Fatal("an out-of-range stop-loss ratio must be rejected")
 	}
 }
 
@@ -480,6 +506,205 @@ func TestScanAddsPolymarketChineseText(t *testing.T) {
 	}
 	if item.EventTitleZH != zh.EventTitle || item.GroupItemTitle != zh.GroupItemTitle {
 		t.Fatalf("missing localized context: %+v", item)
+	}
+}
+
+func TestPaperStopLossClosesPositionAtRatio(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	// Stop-loss must work without enabling automatic entries: this position is
+	// opened manually and the account keeps auto-trade disabled.
+	position, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+		MarketID: "one", Outcome: "Yes", TokenID: "one-yes", Amount: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A price fall below 80% of entry with the stop disabled must leave the
+	// position untouched.
+	drop := provider.markets["one"]
+	drop.Outcomes[0].Price = 0.75
+	drop.Outcomes[1].Price = 0.25
+	provider.markets["one"] = drop
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	open, err := instance.Positions(ctx, paper.ID, "open")
+	if err != nil || open.Total != 1 {
+		t.Fatalf("stop disabled must keep the position open: %+v err=%v", open, err)
+	}
+
+	settings := instance.Settings()
+	settings.StopLossEnabled = true
+	settings.StopLossRatio = 0.80
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sold, err := instance.Positions(ctx, paper.ID, "sold")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sold.Total != 1 {
+		t.Fatalf("stop-loss did not close the position: %+v", sold.Items)
+	}
+	closed := sold.Items[0]
+	if closed.ID != position.ID || closed.Status != "lost" || closed.ExitKind != "stop" || closed.RealizedPNL >= 0 {
+		t.Fatalf("unexpected stopped position: %+v", closed)
+	}
+	trigger := position.EntryPrice * settings.StopLossRatio
+	if closed.CurrentPrice > trigger || closed.CurrentPrice <= 0 {
+		t.Fatalf("exit price %.4f is not below trigger %.4f", closed.CurrentPrice, trigger)
+	}
+	wantGross := closed.CurrentPrice * closed.Shares
+	wantFee := wantGross * settings.FeeBPS / 10000
+	if math.Abs(closed.RealizedPNL-(wantGross-wantFee-position.Cost)) > 1e-6 {
+		t.Fatalf("realized pnl does not net the sell fee: %+v", closed)
+	}
+	if math.Abs(closed.Fee-(position.Fee+wantFee)) > 1e-9 {
+		t.Fatalf("position fee must include the sell fee: got %v want %v", closed.Fee, position.Fee+wantFee)
+	}
+
+	orders, err := instance.Orders(ctx, paper.ID, "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sellOrder *engine.Order
+	for i := range orders.Items {
+		if orders.Items[i].Action == "stop" {
+			sellOrder = &orders.Items[i]
+		}
+	}
+	if sellOrder == nil || sellOrder.Type != "settle" || sellOrder.Status != "filled" || sellOrder.Shares != closed.Shares {
+		t.Fatalf("stop-loss order was not recorded: %+v", orders.Items)
+	}
+	dashboard, err := instance.Dashboard(ctx, paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.Metrics.OpenPositions != 0 || dashboard.Metrics.StoppedPositions != 1 ||
+		dashboard.Metrics.WinRate != 0 || dashboard.Metrics.RealizedPNL >= 0 {
+		t.Fatalf("unexpected metrics after stop-loss: %+v", dashboard.Metrics)
+	}
+}
+
+func TestLiveStopLossSellsThroughExecutor(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	live := &fakeLive{
+		balance: 10000, allowance: 10000,
+		fill:     engine.LiveFill{Shares: 100, Cost: 98.3, Price: 0.983, Fee: 0.1, Status: "matched"},
+		sellFill: engine.LiveFill{Shares: 100, Cost: 74.9, Price: 0.75, Fee: 0.1, Status: "matched"},
+	}
+	instance, _ := newTestEngine(t, provider, live)
+	account := accountByMode(t, instance, engine.AccountModeLive)
+	position, err := instance.PlaceOrder(ctx, account.ID, engine.OrderRequest{
+		MarketID: "one", Outcome: "Yes", TokenID: "one-yes", Amount: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drop := provider.markets["one"]
+	drop.Outcomes[0].Price = 0.75
+	drop.Outcomes[1].Price = 0.25
+	provider.markets["one"] = drop
+
+	settings := instance.Settings()
+	settings.StopLossEnabled = true
+	settings.StopLossRatio = 0.80
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sold, err := instance.Positions(ctx, account.ID, "sold")
+	if err != nil || sold.Total != 1 {
+		t.Fatalf("live stop-loss did not close the position: %+v err=%v", sold, err)
+	}
+	if sold.Items[0].ID != position.ID || sold.Items[0].RealizedPNL >= 0 {
+		t.Fatalf("unexpected live stopped position: %+v", sold.Items[0])
+	}
+	orders, err := instance.Orders(ctx, account.ID, "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var liveSell *engine.Order
+	for i := range orders.Items {
+		if orders.Items[i].Action == "stop" {
+			liveSell = &orders.Items[i]
+		}
+	}
+	if liveSell == nil || liveSell.Status != "filled" || liveSell.ExternalID != "fake-sell" {
+		t.Fatalf("live stop-loss order was not finalized: %+v", orders.Items)
+	}
+}
+
+func TestUnknownLiveStopLossIsReconciled(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	live := &fakeLive{
+		balance: 10000, allowance: 10000,
+		fill:     engine.LiveFill{Shares: 100, Cost: 98.3, Price: 0.983, Fee: 0.1, Status: "matched"},
+		sellFill: engine.LiveFill{OrderID: "pending-sell", Status: "unknown"},
+		sellErr:  errors.New("timeout"),
+	}
+	instance, _ := newTestEngine(t, provider, live)
+	account := accountByMode(t, instance, engine.AccountModeLive)
+	if _, err := instance.UpdateAccount(ctx, account.ID, nil, boolPointer(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(ctx, account.ID, engine.OrderRequest{
+		MarketID: "one", Outcome: "Yes", TokenID: "one-yes", Amount: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	drop := provider.markets["one"]
+	drop.Outcomes[0].Price = 0.75
+	drop.Outcomes[1].Price = 0.25
+	provider.markets["one"] = drop
+	settings := instance.Settings()
+	settings.StopLossEnabled = true
+	settings.StopLossRatio = 0.80
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unresolved, err := instance.Orders(ctx, account.ID, "unresolved", 10, 0)
+	if err != nil || unresolved.Total != 1 || unresolved.Items[0].Action != "stop" {
+		t.Fatalf("unknown sell was not persisted: %+v err=%v", unresolved, err)
+	}
+
+	live.sellErr = nil
+	live.lookup = map[string]engine.LiveFill{
+		"pending-sell": {OrderID: "pending-sell", Shares: 100, Cost: 74.9, Price: 0.75, Fee: 0.1, Status: "matched"},
+	}
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sold, err := instance.Positions(ctx, account.ID, "sold")
+	if err != nil || sold.Total != 1 {
+		t.Fatalf("reconciliation did not close the position: %+v err=%v", sold, err)
+	}
+	orders, err := instance.Orders(ctx, account.ID, "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sell *engine.Order
+	for i := range orders.Items {
+		if orders.Items[i].Action == "stop" {
+			sell = &orders.Items[i]
+		}
+	}
+	if sell == nil || sell.Status != "filled" || math.Abs(sell.Amount-(74.9-0.1)) > 1e-9 {
+		t.Fatalf("sell reconciliation did not net the fee: %+v", orders.Items)
 	}
 }
 

@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, CircleCheck, CircleX, Clock3, FlaskConical, Radio, X } from 'lucide-react'
+import { AlertTriangle, Check, CircleCheck, CircleX, Clock3, FlaskConical, Radio, ShieldAlert, X } from 'lucide-react'
 import type { AccountMode, OrderStatus, PositionStatus } from '@/types'
 import { Badge } from '@/components/ui/badge'
 
@@ -10,7 +10,8 @@ export function OrderStatusBadge({ status }: { status: OrderStatus }) {
   return <Badge variant="danger"><X className="h-3 w-3" /> 未成交</Badge>
 }
 
-export function PositionStatusBadge({ status }: { status: PositionStatus }) {
+export function PositionStatusBadge({ status, exitKind }: { status: PositionStatus; exitKind?: string }) {
+  if (exitKind === 'stop') return <Badge variant="warning"><ShieldAlert className="h-3 w-3" /> 已止损</Badge>
   if (status === 'open') return <Badge variant="info"><Clock3 className="h-3 w-3" /> 持有中</Badge>
   if (status === 'won') return <Badge variant="success"><CircleCheck className="h-3 w-3" /> 已胜出</Badge>
   if (status === 'split') return <Badge variant="warning"><AlertTriangle className="h-3 w-3" /> 平局退款</Badge>
@@ -24,7 +25,10 @@ export function ModeBadge({ mode, className }: { mode: AccountMode | string; cla
   return <Badge variant="success" className={className}><FlaskConical className="h-3 w-3" /> 模拟 PAPER</Badge>
 }
 
-export function OrderModeBadge({ mode, kind }: { mode: AccountMode | string; kind: 'manual' | 'auto' }) {
+export function OrderModeBadge({ mode, kind }: { mode: AccountMode | string; kind: 'manual' | 'auto' | 'stop' }) {
   const isLive = mode === 'live'
+  if (kind === 'stop') {
+    return <Badge variant="warning"><ShieldAlert className="h-3 w-3" /> {isLive ? '实盘' : '模拟'}止损</Badge>
+  }
   return <Badge variant={isLive ? 'warning' : 'success'}>{isLive ? <Radio className="h-3 w-3" /> : <FlaskConical className="h-3 w-3" />} {isLive ? '实盘' : '模拟'}{kind === 'auto' ? '自动' : '手动'}</Badge>
 }

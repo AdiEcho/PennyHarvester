@@ -86,6 +86,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		token_id TEXT NOT NULL,
 		side TEXT NOT NULL,
 		kind TEXT NOT NULL DEFAULT 'manual',
+		exit_kind TEXT NOT NULL DEFAULT '',
 		entry_price REAL NOT NULL,
 		current_price REAL NOT NULL,
 		shares REAL NOT NULL,
@@ -108,6 +109,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		token_id TEXT NOT NULL,
 		kind TEXT NOT NULL CHECK(kind IN ('manual', 'auto')),
 		type TEXT NOT NULL CHECK(type IN ('buy', 'settle')),
+		action TEXT NOT NULL DEFAULT '',
 		amount REAL NOT NULL,
 		price REAL NOT NULL,
 		shares REAL NOT NULL,
@@ -151,15 +153,25 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "equity_snapshots", "account_id", fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", paperID)); err != nil {
 		return err
 	}
+	// New bookkeeping columns are additive: ALTER TABLE ADD COLUMN preserves
+	// every existing column, index, trigger and foreign key. The CHECK
+	// constraints on status/type stay untouched so an older or newer database
+	// with a different schema is never rebuilt (and never loses columns).
+	if err := s.ensureColumn(ctx, "positions", "exit_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := s.migratePositionStatus(ctx); err != nil {
 		return err
 	}
-	if err := s.migrateOrderStatus(ctx); err != nil {
+	// The fee and action columns must exist before the orders table is rebuilt,
+	// so the rebuild can carry them over.
+	if err := s.ensureColumn(ctx, "orders", "fee", "REAL NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	// Must run after migrateOrderStatus: that rebuild recreates the orders
-	// table from the legacy column list, which has no fee column.
-	if err := s.ensureColumn(ctx, "orders", "fee", "REAL NOT NULL DEFAULT 0"); err != nil {
+	if err := s.ensureColumn(ctx, "orders", "action", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.migrateOrderStatus(ctx); err != nil {
 		return err
 	}
 	const indexes = `
@@ -212,6 +224,7 @@ func (s *SQLite) migratePositionStatus(ctx context.Context) error {
 		token_id TEXT NOT NULL,
 		side TEXT NOT NULL,
 		kind TEXT NOT NULL DEFAULT 'manual',
+		exit_kind TEXT NOT NULL DEFAULT '',
 		entry_price REAL NOT NULL,
 		current_price REAL NOT NULL,
 		shares REAL NOT NULL,
@@ -224,9 +237,9 @@ func (s *SQLite) migratePositionStatus(ctx context.Context) error {
 		realized_pnl REAL NOT NULL DEFAULT 0,
 		unrealized_pnl REAL NOT NULL DEFAULT 0
 	);
-	INSERT INTO positions_new(id, account_id, market_id, condition_id, question, outcome, token_id, side, kind,
+	INSERT INTO positions_new(id, account_id, market_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
 		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at, end_date, realized_pnl, unrealized_pnl)
-	SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side, COALESCE(kind, 'manual'),
+	SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side, COALESCE(kind, 'manual'), COALESCE(exit_kind, ''),
 		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at, end_date, realized_pnl, unrealized_pnl
 	FROM positions;
 	DROP TABLE positions;
@@ -261,18 +274,20 @@ func (s *SQLite) migrateOrderStatus(ctx context.Context) error {
 		token_id TEXT NOT NULL,
 		kind TEXT NOT NULL CHECK(kind IN ('manual', 'auto')),
 		type TEXT NOT NULL CHECK(type IN ('buy', 'settle')),
+		action TEXT NOT NULL DEFAULT '',
 		amount REAL NOT NULL,
 		price REAL NOT NULL,
 		shares REAL NOT NULL,
+		fee REAL NOT NULL DEFAULT 0,
 		status TEXT NOT NULL CHECK(status IN ('filled', 'rejected', 'settled', 'pending', 'unknown')),
 		reason TEXT NOT NULL,
 		external_id TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL
 	);
-	INSERT INTO orders_new(id, account_id, position_id, market_id, question, outcome, token_id, kind, type,
-		amount, price, shares, status, reason, external_id, created_at)
-	SELECT id, account_id, position_id, market_id, question, outcome, token_id, kind, type,
-		amount, price, shares, status, reason, external_id, created_at
+	INSERT INTO orders_new(id, account_id, position_id, market_id, question, outcome, token_id, kind, type, action,
+		amount, price, shares, fee, status, reason, external_id, created_at)
+	SELECT id, account_id, position_id, market_id, question, outcome, token_id, kind, type, COALESCE(action, ''),
+		amount, price, shares, fee, status, reason, external_id, created_at
 	FROM orders;
 	DROP TABLE orders;
 	ALTER TABLE orders_new RENAME TO orders;`
@@ -673,11 +688,11 @@ func insertPosition(ctx context.Context, db execer, p engine.Position) (engine.P
 		kind = "manual"
 	}
 	result, err := db.ExecContext(ctx, `INSERT INTO positions(
-		account_id, market_id, condition_id, question, outcome, token_id, side, kind, entry_price,
+		account_id, market_id, condition_id, question, outcome, token_id, side, kind, exit_kind, entry_price,
 		current_price, shares, cost, fee, status, opened_at, closed_at, end_date,
 		realized_pnl, unrealized_pnl
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.AccountID, p.MarketID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, kind, p.EntryPrice,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.AccountID, p.MarketID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, kind, p.ExitKind, p.EntryPrice,
 		p.CurrentPrice, p.Shares, p.Cost, p.Fee, p.Status, formatTime(p.OpenedAt),
 		nullableTime(p.ClosedAt), formatTime(p.EndDate), p.RealizedPNL, p.UnrealizedPNL)
 	if err != nil {
@@ -725,11 +740,11 @@ type orderInserter interface {
 
 func insertOrder(ctx context.Context, db orderInserter, order engine.Order) (int64, error) {
 	result, err := db.ExecContext(ctx, `INSERT INTO orders(
-		account_id, position_id, market_id, question, outcome, token_id, kind, type,
+		account_id, position_id, market_id, question, outcome, token_id, kind, type, action,
 		amount, price, shares, fee, status, reason, external_id, created_at
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		order.AccountID, order.PositionID, order.MarketID, order.Question, order.Outcome, order.TokenID,
-		order.Kind, order.Type, order.Amount, order.Price, order.Shares, order.Fee, order.Status,
+		order.Kind, order.Type, order.Action, order.Amount, order.Price, order.Shares, order.Fee, order.Status,
 		order.Reason, order.ExternalID, formatTime(order.CreatedAt))
 	if err != nil {
 		return 0, err
@@ -738,11 +753,23 @@ func insertOrder(ctx context.Context, db orderInserter, order engine.Order) (int
 }
 
 func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status string) ([]engine.Position, error) {
-	query := `SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side, kind,
+	query := `SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
 		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at,
 		end_date, realized_pnl, unrealized_pnl FROM positions WHERE account_id = ?`
 	args := []any{accountID}
-	if status != "all" {
+	switch status {
+	case "", "all":
+		// No extra filter.
+	case "sold":
+		// "sold" is the UI/API name for a stop-loss exit. It is stored as the
+		// normal lost status plus exit_kind='stop' so existing CHECK
+		// constraints never have to change.
+		query += " AND status <> 'open' AND exit_kind = 'stop'"
+	case "lost":
+		// Keep stopped positions out of the ordinary loss tab; they have their
+		// own tab and are excluded from the win-rate denominator.
+		query += " AND status = 'lost' AND exit_kind <> 'stop'"
+	default:
 		query += " AND status = ?"
 		args = append(args, status)
 	}
@@ -758,7 +785,7 @@ func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status stri
 		var openedAt, endDate string
 		var closedAt sql.NullString
 		if err := rows.Scan(&p.ID, &p.AccountID, &p.MarketID, &p.ConditionID, &p.Question, &p.Outcome,
-			&p.TokenID, &p.Side, &p.Kind, &p.EntryPrice, &p.CurrentPrice, &p.Shares, &p.Cost,
+			&p.TokenID, &p.Side, &p.Kind, &p.ExitKind, &p.EntryPrice, &p.CurrentPrice, &p.Shares, &p.Cost,
 			&p.Fee, &p.Status, &openedAt, &closedAt, &endDate, &p.RealizedPNL, &p.UnrealizedPNL); err != nil {
 			return nil, err
 		}
@@ -794,7 +821,7 @@ func orderStatusClause(status string) (string, []any) {
 }
 
 const orderColumns = `SELECT id, account_id, position_id, market_id, question, outcome,
-	token_id, kind, type, amount, price, shares, fee, status, reason, external_id, created_at
+	token_id, kind, type, action, amount, price, shares, fee, status, reason, external_id, created_at
 	FROM orders`
 
 func scanOrderRows(rows *sql.Rows) ([]engine.Order, error) {
@@ -804,7 +831,7 @@ func scanOrderRows(rows *sql.Rows) ([]engine.Order, error) {
 		var positionID sql.NullInt64
 		var createdAt string
 		if err := rows.Scan(&order.ID, &order.AccountID, &positionID, &order.MarketID, &order.Question,
-			&order.Outcome, &order.TokenID, &order.Kind, &order.Type, &order.Amount,
+			&order.Outcome, &order.TokenID, &order.Kind, &order.Type, &order.Action, &order.Amount,
 			&order.Price, &order.Shares, &order.Fee, &order.Status, &order.Reason, &order.ExternalID, &createdAt); err != nil {
 			return nil, err
 		}
@@ -876,6 +903,71 @@ func (s *SQLite) FinalizeLiveBuy(ctx context.Context, orderID int64, p engine.Po
 		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END
 		WHERE id = ? AND status IN ('pending', 'unknown')`,
 		p.ID, fill.Cost, fill.Price, fill.Shares, fill.Fee, "Polymarket CLOB 实盘成交", fill.OrderID, orderID)
+	if err != nil {
+		return engine.Position{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return engine.Position{}, fmt.Errorf("实盘订单 %d 已处理或不存在", orderID)
+	}
+	if err := tx.Commit(); err != nil {
+		return engine.Position{}, err
+	}
+	return p, nil
+}
+
+// applySellUpdate persists the position fields a sell changes. It is shared by
+// paper and live sells so both paths keep shares, cost basis, cumulative fee and
+// realized PnL consistent, including a partial fill that leaves the position
+// open with the remaining shares.
+func applySellUpdate(ctx context.Context, tx *sql.Tx, p engine.Position) error {
+	result, err := tx.ExecContext(ctx, `UPDATE positions SET current_price=?, shares=?, cost=?, fee=?,
+		status=?, exit_kind=?, closed_at=?, realized_pnl=?, unrealized_pnl=? WHERE id=? AND status='open'`,
+		p.CurrentPrice, p.Shares, p.Cost, p.Fee, p.Status, p.ExitKind, nullableTime(p.ClosedAt),
+		p.RealizedPNL, p.UnrealizedPNL, p.ID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return fmt.Errorf("持仓 %d 已平仓或不存在", p.ID)
+	}
+	return nil
+}
+
+// SellPosition books a paper sell (full or partial) and its order in one
+// transaction.
+func (s *SQLite) SellPosition(ctx context.Context, p engine.Position, order engine.Order) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := applySellUpdate(ctx, tx, p); err != nil {
+		return err
+	}
+	if _, err := insertOrder(ctx, tx, order); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// FinalizeLiveSell marks a signed sell order as filled and applies its fill to
+// the position. A partial fill leaves the position open with the remaining
+// shares; a full fill closes it with exit_kind='stop'.
+func (s *SQLite) FinalizeLiveSell(ctx context.Context, orderID int64, p engine.Position, fill engine.LiveFill) (engine.Position, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return engine.Position{}, err
+	}
+	defer tx.Rollback()
+	if err := applySellUpdate(ctx, tx, p); err != nil {
+		return engine.Position{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE orders SET position_id = ?, amount = ?, price = ?, shares = ?, fee = ?,
+		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END
+		WHERE id = ? AND status IN ('pending', 'unknown')`,
+		p.ID, fill.Cost, fill.Price, fill.Shares, fill.Fee, "Polymarket CLOB 止损成交", fill.OrderID, orderID)
 	if err != nil {
 		return engine.Position{}, err
 	}

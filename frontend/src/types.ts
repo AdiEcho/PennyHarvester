@@ -47,6 +47,7 @@ export interface Metrics {
   open_positions: number
   settled_positions: number
   split_positions: number
+  stopped_positions: number
   win_rate: number
   total_orders: number
 }
@@ -135,7 +136,7 @@ export interface OpportunityQuote {
   quoted_at: string
 }
 
-export type PositionStatus = 'open' | 'won' | 'lost' | 'split'
+export type PositionStatus = 'open' | 'won' | 'lost' | 'split' | 'sold'
 
 export interface Position {
   id: number
@@ -147,6 +148,8 @@ export interface Position {
   token_id: string
   side: 'BUY'
   kind: 'manual' | 'auto'
+  /** 空字符串表示普通持仓；stop 表示由止损提前平仓 */
+  exit_kind: string
   entry_price: number
   current_price: number
   shares: number
@@ -177,7 +180,9 @@ export interface Order {
   outcome: string
   token_id: string
   kind: 'manual' | 'auto'
-  type: 'buy' | 'settle'
+  type: 'buy' | 'sell' | 'settle'
+  /** 空字符串表示买入/结算；stop 表示止损卖出 */
+  action: string
   amount: number
   price: number
   shares: number
@@ -210,6 +215,8 @@ export interface Settings {
   max_price_change_24h: number
   entry_window_minutes: number
   sports_entry_window_minutes: number
+  stop_loss_enabled: boolean
+  stop_loss_ratio: number
 }
 
 export type ProxyMode = 'environment' | 'custom' | 'off'

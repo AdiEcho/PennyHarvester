@@ -86,6 +86,14 @@ type Settings struct {
 	// overtime. Zero disables the gate for that group.
 	EntryWindowMinutes       int `json:"entry_window_minutes"`
 	SportsEntryWindowMinutes int `json:"sports_entry_window_minutes"`
+	// StopLossEnabled turns the local stop-loss monitor on. Polymarket's CLOB
+	// has no native stop order, so the engine watches the mark price on every
+	// scan and submits a market sell when the trigger is hit.
+	StopLossEnabled bool `json:"stop_loss_enabled"`
+	// StopLossRatio is the fraction of the position's average entry price at
+	// which the stop triggers. 0.70 means "exit when the mark falls to 70% of
+	// the entry price", not an absolute price of 0.70.
+	StopLossRatio float64 `json:"stop_loss_ratio"`
 	// FeeModelVersion is managed by the server; clients must not set it.
 	FeeModelVersion int `json:"fee_model_version"`
 }
@@ -133,6 +141,11 @@ func validSportsPolicy(value string) bool {
 // this value: they read the market's real FeeSchedule.
 const DefaultFeeBPS = 15
 
+// DefaultStopLossRatio exits a position when its mark falls to 70% of the
+// average entry price. A stop-loss only reduces a tail-risk loss; a binary
+// market can still gap through the trigger and fill far lower.
+const DefaultStopLossRatio = 0.70
+
 func DefaultSettings() Settings {
 	return Settings{
 		MinPrice: 0.95, MaxPrice: 0.99, MaxDays: 30, MinLiquidity: 10000,
@@ -141,6 +154,7 @@ func DefaultSettings() Settings {
 		InitialBankroll: 10000, DefaultCategory: RadarCategoryNonSports,
 		SportsPolicy: SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
 		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5,
+		StopLossEnabled: false, StopLossRatio: DefaultStopLossRatio,
 		FeeModelVersion: FeeModelVersion,
 	}
 }
@@ -187,6 +201,10 @@ func (s Settings) Validate() error {
 	}
 	if s.SportsEntryWindowMinutes < 0 || s.SportsEntryWindowMinutes > MaxEntryWindowMinutes {
 		return fmt.Errorf("体育尾盘下单窗口须为 0–%d 分钟", MaxEntryWindowMinutes)
+	}
+	if s.StopLossRatio <= 0 || s.StopLossRatio >= 1 ||
+		math.IsNaN(s.StopLossRatio) || math.IsInf(s.StopLossRatio, 0) {
+		return fmt.Errorf("止损比例须为 0–1 之间的小数（例如 0.70 表示入场价的 70%%）")
 	}
 	return nil
 }
@@ -574,15 +592,19 @@ type OpportunityQuote struct {
 }
 
 type Position struct {
-	ID            int64      `json:"id"`
-	AccountID     int64      `json:"account_id"`
-	MarketID      string     `json:"market_id"`
-	ConditionID   string     `json:"condition_id"`
-	Question      string     `json:"question"`
-	Outcome       string     `json:"outcome"`
-	TokenID       string     `json:"token_id"`
-	Side          string     `json:"side"`
-	Kind          string     `json:"kind"`
+	ID          int64  `json:"id"`
+	AccountID   int64  `json:"account_id"`
+	MarketID    string `json:"market_id"`
+	ConditionID string `json:"condition_id"`
+	Question    string `json:"question"`
+	Outcome     string `json:"outcome"`
+	TokenID     string `json:"token_id"`
+	Side        string `json:"side"`
+	Kind        string `json:"kind"`
+	// ExitKind is empty for normal holdings and "stop" for a position closed by
+	// the stop-loss monitor. The status itself stays won/lost/split so the
+	// existing SQLite CHECK constraints (and any older database) remain valid.
+	ExitKind      string     `json:"exit_kind"`
 	EntryPrice    float64    `json:"entry_price"`
 	CurrentPrice  float64    `json:"current_price"`
 	Shares        float64    `json:"shares"`
@@ -597,20 +619,24 @@ type Position struct {
 }
 
 type Order struct {
-	ID         int64   `json:"id"`
-	AccountID  int64   `json:"account_id"`
-	PositionID *int64  `json:"position_id"`
-	MarketID   string  `json:"market_id"`
-	Question   string  `json:"question"`
-	Outcome    string  `json:"outcome"`
-	TokenID    string  `json:"token_id"`
-	Kind       string  `json:"kind"`
-	Type       string  `json:"type"`
-	Amount     float64 `json:"amount"`
-	Price      float64 `json:"price"`
-	Shares     float64 `json:"shares"`
-	// Fee is the taker fee paid on top of Amount for a filled buy. Settlement
-	// (redemption) orders carry no fee: Polymarket redeems at par.
+	ID         int64  `json:"id"`
+	AccountID  int64  `json:"account_id"`
+	PositionID *int64 `json:"position_id"`
+	MarketID   string `json:"market_id"`
+	Question   string `json:"question"`
+	Outcome    string `json:"outcome"`
+	TokenID    string `json:"token_id"`
+	Kind       string `json:"kind"`
+	Type       string `json:"type"`
+	// Action is empty for buys/settlements and "stop" for a stop-loss sell.
+	// Type stays settle so the orders CHECK constraint remains unchanged.
+	Action string  `json:"action"`
+	Amount float64 `json:"amount"`
+	Price  float64 `json:"price"`
+	Shares float64 `json:"shares"`
+	// Fee is the taker fee charged for a buy (added to Amount) or a stop-loss
+	// sell (already deducted from Amount). Settlement orders carry no fee:
+	// Polymarket redeems at par.
 	Fee        float64   `json:"fee"`
 	Status     string    `json:"status"`
 	Reason     string    `json:"reason"`
@@ -641,6 +667,9 @@ type Metrics struct {
 	OpenPositions    int     `json:"open_positions"`
 	SettledPositions int     `json:"settled_positions"`
 	SplitPositions   int     `json:"split_positions"`
+	// StoppedPositions counts positions closed early by the stop-loss. They are
+	// settled for cash purposes but excluded from the win-rate denominator.
+	StoppedPositions int     `json:"stopped_positions"`
 	WinRate          float64 `json:"win_rate"`
 	TotalOrders      int64   `json:"total_orders"`
 }
@@ -689,6 +718,9 @@ type AccountList struct {
 }
 
 // LiveFill is the real exchange execution returned by the live executor.
+// For a buy, Cost is the gross notional plus the taker fee. For a sell, Cost is
+// the gross proceeds minus the taker fee. Price is always the execution price
+// excluding the fee.
 type LiveFill struct {
 	OrderID string
 	Shares  float64
@@ -719,6 +751,10 @@ type LiveExecutor interface {
 	// callback must persist the order so a crash or timeout cannot lose a
 	// real fill. conditionID is required to load the market's fee schedule.
 	Buy(ctx context.Context, tokenID, conditionID string, amount, maxPrice float64, onSigned func(orderID string) error) (LiveFill, error)
+	// Sell signs and submits a market sell for shares, invoking onSigned before
+	// submitting it. LiveFill.Cost is the net pUSD proceeds (gross proceeds
+	// minus the taker fee) and LiveFill.Price is the gross execution price.
+	Sell(ctx context.Context, tokenID, conditionID string, shares float64, onSigned func(orderID string) error) (LiveFill, error)
 	LookupOrder(ctx context.Context, orderID, conditionID string) (LiveFill, bool, error)
 	EstimateBuyFee(ctx context.Context, conditionID string, amount, price float64) (float64, error)
 	// Quote reads the real ask book and fee schedule without submitting an
@@ -768,6 +804,11 @@ type Repository interface {
 	ListUnresolvedOrders(context.Context, int64) ([]Order, error)
 	MarkOrderStatus(context.Context, int64, string, string) error
 	FinalizeLiveBuy(context.Context, int64, Position, LiveFill) (Position, error)
+	// SellPosition books a fully simulated paper sell and inserts its order.
+	SellPosition(context.Context, Position, Order) error
+	// FinalizeLiveSell marks a pending/unknown real sell as filled and updates
+	// the position it closed or reduced.
+	FinalizeLiveSell(context.Context, int64, Position, LiveFill) (Position, error)
 	UpdateMark(context.Context, int64, float64, float64) error
 	SettlePosition(context.Context, Position, Order) error
 	AddSnapshot(context.Context, int64, EquityPoint) error

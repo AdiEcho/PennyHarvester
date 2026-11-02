@@ -602,6 +602,115 @@ func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount,
 	return fill, nil
 }
 
+// Sell signs and submits a FOK market sell for the full requested share count.
+// FOK is deliberate for stop-loss exits: a partial fill would leave a residual
+// position that the local ledger would have to track as a separate lot. If the
+// book cannot take every share, the order is killed and the next scan retries.
+//
+// The CLOB response reports makingAmount as shares and takingAmount as pUSD for
+// a sell, the reverse of a buy. The taker fee is subtracted from the proceeds,
+// so LiveFill.Cost is the net cash the wallet receives.
+func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	if tokenID == "" || conditionID == "" || shares <= 0 || math.IsNaN(shares) || math.IsInf(shares, 0) {
+		return engine.LiveFill{}, fmt.Errorf("%w: token、condition 与份额必须有效", engine.ErrInvalidOrder)
+	}
+	client, err := e.ensure(ctx)
+	if err != nil {
+		return engine.LiveFill{}, err
+	}
+	schedule, err := client.FeeSchedule(ctx, conditionID)
+	if err != nil {
+		return engine.LiveFill{}, fmt.Errorf("读取实盘手续费: %w", err)
+	}
+	order, err := client.MarketSellOrder(ctx, tokenID, shares, clobclient.OrderTypeFOK)
+	if err != nil {
+		return engine.LiveFill{}, fmt.Errorf("构建实盘卖单: %w", err)
+	}
+	order.Builder = e.builderCode
+	signed, err := client.CreateOrder(ctx, order)
+	if err != nil {
+		return engine.LiveFill{}, fmt.Errorf("签名实盘卖单: %w", err)
+	}
+	if onSigned != nil {
+		if err := onSigned(signed.OrderID); err != nil {
+			return engine.LiveFill{}, fmt.Errorf("持久化待确认实盘卖单: %w", err)
+		}
+	}
+	response, submitErr := client.SubmitSignedOrder(ctx, signed, clobclient.OrderTypeFOK, false)
+	if submitErr != nil {
+		if detail, lookupErr := client.Order(ctx, signed.OrderID); lookupErr == nil {
+			if fill, ok := fillFromOrder(detail, order.Price); ok {
+				fill.OrderID = signed.OrderID
+				if feeErr := applySellFee(schedule, &fill); feeErr != nil {
+					return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, feeErr
+				}
+				return fill, nil
+			}
+		}
+		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("提交实盘卖单（订单 %s，结果可能未知）: %w", signed.OrderID, submitErr)
+	}
+	if response == nil {
+		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("Polymarket 返回空订单响应")
+	}
+	if !response.Success {
+		message := strings.TrimSpace(response.ErrorMsg)
+		if message == "" {
+			message = "Polymarket 拒绝了卖单"
+		}
+		if response.OrderID != "" {
+			message = fmt.Sprintf("%s（订单 %s）", message, response.OrderID)
+		}
+		return engine.LiveFill{OrderID: response.OrderID, Status: "rejected"}, fmt.Errorf("%s", message)
+	}
+	fill := engine.LiveFill{
+		OrderID: response.OrderID, Status: response.Status,
+		Shares: parseAmount(response.MakingAmount), Cost: parseAmount(response.TakingAmount),
+	}
+	if fill.Shares <= 0 || fill.Cost <= 0 {
+		if response.OrderID != "" {
+			if detail, lookupErr := client.Order(ctx, response.OrderID); lookupErr == nil {
+				if lookedUp, ok := fillFromOrder(detail, order.Price); ok {
+					lookedUp.OrderID = response.OrderID
+					if feeErr := applySellFee(schedule, &lookedUp); feeErr != nil {
+						return engine.LiveFill{OrderID: response.OrderID, Status: "unknown"}, feeErr
+					}
+					return lookedUp, nil
+				}
+			}
+		}
+		originalStatus := fill.Status
+		if fill.OrderID == "" {
+			fill.OrderID = signed.OrderID
+		}
+		fill.Status = "unknown"
+		return fill, fmt.Errorf("实盘卖单未产生可确认成交（原状态 %s）", originalStatus)
+	}
+	fill.Price = fill.Cost / fill.Shares
+	if err := applySellFee(schedule, &fill); err != nil {
+		return engine.LiveFill{OrderID: fill.OrderID, Status: "unknown"}, err
+	}
+	return fill, nil
+}
+
+// applySellFee subtracts the taker fee from a sell's gross proceeds. The fee is
+// charged on the shares sold, exactly like a buy, but it reduces cash received
+// instead of increasing cash paid.
+func applySellFee(schedule clobclient.FeeSchedule, fill *engine.LiveFill) error {
+	if fill == nil || fill.Shares <= 0 || fill.Price <= 0 || fill.Price >= 1 {
+		return nil
+	}
+	fee, err := feeFromSchedule(schedule, fill.Shares, fill.Price)
+	if err != nil {
+		return fmt.Errorf("计算实盘卖出手续费: %w", err)
+	}
+	if fee >= fill.Cost {
+		return fmt.Errorf("卖出手续费 %.8f 不小于成交所得 %.8f", fee, fill.Cost)
+	}
+	fill.Fee = fee
+	fill.Cost -= fee
+	return nil
+}
+
 // EstimateBuyFee returns the taker fee the exchange would charge for the
 // requested notional at the reference price. It is used for pre-trade cash and
 // exposure checks; the actual fee is recomputed from the fill.
@@ -780,9 +889,13 @@ func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string)
 		if scheduleErr != nil {
 			return engine.LiveFill{}, false, fmt.Errorf("对账时读取实盘手续费: %w", scheduleErr)
 		}
-		if feeErr := applyFee(schedule, &fill); feeErr != nil {
+		// Report the fee without folding it into Cost. The engine knows the
+		// order side and adds it for a buy or subtracts it for a sell.
+		fee, feeErr := feeFromSchedule(schedule, fill.Shares, fill.Price)
+		if feeErr != nil {
 			return engine.LiveFill{}, false, feeErr
 		}
+		fill.Fee = fee
 	}
 	return fill, true, nil
 }

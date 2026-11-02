@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react'
-import { BookOpenCheck, Bot, CalendarDays, RefreshCw, UserRound } from 'lucide-react'
+import { BookOpenCheck, Bot, CalendarDays, RefreshCw, ShieldAlert, UserRound } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
@@ -22,20 +22,31 @@ const filters: { value: OrderStatusFilter; label: string }[] = [
   { value: 'rejected', label: '已拒绝' },
 ]
 
+function orderKindLabel(order: Order) {
+  if (order.action === 'stop') return '止损保护'
+  return order.kind === 'auto' ? '自动策略' : '手动确认'
+}
+
+function orderTypeLabel(order: Order, isLive: boolean) {
+  if (order.action === 'stop') return isLive ? '实盘止损卖出' : '模拟止损卖出'
+  if (order.action === 'sell') return isLive ? '实盘卖出' : '模拟卖出'
+  return order.type === 'buy' ? (isLive ? '实盘买入' : '模拟买入') : '结算'
+}
+
 function OrderCard({ order, isLive }: { order: Order; isLive: boolean }) {
   return (
     <Card className="p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-xs text-slate-400">订单 #{order.id} · {order.kind === 'auto' ? '自动策略' : '手动确认'}</p>
+          <p className="text-xs text-slate-400">订单 #{order.id} · {orderKindLabel(order)}</p>
           <h3 className="mt-1.5 text-sm font-medium leading-6 text-slate-900">{order.question}</h3>
         </div>
         <OrderStatusBadge status={order.status} />
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
         <span className="rounded-md bg-blue-50 px-2 py-1 font-medium text-blue-700">{order.outcome}</span>
-        <span className="text-slate-500">{order.type === 'buy' ? (isLive ? '实盘买入' : '模拟买入') : '结算'}</span>
-        <OrderModeBadge mode={isLive ? 'live' : 'paper'} kind={order.kind} />
+        <span className="text-slate-500">{orderTypeLabel(order, isLive)}</span>
+        <OrderModeBadge mode={isLive ? 'live' : 'paper'} kind={order.action === 'stop' ? 'stop' : order.kind} />
       </div>
       <div className="mt-4 grid grid-cols-3 gap-3 border-t border-slate-100 pt-4">
         <div><p className="text-[11px] text-slate-400">金额</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-800">{formatCurrency(order.amount)}</p>{order.fee > 0 && <p className="mt-0.5 text-[10px] text-slate-400">含费用 {formatCurrency(order.fee)}</p>}</div>
@@ -101,8 +112,8 @@ export function OrdersView() {
                         <div className="mt-1.5 flex items-center gap-2 text-xs"><span className="font-medium text-blue-700">{order.outcome}</span><span className="text-slate-300">·</span><span className="text-slate-400">#{order.id}</span>{order.position_id !== null && <span className="text-slate-400">持仓 #{order.position_id}</span>}</div>
                       </td>
                       <td className="px-4 py-4">
-                        <p className="flex items-center gap-1.5 text-slate-700">{order.kind === 'auto' ? <Bot className="h-3.5 w-3.5 text-slate-400" /> : <UserRound className="h-3.5 w-3.5 text-slate-400" />}{order.kind === 'auto' ? '自动策略' : '手动确认'}</p>
-                        <p className="mt-1.5 text-xs text-slate-400">{order.type === 'buy' ? (isLive ? '实盘买入' : '模拟买入') : '结算'}</p>
+                        <p className="flex items-center gap-1.5 text-slate-700">{order.action === 'stop' ? <ShieldAlert className="h-3.5 w-3.5 text-amber-500" /> : order.kind === 'auto' ? <Bot className="h-3.5 w-3.5 text-slate-400" /> : <UserRound className="h-3.5 w-3.5 text-slate-400" />}{orderKindLabel(order)}</p>
+                        <p className="mt-1.5 text-xs text-slate-400">{orderTypeLabel(order, isLive)}</p>
                       </td>
                       <td className="px-4 py-4 text-right"><p className="font-medium tabular-nums text-slate-800">{formatCurrency(order.amount)}</p>{order.fee > 0 && <p className="mt-1 text-[11px] text-slate-400">含费用 {formatCurrency(order.fee)}</p>}</td>
                       <td className="px-4 py-4 text-right"><p className="tabular-nums text-slate-700">{formatPrice(order.price)}</p><p className="mt-1 text-xs tabular-nums text-slate-400">{formatNumber(order.shares, 4)} 份</p></td>

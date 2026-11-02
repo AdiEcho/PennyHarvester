@@ -141,6 +141,9 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	if settings.SportsPolicy == "" {
 		settings.SportsPolicy = defaults.SportsPolicy
 	}
+	if settings.StopLossRatio == 0 {
+		settings.StopLossRatio = defaults.StopLossRatio
+	}
 	if err := settings.Validate(); err != nil {
 		return err
 	}
@@ -654,13 +657,22 @@ func (e *Engine) scan(ctx context.Context, execute bool) error {
 			// settlement state could not be refreshed.
 			unresolved++
 		}
-		if execute && e.isRunning() && account.AutoTrade {
-			switch {
-			case unresolved > 0:
-				processingErrors = append(processingErrors, fmt.Sprintf("%s: 存在未对账或未刷新的持仓，跳过本轮自动交易", account.Name))
-			default:
-				if err := e.autoTrade(ctx, account, opportunities, settings); err != nil {
-					processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+		if execute && e.isRunning() {
+			if unresolved > 0 {
+				processingErrors = append(processingErrors, fmt.Sprintf("%s: 存在未对账或未刷新的持仓，跳过本轮止损与自动交易", account.Name))
+			} else {
+				// Stop-loss is independent of the auto-entry switch: an operator
+				// who only buys manually still needs an automatic exit. It runs
+				// before new entries so a breached position is reduced first.
+				stopErr := e.runStopLoss(ctx, account, settings)
+				if stopErr != nil {
+					processingErrors = append(processingErrors, fmt.Sprintf("%s 止损: %v", account.Name, stopErr))
+				}
+				// Do not add risk while an exit is failing.
+				if account.AutoTrade && stopErr == nil {
+					if err := e.autoTrade(ctx, account, opportunities, settings); err != nil {
+						processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+					}
 				}
 			}
 		}
@@ -724,7 +736,9 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 			default:
 				position.Status = "lost"
 			}
-			position.RealizedPNL = payout - position.Cost
+			// A partial stop-loss exit may have booked realized PnL already;
+			// the remaining cost basis is settled on top of it.
+			position.RealizedPNL += payout - position.Cost
 			kind := position.Kind
 			if kind == "" {
 				kind = "manual"
@@ -795,8 +809,8 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
 		orderedMarkets[position.MarketID] = true
+		realized += position.RealizedPNL
 		if position.Status != "open" {
-			realized += position.RealizedPNL
 			continue
 		}
 		marketExposure[position.MarketID] += position.Cost
@@ -863,11 +877,10 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
 		orderedMarkets[position.MarketID] = true
+		realized += position.RealizedPNL
 		if position.Status == "open" {
 			marketExposure[position.MarketID] += position.Cost
 			totalExposure += position.Cost
-		} else {
-			realized += position.RealizedPNL
 		}
 	}
 	if account.BaselineEquity <= 0 {
@@ -934,6 +947,194 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	return nil
 }
 
+// runStopLoss checks every open position of an account against the configured
+// stop ratio and submits a market sell when the mark has fallen to the trigger.
+// Polymarket has no native stop order, so this is a local monitor: the scan
+// interval bounds how quickly a breach is noticed, and a gap can fill far below
+// the trigger. Only accounts with automatic trading enabled are allowed to sell
+// without an explicit click.
+func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Settings) error {
+	if !settings.StopLossEnabled {
+		return nil
+	}
+	positions, err := e.repo.ListPositions(ctx, account.ID, "open")
+	if err != nil {
+		return err
+	}
+	var errs []string
+	for _, position := range positions {
+		if position.Shares <= 0 || position.EntryPrice <= 0 || position.CurrentPrice <= 0 {
+			continue
+		}
+		trigger := position.EntryPrice * settings.StopLossRatio
+		if position.CurrentPrice > trigger+1e-9 {
+			continue
+		}
+		reason := fmt.Sprintf("触发止损：参考价 %.4f ≤ 入场价 %.4f × %.0f%%（止损线 %.4f）",
+			position.CurrentPrice, position.EntryPrice, settings.StopLossRatio*100, trigger)
+		var sellErr error
+		if account.Mode == AccountModeLive {
+			_, sellErr = e.executeLiveSell(ctx, account, position, reason)
+		} else {
+			_, sellErr = e.executePaperSell(ctx, account, position, reason, settings)
+		}
+		if sellErr != nil {
+			errs = append(errs, fmt.Sprintf("持仓 %d: %v", position.ID, sellErr))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// applySellFill turns a sell fill into an updated position and its order. A
+// partial fill reduces the shares and cost basis proportionally and leaves the
+// position open; a full fill closes it with exit_kind='stop'. The status stays
+// the ordinary lost value so older database CHECK constraints remain valid.
+func applySellFill(position Position, fill LiveFill, action, reason string, now time.Time) (Position, Order, error) {
+	if math.IsNaN(fill.Cost) || math.IsInf(fill.Cost, 0) || math.IsNaN(fill.Shares) || math.IsInf(fill.Shares, 0) {
+		return Position{}, Order{}, fmt.Errorf("%w: 卖出回报金额无效", ErrUpstream)
+	}
+	if position.Shares <= 0 || position.Cost <= 0 {
+		return Position{}, Order{}, fmt.Errorf("%w: 持仓份额或成本无效", ErrInvalidOrder)
+	}
+	sold := math.Min(fill.Shares, position.Shares)
+	if sold <= 0 || fill.Cost <= 0 || fill.Price <= 0 || fill.Price >= 1 {
+		return Position{}, Order{}, fmt.Errorf("%w: 卖出回报没有有效成交", ErrUpstream)
+	}
+	fraction := sold / position.Shares
+	costSold := position.Cost * fraction
+	updated := position
+	updated.Fee += fill.Fee
+	updated.RealizedPNL += fill.Cost - costSold
+	updated.CurrentPrice = fill.Price
+	remaining := position.Shares - sold
+	if remaining <= 1e-9 {
+		updated.Status = "lost"
+		updated.ExitKind = "stop"
+		closedAt := now
+		updated.ClosedAt = &closedAt
+		updated.UnrealizedPNL = 0
+	} else {
+		updated.Shares = remaining
+		updated.Cost = position.Cost - costSold
+		updated.UnrealizedPNL = remaining*fill.Price - updated.Cost
+	}
+	order := Order{
+		AccountID: position.AccountID, PositionID: &position.ID, MarketID: position.MarketID,
+		Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
+		Kind: "auto", Type: "settle", Action: action, Amount: fill.Cost, Price: fill.Price, Shares: sold,
+		Fee: fill.Fee, Status: "filled", Reason: reason, CreatedAt: now,
+	}
+	return updated, order, nil
+}
+
+func (e *Engine) executePaperSell(ctx context.Context, account Account, position Position, reason string, settings Settings) (Position, error) {
+	fillPrice := position.CurrentPrice * (1 - settings.SlippageBPS/10000)
+	if fillPrice <= 0 || fillPrice >= 1 {
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position, "模拟止损卖出价无效")
+	}
+	gross := fillPrice * position.Shares
+	fee := gross * settings.FeeBPS / 10000
+	fill := LiveFill{Shares: position.Shares, Cost: gross - fee, Price: fillPrice, Fee: fee, Status: "filled"}
+	updated, order, err := applySellFill(position, fill, "stop", reason+"；模拟成交；未发送任何真实订单", time.Now().UTC())
+	if err != nil {
+		return Position{}, err
+	}
+	if err := e.repo.SellPosition(ctx, updated, order); err != nil {
+		return Position{}, err
+	}
+	return updated, nil
+}
+
+func (e *Engine) executeLiveSell(ctx context.Context, account Account, position Position, reason string) (Position, error) {
+	if e.live == nil || !e.live.Configured() {
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position,
+			"实盘未配置：无法提交止损卖单")
+	}
+	if message := e.live.ReadyError(); message != "" {
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position,
+			"实盘未就绪："+message)
+	}
+	if position.ConditionID == "" || position.TokenID == "" {
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position,
+			"缺少 condition_id 或 token_id，无法提交止损卖单")
+	}
+	var pending Order
+	fill, err := e.live.Sell(ctx, position.TokenID, position.ConditionID, position.Shares, func(orderID string) error {
+		created, createErr := e.repo.CreateOrder(ctx, Order{
+			AccountID: account.ID, PositionID: &position.ID, MarketID: position.MarketID,
+			Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
+			Kind: "auto", Type: "settle", Action: "stop", Price: position.CurrentPrice, Shares: position.Shares,
+			Status: "pending", Reason: "实盘止损卖单已签名，等待成交回报",
+			ExternalID: orderID, CreatedAt: time.Now().UTC(),
+		})
+		if createErr == nil {
+			pending = created
+		}
+		return createErr
+	})
+	if err != nil {
+		if pending.ID != 0 {
+			status, message := "rejected", "实盘止损下单失败："+err.Error()
+			explicitRejection := strings.EqualFold(fill.Status, "rejected") || strings.EqualFold(fill.Status, "canceled") ||
+				strings.EqualFold(fill.Status, "cancelled") || strings.EqualFold(fill.Status, "expired")
+			if strings.EqualFold(fill.Status, "unknown") || (fill.OrderID != "" && !explicitRejection) {
+				status, message = "unknown", "实盘止损结果未知，等待对账："+err.Error()
+			}
+			_ = e.repo.MarkOrderStatus(ctx, pending.ID, status, message)
+		} else {
+			_ = e.rejectSellOrder(ctx, account.ID, position, "实盘止损下单失败："+err.Error())
+		}
+		if errors.Is(err, ErrInvalidOrder) {
+			return Position{}, err
+		}
+		return Position{}, fmt.Errorf("%w: 实盘止损失败: %v", ErrUpstream, err)
+	}
+	if fill.Shares <= 0 || fill.Cost <= 0 {
+		if pending.ID != 0 {
+			status, message := "rejected", "实盘止损订单未产生成交（状态 "+fill.Status+"）"
+			if strings.EqualFold(fill.Status, "unknown") {
+				status = "unknown"
+			}
+			_ = e.repo.MarkOrderStatus(ctx, pending.ID, status, message)
+			return Position{}, fmt.Errorf("%w: %s", ErrUpstream, message)
+		}
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position, "实盘止损订单未产生成交")
+	}
+	now := time.Now().UTC()
+	updated, order, err := applySellFill(position, fill, "stop", "Polymarket CLOB 止损成交", now)
+	if err != nil {
+		return Position{}, err
+	}
+	if pending.ID != 0 {
+		updated, err = e.repo.FinalizeLiveSell(ctx, pending.ID, updated, fill)
+		if err != nil {
+			return Position{}, fmt.Errorf("实盘止损已成交，但本地账务写入失败: %w", err)
+		}
+		return updated, nil
+	}
+	// Defensive fallback for an executor that does not call onSigned.
+	if err := e.repo.SellPosition(ctx, updated, order); err != nil {
+		return Position{}, fmt.Errorf("实盘止损已成交，但本地账务写入失败: %w", err)
+	}
+	return updated, nil
+}
+
+func (e *Engine) rejectSellOrder(ctx context.Context, accountID int64, position Position, reason string) error {
+	_, _ = e.repo.CreateOrder(ctx, Order{
+		AccountID: accountID, PositionID: &position.ID, MarketID: position.MarketID,
+		Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
+		Kind: "auto", Type: "settle", Action: "stop", Price: position.CurrentPrice, Shares: position.Shares,
+		Status: "rejected", Reason: reason, CreatedAt: time.Now().UTC(),
+	})
+	if strings.HasPrefix(reason, "实盘未配置") || strings.HasPrefix(reason, "实盘未就绪") {
+		return fmt.Errorf("%w: %s", ErrLiveUnavailable, reason)
+	}
+	return fmt.Errorf("%w: %s", ErrInvalidOrder, reason)
+}
+
 type OrderRequest struct {
 	MarketID string  `json:"market_id" binding:"required"`
 	Outcome  string  `json:"outcome" binding:"required"`
@@ -983,13 +1184,12 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	}
 	marketExposure, totalExposure, realized := 0.0, 0.0, 0.0
 	for _, position := range positions {
+		realized += position.RealizedPNL
 		if position.Status == "open" {
 			totalExposure += position.Cost
 			if position.MarketID == opportunity.MarketID {
 				marketExposure += position.Cost
 			}
-		} else {
-			realized += position.RealizedPNL
 		}
 	}
 	baseline := account.BaselineEquity
@@ -1061,13 +1261,12 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	}
 	marketExposure, totalExposure, realized := 0.0, 0.0, 0.0
 	for _, position := range positions {
+		realized += position.RealizedPNL
 		if position.Status == "open" {
 			totalExposure += position.Cost
 			if position.MarketID == opportunity.MarketID {
 				marketExposure += position.Cost
 			}
-		} else {
-			realized += position.RealizedPNL
 		}
 	}
 	if account.BaselineEquity <= 0 {
@@ -1189,6 +1388,14 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 	if message := e.live.ReadyError(); message != "" {
 		return len(orders), fmt.Errorf("实盘未就绪，无法对账: %s", message)
 	}
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
+	if err != nil {
+		return len(orders), err
+	}
+	positionsByID := make(map[int64]Position, len(positions))
+	for _, position := range positions {
+		positionsByID[position.ID] = position
+	}
 	var errs []string
 	remaining := 0
 	for _, order := range orders {
@@ -1222,7 +1429,37 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 			}
 			continue
 		}
+		if fill.Shares > 0 && fill.Cost > 0 && order.Action == "stop" {
+			positionID := int64(0)
+			if order.PositionID != nil {
+				positionID = *order.PositionID
+			}
+			position, positionOK := positionsByID[positionID]
+			if !positionOK || position.Status != "open" {
+				if markErr := e.repo.MarkOrderStatus(ctx, order.ID, "rejected", "止损订单对应的持仓已不存在，请人工核对"); markErr != nil {
+					errs = append(errs, markErr.Error())
+					remaining++
+				}
+				continue
+			}
+			// LookupOrder reports gross proceeds; net them against the taker fee
+			// the same way a live sell does.
+			fill.Cost -= fill.Fee
+			updated, _, applyErr := applySellFill(position, fill, "stop", "Polymarket CLOB 止损成交（对账）", time.Now().UTC())
+			if applyErr != nil {
+				errs = append(errs, fmt.Sprintf("订单 %s 对账失败: %v", order.ExternalID, applyErr))
+				remaining++
+				continue
+			}
+			if _, finalizeErr := e.repo.FinalizeLiveSell(ctx, order.ID, updated, fill); finalizeErr != nil {
+				errs = append(errs, fmt.Sprintf("订单 %s 对账写入失败: %v", order.ExternalID, finalizeErr))
+				remaining++
+			}
+			continue
+		}
 		if fill.Shares > 0 && fill.Cost > 0 {
+			// LookupOrder reports gross notional; a buy pays the taker fee on top.
+			fill.Cost += fill.Fee
 			outcome, outcomeOK := item.OutcomeByToken(order.TokenID)
 			if !outcomeOK {
 				errs = append(errs, fmt.Sprintf("订单 %s 的 token 已不在市场中", order.ExternalID))
@@ -1310,6 +1547,7 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	wins, marketValue := 0, 0.0
 	for _, position := range positions {
 		metrics.FeesPaid += position.Fee
+		metrics.RealizedPNL += position.RealizedPNL
 		if position.Status == "open" {
 			metrics.OpenPositions++
 			metrics.OpenExposure += position.Cost
@@ -1317,7 +1555,9 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 			marketValue += position.CurrentPrice * position.Shares
 		} else {
 			metrics.SettledPositions++
-			metrics.RealizedPNL += position.RealizedPNL
+			if position.ExitKind == "stop" {
+				metrics.StoppedPositions++
+			}
 			switch position.Status {
 			case "won":
 				wins++
@@ -1365,7 +1605,7 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 			metrics.WalletCashStale = true
 		}
 	}
-	decided := metrics.SettledPositions - metrics.SplitPositions
+	decided := metrics.SettledPositions - metrics.SplitPositions - metrics.StoppedPositions
 	if decided > 0 {
 		metrics.WinRate = float64(wins) / float64(decided)
 	}

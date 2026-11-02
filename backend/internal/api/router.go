@@ -222,8 +222,8 @@ func (h *Handler) positions(c *gin.Context) {
 		return
 	}
 	status := c.DefaultQuery("status", "open")
-	if status != "open" && status != "won" && status != "lost" && status != "split" && status != "all" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "status 仅支持 open、won、lost、split 或 all"})
+	if status != "open" && status != "won" && status != "lost" && status != "split" && status != "sold" && status != "all" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status 仅支持 open、won、lost、split、sold 或 all"})
 		return
 	}
 	positions, err := h.engine.Positions(c.Request.Context(), accountID, status)

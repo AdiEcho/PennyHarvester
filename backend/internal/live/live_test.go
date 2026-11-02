@@ -192,7 +192,7 @@ func TestQuoteReadsBookAndFeeWithoutCredentials(t *testing.T) {
 	}
 }
 
-func TestLookupOrderAddsFee(t *testing.T) {
+func TestLookupOrderReportsFeeWithoutBookingSide(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/data/order/"):
@@ -225,8 +225,10 @@ func TestLookupOrderAddsFee(t *testing.T) {
 	if !found || fill.Shares != 100 || fill.Fee <= 0 {
 		t.Fatalf("unexpected reconciled fill: %+v found=%v", fill, found)
 	}
-	if math.Abs(fill.Cost-(98+fill.Fee)) > 1e-9 {
-		t.Fatalf("reconciled cost must include fee: %+v", fill)
+	// Reconciliation reports the gross notional and the fee separately: the
+	// engine adds the fee for a buy and subtracts it for a sell.
+	if math.Abs(fill.Cost-98) > 1e-9 || fill.Fee <= 0 {
+		t.Fatalf("reconciled fill must expose gross cost and fee separately: %+v", fill)
 	}
 	fee, err := executor.EstimateBuyFee(context.Background(), "condition-1", 98, 0.98)
 	if err != nil || fee <= 0 {
@@ -280,7 +282,7 @@ func TestLookupOrderUsesRealFillPrices(t *testing.T) {
 	}
 	// 60 × 0.98 + 40 × 0.985 = 98.2, so the average is 0.982 rather than the
 	// 0.99 limit price the order response reports.
-	if math.Abs(fill.Price-0.982) > 1e-9 || math.Abs(fill.Cost-(98.2+fill.Fee)) > 1e-9 {
+	if math.Abs(fill.Price-0.982) > 1e-9 || math.Abs(fill.Cost-98.2) > 1e-9 {
 		t.Fatalf("reconciliation must use the real fills: %+v", fill)
 	}
 }
@@ -434,6 +436,65 @@ func TestBuyPersistsSignedOrderAndAddsFee(t *testing.T) {
 	// trade is not attributed to the builder profile.
 	if !strings.Contains(submittedOrder, `"builder":"`+builderCode+`"`) {
 		t.Fatalf("signed order does not carry the builder code: %s", submittedOrder)
+	}
+}
+
+func TestSellPersistsSignedOrderAndSubtractsFee(t *testing.T) {
+	var submittedOrder string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/book":
+			_, _ = w.Write([]byte(`{"asset_id":"token-1","market":"condition-1","bids":[{"price":"0.75","size":"100"}],"asks":[],"min_order_size":"5","tick_size":"0.01","neg_risk":false}`))
+		case r.URL.Path == "/tick-size":
+			_, _ = w.Write([]byte(`{"minimum_tick_size":0.01}`))
+		case r.URL.Path == "/neg-risk":
+			_, _ = w.Write([]byte(`{"neg_risk":false}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		case r.URL.Path == "/order" && r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			submittedOrder = string(body)
+			// A sell reverses the response fields: makingAmount is shares,
+			// takingAmount is the pUSD proceeds.
+			_, _ = w.Write([]byte(`{"success":true,"orderID":"sell-1","status":"matched","makingAmount":"100","takingAmount":"75"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       server.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	if err := executor.ReadyError(); err != "" {
+		t.Fatal(err)
+	}
+	var signedOrderID string
+	fill, err := executor.Sell(context.Background(), "token-1", "condition-1", 100, func(orderID string) error {
+		signedOrderID = orderID
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signedOrderID == "" || fill.OrderID != "sell-1" {
+		t.Fatalf("unexpected order identity: signed=%q fill=%+v", signedOrderID, fill)
+	}
+	if fill.Shares != 100 || fill.Price != 0.75 || fill.Fee <= 0 {
+		t.Fatalf("unexpected sell fill: %+v", fill)
+	}
+	wantFee := 0.07 * 100 * 0.75 * 0.25
+	if math.Abs(fill.Fee-wantFee) > 1e-9 || math.Abs(fill.Cost-(75-wantFee)) > 1e-9 {
+		t.Fatalf("sell fee must reduce proceeds: %+v wantFee=%f", fill, wantFee)
+	}
+	if !strings.Contains(submittedOrder, `"side":"SELL"`) {
+		t.Fatalf("submitted order is not a sell: %s", submittedOrder)
 	}
 }
 

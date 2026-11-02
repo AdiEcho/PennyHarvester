@@ -86,6 +86,9 @@ func (quoteLive) ReadyError() string { return "未配置 POLYMARKET_PRIVATE_KEY"
 func (quoteLive) Buy(context.Context, string, string, float64, float64, func(string) error) (engine.LiveFill, error) {
 	return engine.LiveFill{}, errors.New("live execution is not configured")
 }
+func (quoteLive) Sell(context.Context, string, string, float64, func(string) error) (engine.LiveFill, error) {
+	return engine.LiveFill{}, engine.ErrInvalidOrder
+}
 func (quoteLive) LookupOrder(context.Context, string, string) (engine.LiveFill, bool, error) {
 	return engine.LiveFill{}, false, nil
 }
