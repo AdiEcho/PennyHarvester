@@ -170,6 +170,7 @@
 - **部分成交保护**：如果交易所回报的成交份额少于持仓份额（例如极端盘口变化），系统会按比例减少持仓份额与成本，保留剩余头寸并继续监控，而不是把未卖出的份额从账本中删除。
 - **状态与统计**：止损平仓的持仓 `status=lost`、`exit_kind=stop`（API 可用 `status=sold` 筛选），订单为 `type=settle`、`action=stop`。止损头寸计入已实现盈亏与已付费用，但不计入胜率分母；仪表盘会单独显示止损笔数。底层状态保持 `lost` 是为了兼容旧版 SQLite 的 CHECK 约束，界面会按 `exit_kind` 显示「已止损」。
 - **触发口径**：使用 Gamma 公开参考价，而不是卖一价。实盘卖单最终按 CLOB 买盘逐档成交，因此成交价可能低于触发价；这是止损保护的固有限制。
+- **最小可卖份额（Polymarket 5 份）**：买入是市价单，按金额计价，最低只要 1 美元；但本系统的卖出是限价单，交易所按**份额**卡下限（Polymarket 为 5 份）。因此单笔金额低于 5 USDC 时买到的仓位（例如 2 美元 @0.98 ≈ 2.04 份）在结算前卖不出去。为避免开启一个无法兑现的止损承诺，开启止损保护要求已启用场所的单笔金额不低于该场所的最小卖单份额（Polymarket 5 USDC）；低于该值时保存会被后端拒绝，设置页会直接在对应字段给出提示。另外，已经存在的不足 5 份持仓不会被提交卖单，而是在扫描状态里报「低于 Polymarket 卖单最小 5 份，无法自动止损」，只能持有到结算。
 
 ### 体育赛事、加时与波动保护
 
@@ -363,7 +364,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/venues` | 获取已注册场所的能力声明（`currency`、`quote_decimals`、`min_notional`、`order_types`、`supports_settlement`、`supports_redeem`、`testnet`、`read_only`），前端据此决定币种符号、精度与是否显示结算/赎回相关文案 |
+| `GET` | `/venues` | 获取已注册场所的能力声明（`currency`、`quote_decimals`、`min_notional`、`min_sell_shares`、`order_types`、`supports_settlement`、`supports_redeem`、`testnet`、`read_only`），前端据此决定币种符号、精度与是否显示结算/赎回相关文案 |
 | `POST` | `/accounts/:id/positions/:positionId/redeem` | 对已结算仓位提交链上赎回交易（当前仅 Predict.fun），返回 `{venue, tx_hash, method}` |
 | `GET` | `/health` | 服务健康检查、默认账户模式、实盘配置与就绪状态 |
 | `GET` | `/accounts` | 获取所有账户列表（含实盘就绪状态、`signer` 与 `maker` 地址） |

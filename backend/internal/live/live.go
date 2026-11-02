@@ -23,6 +23,7 @@ import (
 	"pennyharvester/backend/internal/engine"
 	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
+	"pennyharvester/backend/internal/venue"
 )
 
 type Config struct {
@@ -527,10 +528,14 @@ func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount,
 	if err != nil {
 		return engine.LiveFill{}, fmt.Errorf("读取实盘手续费: %w", err)
 	}
-	order, err := client.MarketBuyOrder(ctx, tokenID, amount, clobclient.OrderTypeFAK)
+	plan, err := planMarketBuy(ctx, client, tokenID, amount)
 	if err != nil {
 		return engine.LiveFill{}, fmt.Errorf("构建实盘买单: %w", err)
 	}
+	if plan.available+1e-9 < amount {
+		return engine.LiveFill{}, fmt.Errorf("构建实盘买单: 盘口深度不足，需要 %.4f USDC，可用 %.4f USDC", amount, plan.available)
+	}
+	order := clobclient.UserOrder{TokenID: tokenID, Side: clobclient.SideBuy, Price: plan.limitPrice, Shares: plan.shares, OrderType: clobclient.OrderTypeFAK}
 	// The builder code is serialized into the signed order, so it has to be set
 	// before signing; it is what attributes the matched trade to the builder.
 	order.Builder = e.builderCode
@@ -738,39 +743,36 @@ func (e *Executor) EstimateBuyFee(ctx context.Context, conditionID string, amoun
 	return feeFromSchedule(schedule, amount/price, price)
 }
 
-// Quote estimates the result of a live FAK market buy using the real CLOB ask
-// book and the market's real taker fee schedule. It mirrors MarketBuyOrder's
-// share sizing (worst touched level, tick-ceiled) but prices every level at its
-// own ask, so Notional is the expected making amount rather than the limit
-// price applied to the whole size. It never signs or submits anything. When the
-// book cannot fill the full amount it quotes the available depth and sets
-// FullyFilled=false.
-func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amount float64) (engine.LiveQuote, error) {
-	if e == nil {
-		return engine.LiveQuote{}, fmt.Errorf("未配置实盘执行器")
-	}
-	if strings.TrimSpace(tokenID) == "" || strings.TrimSpace(conditionID) == "" {
-		return engine.LiveQuote{}, fmt.Errorf("token 与 condition 必须有效")
-	}
-	if amount <= 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
-		return engine.LiveQuote{}, fmt.Errorf("买入金额必须为有限正数")
-	}
-	e.mu.Lock()
-	client, err := e.readClientLocked()
-	e.mu.Unlock()
-	if err != nil {
-		return engine.LiveQuote{}, err
-	}
+// polymarketMinBuyNotional is Polymarket's floor for a marketable BUY, in
+// USDC. It mirrors venue.PolymarketCapabilities().MinNotional so the executor
+// and the venue fact sheet cannot drift apart.
+var polymarketMinBuyNotional = venue.PolymarketCapabilities().MinNotional
+
+// askLevel is one parsed ask level on the book.
+type askLevel struct{ price, size float64 }
+
+// buyPlan is the FAK order a dollar amount becomes against the live ask book:
+// the worst touched level ceiled to the tick, and the shares that budget buys.
+type buyPlan struct {
+	levels     []askLevel // asks sorted by price, cheapest first
+	available  float64    // USDC the whole ask side can absorb
+	limitPrice float64    // worst touched ask, ceiled to the market tick
+	shares     float64
+}
+
+// planMarketBuy sizes a FAK marketable BUY from the real ask book.
+//
+// It mirrors clobclient.MarketBuyOrder (worst touched level, tick-ceiled limit
+// price, shares floored to four decimals) with one deliberate difference: it
+// enforces Polymarket's dollar floor rather than the book's min_order_size.
+// min_order_size is the five-share floor for resting limit orders; a marketable
+// BUY is sized in USDC and the exchange only requires one dollar, which is why
+// the web UI fills a $2 buy at 0.98 (2.04 shares) while the SDK refuses it.
+func planMarketBuy(ctx context.Context, client *clobclient.Client, tokenID string, amount float64) (buyPlan, error) {
 	book, err := client.OrderBook(ctx, tokenID)
 	if err != nil {
-		return engine.LiveQuote{}, fmt.Errorf("读取实盘订单簿: %w", err)
+		return buyPlan{}, fmt.Errorf("读取实盘订单簿: %w", err)
 	}
-	schedule, err := client.FeeSchedule(ctx, conditionID)
-	if err != nil {
-		return engine.LiveQuote{}, fmt.Errorf("读取实盘手续费: %w", err)
-	}
-
-	type askLevel struct{ price, size float64 }
 	levels := make([]askLevel, 0, len(book.Asks))
 	for _, ask := range book.Asks {
 		price, priceErr := strconv.ParseFloat(ask.Price, 64)
@@ -781,7 +783,7 @@ func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amoun
 		levels = append(levels, askLevel{price: price, size: size})
 	}
 	if len(levels) == 0 {
-		return engine.LiveQuote{}, fmt.Errorf("订单簿没有可用卖盘")
+		return buyPlan{}, fmt.Errorf("订单簿没有可用卖盘")
 	}
 	sort.Slice(levels, func(i, j int) bool { return levels[i].price < levels[j].price })
 	available := 0.0
@@ -789,13 +791,13 @@ func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amoun
 		available += level.price * level.size
 	}
 
-	// MarketBuyOrder sizes shares from the worst touched level and ceils that
-	// level to the tick size. That limit price is what the risk check compares
-	// against max_price, so keep it separate from the average fill price.
 	budget := amount
 	if available < budget {
 		budget = available
 	}
+	// The limit price is the worst level the budget touches, tick-ceiled. Risk
+	// checks compare it against max_price, so it stays separate from the
+	// average fill price the quote reports.
 	remaining, limitPrice := budget, levels[0].price
 	for _, level := range levels {
 		limitPrice = level.price
@@ -812,22 +814,61 @@ func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amoun
 	}
 	limitPrice = math.Ceil(limitPrice/tick) * tick
 	if limitPrice <= 0 || limitPrice >= 1 {
-		return engine.LiveQuote{}, fmt.Errorf("盘口价格 %.6f 无法成交", limitPrice)
+		return buyPlan{}, fmt.Errorf("盘口价格 %.6f 无法成交", limitPrice)
 	}
+	// The exchange keeps four decimals for a FAK buy's share amount.
 	const shareScale = 10_000
 	shares := math.Floor((budget/limitPrice)*shareScale) / shareScale
 	if shares <= 0 {
-		return engine.LiveQuote{}, fmt.Errorf("盘口深度不足，无法买入")
+		return buyPlan{}, fmt.Errorf("盘口深度不足，无法买入")
 	}
-	if minShares, minErr := strconv.ParseFloat(strings.TrimSpace(book.MinOrderSize), 64); minErr == nil && minShares > 0 && shares+1e-9 < minShares {
-		return engine.LiveQuote{}, fmt.Errorf("份额 %.4f 低于市场最小下单量 %.4f", shares, minShares)
+	// The exchange floors a FAK buy's USDC side to cents when it signs, and its
+	// floor applies to that signed amount: a $1.00 budget at a 0.983 ask signs
+	// as $0.99 and is refused, so validate what would actually be signed.
+	signedNotional := math.Floor(limitPrice*shares*100) / 100
+	if minimum := polymarketMinBuyNotional; minimum > 0 && signedNotional+1e-9 < minimum {
+		return buyPlan{}, fmt.Errorf("下单金额 %.2f USDC 低于市场最小下单额 %.2f USDC（卖盘深度 %.4f USDC）", signedNotional, minimum, available)
+	}
+	return buyPlan{levels: levels, available: available, limitPrice: limitPrice, shares: shares}, nil
+}
+
+// Quote estimates the result of a live FAK market buy using the real CLOB ask
+// book and the market's real taker fee schedule. It mirrors MarketBuyOrder's
+// share sizing (worst touched level, tick-ceiled), see planMarketBuy, but
+// prices every level at its own ask, so Notional is the expected making amount
+// rather than the limit price applied to the whole size. It never signs or
+// submits anything. When the book cannot fill the full amount it quotes the
+// available depth and sets FullyFilled=false.
+func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amount float64) (engine.LiveQuote, error) {
+	if e == nil {
+		return engine.LiveQuote{}, fmt.Errorf("未配置实盘执行器")
+	}
+	if strings.TrimSpace(tokenID) == "" || strings.TrimSpace(conditionID) == "" {
+		return engine.LiveQuote{}, fmt.Errorf("token 与 condition 必须有效")
+	}
+	if amount <= 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return engine.LiveQuote{}, fmt.Errorf("买入金额必须为有限正数")
+	}
+	e.mu.Lock()
+	client, err := e.readClientLocked()
+	e.mu.Unlock()
+	if err != nil {
+		return engine.LiveQuote{}, err
+	}
+	plan, err := planMarketBuy(ctx, client, tokenID, amount)
+	if err != nil {
+		return engine.LiveQuote{}, err
+	}
+	schedule, err := client.FeeSchedule(ctx, conditionID)
+	if err != nil {
+		return engine.LiveQuote{}, fmt.Errorf("读取实盘手续费: %w", err)
 	}
 
 	// Walk the book again: a FAK order pays each maker its own ask, not the
 	// limit price for every share.
-	notional, unfilled := 0.0, shares
-	filled := make([]fillLevel, 0, len(levels))
-	for _, level := range levels {
+	notional, unfilled := 0.0, plan.shares
+	filled := make([]fillLevel, 0, len(plan.levels))
+	for _, level := range plan.levels {
 		take := math.Min(unfilled, level.size)
 		if take <= 0 {
 			break
@@ -837,18 +878,18 @@ func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amoun
 		unfilled -= take
 	}
 	if unfilled > 1e-6 {
-		return engine.LiveQuote{}, fmt.Errorf("盘口深度不足，无法覆盖 %.4f 份", shares)
+		return engine.LiveQuote{}, fmt.Errorf("盘口深度不足，无法覆盖 %.4f 份", plan.shares)
 	}
-	fillPrice := math.Round((notional/shares)*1e6) / 1e6
+	fillPrice := math.Round((notional/plan.shares)*1e6) / 1e6
 	fee, err := feeFromLevels(schedule, filled)
 	if err != nil {
 		return engine.LiveQuote{}, err
 	}
 	rate, _ := feeRate(schedule)
 	return engine.LiveQuote{
-		BestAsk: levels[0].price, LimitPrice: limitPrice, FillPrice: fillPrice,
-		Shares: shares, Notional: notional, Fee: fee, FeeRate: rate,
-		AvailableNotional: available, FullyFilled: available+1e-9 >= amount,
+		BestAsk: plan.levels[0].price, LimitPrice: plan.limitPrice, FillPrice: fillPrice,
+		Shares: plan.shares, Notional: notional, Fee: fee, FeeRate: rate,
+		AvailableNotional: plan.available, FullyFilled: plan.available+1e-9 >= amount,
 	}, nil
 }
 

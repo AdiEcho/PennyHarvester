@@ -78,6 +78,11 @@ type Capabilities struct {
 	// MinNotional is the smallest order value, in Currency units, the venue
 	// accepts. Zero means "not enforced by this build".
 	MinNotional float64 `json:"min_notional"`
+	// MinSellShares is the smallest sell this build can submit, in shares. A
+	// buy may be sized in money, but an exit is a limit order the venue floors
+	// by shares, so a position below this count cannot be sold at all. Zero
+	// means "not enforced by this build".
+	MinSellShares float64 `json:"min_sell_shares"`
 	// OrderTypes lists what can be submitted, in the venue's own vocabulary.
 	OrderTypes []string `json:"order_types"`
 	// MaxSlippageBPS is the largest deviation from the quoted price this build

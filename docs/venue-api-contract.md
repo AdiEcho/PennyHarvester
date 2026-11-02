@@ -22,6 +22,7 @@
   "currency": "USDC",
   "quote_decimals": 6,
   "min_notional": 1,
+  "min_sell_shares": 5,
   "order_types": ["FAK", "FOK"],
   "max_slippage_bps": 100,
   "supports_cancel": false,

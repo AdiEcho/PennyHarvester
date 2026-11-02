@@ -2447,3 +2447,91 @@ func TestRedeemPositionRejectsOpenAndSimulated(t *testing.T) {
 		t.Fatalf("no refused redemption may reach the chain: %d attempts", len(pfLive.redemptions))
 	}
 }
+
+// A marketable buy only needs one dollar, but every exit this build submits is a
+// limit order the venue floors at five shares. A two-dollar stop-loss
+// configuration therefore buys positions it can never sell, so enabling the
+// stop-loss is refused instead of silently accumulating unsellable bags.
+func TestStopLossRefusesOrderSizeBelowSellFloor(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	live := &fakeLive{
+		balance: 10000, allowance: 10000,
+		fill:     engine.LiveFill{Shares: 2.0408, Cost: 2, Price: 0.98, Status: "matched"},
+		sellFill: engine.LiveFill{Shares: 2.0408, Cost: 1.5, Price: 0.75, Status: "matched"},
+	}
+	registry := venue.NewRegistry()
+	// The real Polymarket fact sheet carries the five-share sell floor; the
+	// Polymarket-shaped testCapabilities intentionally does not.
+	if err := registry.Register(venue.PolymarketCapabilities(), provider, live); err != nil {
+		t.Fatal(err)
+	}
+	instance, _ := newTestEngineWithRegistry(t, registry)
+
+	// A small order size stays allowed while the stop-loss is off: such a
+	// position simply runs to settlement, which is a legitimate strategy.
+	small := instance.Settings()
+	small.OrderSize, small.MaxPosition, small.MaxExposure = 2, 250, 1000
+	if err := instance.UpdateSettings(ctx, small); err != nil {
+		t.Fatalf("a two-dollar order size must stay allowed without the stop-loss: %v", err)
+	}
+	// Turning the stop-loss on with that size would promise an exit that cannot
+	// be submitted, so it is refused.
+	small.StopLossEnabled = true
+	err := instance.UpdateSettings(ctx, small)
+	if err == nil || !strings.Contains(err.Error(), "开启自动止损需要 Polymarket 的单笔金额不低于 5 USDC") {
+		t.Fatalf("sub-floor order size must refuse the stop-loss: %v", err)
+	}
+	// The rule reads the effective per-venue size, so a per-venue override that
+	// drops Polymarket under the floor is refused even with a large global size.
+	override := instance.Settings()
+	override.StopLossEnabled = true
+	override.Venues = map[market.Venue]engine.VenueSettings{
+		market.VenuePolymarket: {Enabled: true, OrderSize: 2},
+	}
+	err = instance.UpdateSettings(ctx, override)
+	if err == nil || !strings.Contains(err.Error(), "自动止损") {
+		t.Fatalf("a per-venue override below the floor must refuse the stop-loss: %v", err)
+	}
+	// Five dollars always buys more than five shares because a share costs less
+	// than one dollar, so it clears the floor.
+	sized := instance.Settings()
+	sized.OrderSize, sized.MaxPosition, sized.MaxExposure = 5, 250, 1000
+	sized.StopLossEnabled = true
+	sized.StopLossRatio = 0.80
+	if err := instance.UpdateSettings(ctx, sized); err != nil {
+		t.Fatalf("a five-dollar order size must allow the stop-loss: %v", err)
+	}
+
+	// A position bought before the floor was known is still unsellable, so the
+	// monitor reports it instead of submitting an order the exchange rejects.
+	account := accountByMode(t, instance, engine.AccountModeLive)
+	if _, err := instance.PlaceOrder(ctx, account.ID, engine.OrderRequest{
+		MarketID: "one", Outcome: "Yes", TokenID: "one-yes", Amount: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	drop := provider.markets["one"]
+	drop.Outcomes[0].Price = 0.75
+	drop.Outcomes[1].Price = 0.25
+	provider.markets["one"] = drop
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if lastError := instance.Status().LastError; !strings.Contains(lastError, "低于 Polymarket 卖单最小 5 份") {
+		t.Fatalf("the monitor must report an unsellable position: %q", lastError)
+	}
+	open, err := instance.Positions(ctx, account.ID, "open", "")
+	if err != nil || open.Total != 1 {
+		t.Fatalf("an unsellable position stays open: %+v err=%v", open, err)
+	}
+	orders, err := instance.Orders(ctx, account.ID, "all", 10, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range orders.Items {
+		if order.Action == "stop" {
+			t.Fatalf("no stop order may be submitted below the sell floor: %+v", order)
+		}
+	}
+}

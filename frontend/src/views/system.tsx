@@ -1055,6 +1055,7 @@ function VenueRuntimeCard({ system, capabilityOf }: { system: SystemSettings; ca
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">Maker</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-600" title={runtime.maker}>{runtime.maker || '—'}</dd></div>
                 <div className="flex justify-between gap-3"><dt className="text-slate-500">结算能力</dt><dd className="text-slate-700">{settlement ? '引擎可自动结算' : '保持持有中，需自行赎回'}</dd></div>
                 {capability && <div className="flex justify-between gap-3"><dt className="text-slate-500">最小下单额</dt><dd className="text-slate-700">{fmtMoney(capability.min_notional, venue)}</dd></div>}
+                {capability && capability.min_sell_shares > 0 && <div className="flex justify-between gap-3"><dt className="text-slate-500">最小卖单</dt><dd className="text-slate-700">{capability.min_sell_shares} 份</dd></div>}
               </dl>
               {runtime.error && <p className="mt-2 break-words text-xs leading-5 text-rose-600">{runtime.error}</p>}
             </div>

@@ -26,6 +26,13 @@ export interface VenueMeta {
   tone: VenueTone
   /** Chip colours for the venue filter (single source for the pill look). */
   accentClass: string
+  /**
+   * Smallest sell the venue accepts, in shares (mirrors
+   * venue.Capabilities.MinSellShares). A buy is sized in money, an exit is a
+   * limit order floored by shares, so an order size below this number of
+   * currency units cannot produce a sellable position. Zero means no floor.
+   */
+  minSellShares: number
   orderTypes: string[]
   supportsSettlement: boolean
   settlementHint: string
@@ -55,6 +62,7 @@ export const VENUE_META: Record<Venue, VenueMeta> = {
     collateral: 'pUSD',
     tone: 'info',
     accentClass: 'border-blue-200 bg-blue-50 text-blue-700',
+    minSellShares: 5,
     orderTypes: ['FAK', 'FOK'],
     supportsSettlement: true,
     settlementHint: '结算损益为链上可领取权益，需在 Polymarket 手动领取（赎回需自付 Polygon gas）。',
@@ -76,6 +84,7 @@ export const VENUE_META: Record<Venue, VenueMeta> = {
     collateral: 'USDT',
     tone: 'default',
     accentClass: 'border-slate-300 bg-slate-100 text-slate-700',
+    minSellShares: 0,
     orderTypes: ['LIMIT', 'MARKET'],
     supportsSettlement: true,
     settlementHint: '结算结果由 Predict.fun 公布的获胜结果映射（引擎据此关账），链上份额仍需在 Predict.fun 手动赎回（需自付 BNB gas）。',

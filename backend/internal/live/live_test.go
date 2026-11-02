@@ -194,6 +194,64 @@ func TestQuoteReadsBookAndFeeWithoutCredentials(t *testing.T) {
 	}
 }
 
+func TestQuoteAllowsDollarAmountBelowMinShares(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/book":
+			// min_order_size is the five-share floor for resting limit orders;
+			// a $2 marketable BUY at 0.98 only buys 2.04 shares and the web UI
+			// fills it, so the quote must not reject it.
+			_, _ = w.Write([]byte(`{"asset_id":"token-1","market":"condition-1","bids":[],"asks":[{"price":"0.98","size":"1000"}],"min_order_size":"5","tick_size":"0.01","neg_risk":false}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := New(Config{CLOBURL: server.URL})
+	quote, err := executor.Quote(context.Background(), "token-1", "condition-1", 2)
+	if err != nil {
+		t.Fatalf("a $2 marketable buy must quote: %v", err)
+	}
+	if math.Abs(quote.Shares-2.0408) > 1e-9 || quote.LimitPrice != 0.98 {
+		t.Fatalf("shares must be sized from the dollars, not the share floor: %+v", quote)
+	}
+	if !quote.FullyFilled || quote.Fee <= 0 {
+		t.Fatalf("unexpected quote: %+v", quote)
+	}
+}
+
+func TestQuoteRejectsBelowMinNotional(t *testing.T) {
+	// The exchange floors a FAK buy's USDC side to cents and applies its $1
+	// minimum to that signed amount, so a $1.00 budget at a 0.983 ask signs as
+	// $0.99 and must be refused here instead of by the exchange.
+	cases := []struct {
+		ask    string
+		amount float64
+	}{{"0.98", 0.5}, {"0.983", 1}}
+	for _, tc := range cases {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.URL.Path == "/book":
+				_, _ = w.Write([]byte(`{"asset_id":"token-1","market":"condition-1","bids":[],"asks":[{"price":"` + tc.ask + `","size":"1000"}],"min_order_size":"5","tick_size":"0.001","neg_risk":false}`))
+			case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+				_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		executor := New(Config{CLOBURL: server.URL})
+		_, err := executor.Quote(context.Background(), "token-1", "condition-1", tc.amount)
+		server.Close()
+		if err == nil || !strings.Contains(err.Error(), "最小下单额") {
+			t.Fatalf("ask %s amount %v must be rejected on the dollar floor: %v", tc.ask, tc.amount, err)
+		}
+	}
+}
 func TestLookupOrderReportsFeeWithoutBookingSide(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -440,6 +498,52 @@ func TestBuyPersistsSignedOrderAndReportsFee(t *testing.T) {
 	// trade is not attributed to the builder profile.
 	if !strings.Contains(submittedOrder, `"builder":"`+builderCode+`"`) {
 		t.Fatalf("signed order does not carry the builder code: %s", submittedOrder)
+	}
+}
+
+func TestBuySizesBelowMinOrderSizeForMarketableBuy(t *testing.T) {
+	var submittedOrder string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/book":
+			// A five-share limit-order floor must not block a $2 marketable buy.
+			_, _ = w.Write([]byte(`{"asset_id":"token-1","market":"condition-1","bids":[],"asks":[{"price":"0.98","size":"1000"}],"min_order_size":"5","tick_size":"0.01","neg_risk":false}`))
+		case r.URL.Path == "/tick-size":
+			_, _ = w.Write([]byte(`{"minimum_tick_size":0.01}`))
+		case r.URL.Path == "/neg-risk":
+			_, _ = w.Write([]byte(`{"neg_risk":false}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		case r.URL.Path == "/order" && r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			submittedOrder = string(body)
+			_, _ = w.Write([]byte(`{"success":true,"orderID":"order-2","status":"matched","takingAmount":"2.0408","makingAmount":"1.99"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       server.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	fill, err := executor.Buy(context.Background(), "token-1", "condition-1", 2, 0.99, nil)
+	if err != nil {
+		t.Fatalf("a $2 marketable buy must be submitted: %v", err)
+	}
+	if fill.Shares != 2.0408 || fill.Cost != 1.99 {
+		t.Fatalf("unexpected fill: %+v", fill)
+	}
+	// 2.0408 shares at the 0.98 tick-ceiled limit: the signed order must carry
+	// that share count, not a padded five-share one.
+	if !strings.Contains(submittedOrder, `"takerAmount":"2040800"`) {
+		t.Fatalf("signed order does not carry the dollar-sized shares: %s", submittedOrder)
 	}
 }
 

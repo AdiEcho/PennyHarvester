@@ -11,6 +11,10 @@ export interface VenueCapabilities {
   currency: Currency
   quote_decimals: number
   min_notional: number
+  // min_sell_shares is the smallest sell the venue accepts, in shares. A buy
+  // may be sized in money, but an exit is a limit order floored by shares, so a
+  // position below this count cannot be sold (0 = no floor).
+  min_sell_shares: number
   order_types: string[]
   max_slippage_bps: number
   supports_cancel: boolean

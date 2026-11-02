@@ -306,12 +306,46 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	if err := settings.Validate(); err != nil {
 		return err
 	}
+	if err := e.validateStopLossExit(settings); err != nil {
+		return err
+	}
 	if err := e.repo.SaveSettings(ctx, settings); err != nil {
 		return err
 	}
 	e.mu.Lock()
 	e.settings = settings
 	e.mu.Unlock()
+	return nil
+}
+
+// validateStopLossExit refuses to enable the stop-loss when this build could not
+// exit what the settings would buy. Every venue floors a sell by shares while a
+// buy is sized in money, and one share always costs less than one currency unit
+// (prices are strictly below 1), so a single order below the venue's minimum
+// share count always lands under that floor. Such a position is not lost: it
+// simply cannot be sold before settlement, which is the opposite of what a
+// stop-loss promises. The rule lives here rather than in Settings.Validate
+// because persisted settings are validated on load, and an installation that
+// already runs the stop-loss on small orders must keep loading.
+func (e *Engine) validateStopLossExit(settings Settings) error {
+	if !settings.StopLossEnabled {
+		return nil
+	}
+	for _, v := range market.VenueOrder {
+		effective := settings.For(v)
+		if !effective.Enabled {
+			continue
+		}
+		caps, ok := e.capabilities(v)
+		if !ok || caps.MinSellShares <= 0 {
+			continue
+		}
+		if effective.OrderSize+1e-9 >= caps.MinSellShares {
+			continue
+		}
+		return fmt.Errorf("%w: 开启自动止损需要 %s 的单笔金额不低于 %.0f %s（该场所卖单最小 %.0f 份，单笔金额低于这个数就买不到可卖出的份额，仓位只能持有到结算）",
+			ErrInvalidSettings, caps.Label, caps.MinSellShares, caps.Currency, caps.MinSellShares)
+	}
 	return nil
 }
 
@@ -1845,8 +1879,17 @@ func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Sett
 		if position.Shares <= 0 || position.EntryPrice <= 0 || position.CurrentPrice <= 0 {
 			continue
 		}
+		// A sell is a limit order the venue floors by shares, so a position
+		// bought for a few dollars cannot be exited at all. Say so instead of
+		// submitting an order the exchange rejects on every scan.
 		trigger := position.EntryPrice * settings.StopLossRatio
 		if position.CurrentPrice > trigger+1e-9 {
+			continue
+		}
+		if caps, ok := e.capabilities(position.EffectiveVenue()); ok && caps.MinSellShares > 0 &&
+			position.Shares+1e-9 < caps.MinSellShares {
+			errs = append(errs, fmt.Sprintf("持仓 %d: %.4f 份低于 %s 卖单最小 %.0f 份，无法自动止损，只能持有到结算",
+				position.ID, position.Shares, caps.Label, caps.MinSellShares))
 			continue
 		}
 		reason := fmt.Sprintf("触发止损：参考价 %.4f ≤ 入场价 %.4f × %.0f%%（止损线 %.4f）",

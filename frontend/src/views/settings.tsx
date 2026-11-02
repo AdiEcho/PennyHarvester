@@ -21,6 +21,7 @@ import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import type { Account, AccountMode, Engine, Settings, Venue, VenueSettings } from '@/types'
+import type { Currency } from '@/lib/venue'
 import { fmtMoney, VENUES, venueLabel, venueMeta, venueOf } from '@/lib/venue'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/toast'
@@ -199,6 +200,38 @@ function validateShared(shared: SharedDraft): FieldErrors {
   return errors
 }
 
+/** One venue whose effective order size could not produce a sellable position. */
+interface StopLossFloorViolation {
+  venue: Venue
+  label: string
+  currency: Currency
+  floor: number
+  orderSize: number
+}
+
+/**
+ * Venues where the stop-loss would promise an exit the exchange refuses. A buy
+ * is sized in money, but the exit is a limit order the venue floors by shares,
+ * so a per-venue order size below that floor always lands under it (a share
+ * costs less than one currency unit). The backend refuses to enable the
+ * stop-loss in that state; the form mirrors it so the reason is visible before
+ * the save round-trip.
+ */
+function stopLossFloorViolations(draft: Draft): StopLossFloorViolation[] {
+  if (!draft.shared.stop_loss_enabled) return []
+  const shared = toShared(draft.shared)
+  const violations: StopLossFloorViolation[] = []
+  for (const venue of VENUES) {
+    const meta = venueMeta(venue)
+    if (!meta.minSellShares) continue
+    if (!draft.venues[venue].enabled) continue
+    const orderSize = numberOrZero(draft.venues[venue].order_size) || shared.order_size
+    if (orderSize + 1e-9 >= meta.minSellShares) continue
+    violations.push({ venue, label: meta.label, currency: meta.currency, floor: meta.minSellShares, orderSize })
+  }
+  return violations
+}
+
 function validate(draft: Draft): FieldErrors {
   const errors = validateShared(draft.shared)
   const shared = toShared(draft.shared)
@@ -219,6 +252,15 @@ function validate(draft: Draft): FieldErrors {
     if (maxExposure < maxPosition) errors[key('max_exposure')] = `总敞口上限不能低于单市场持仓上限（当前生效 ${maxPosition}）。`
     if ((current.fee_bps.trim() !== '' && (feeBps < 0 || feeBps > 1000)) || feeBps > 1000) errors[key('fee_bps')] = '费用范围为 0–1000 bps（0 表示继承全局值）。'
     if (current.min_liquidity.trim() !== '' && numberOrZero(current.min_liquidity) < 0) errors[key('min_liquidity')] = '最低流动性不能小于 0。'
+  }
+  // The stop-loss sells a whole position as a limit order, and every venue floors
+  // such an order by shares. An order size in money below that floor buys a
+  // position the bot can never exit, so the backend refuses to enable the
+  // stop-loss then; mirror the rule here so the reason lands on the field.
+  for (const violation of stopLossFloorViolations(draft)) {
+    const message = `开启自动止损需要${violation.label}单笔金额不低于 ${violation.floor} ${violation.currency}（${violation.label} 卖单最小 ${violation.floor} 份，单笔金额更低就买不到能卖出的份额）。`
+    if (draft.venues[violation.venue].order_size.trim() !== '') errors[`${violation.venue}.order_size`] = message
+    else errors.order_size = message
   }
   return errors
 }
@@ -746,6 +788,11 @@ export function SettingsView() {
                 <div className="mt-6 grid gap-x-5 gap-y-6 sm:grid-cols-2">
                   <NumberField id="stop_loss_ratio" label="止损线（入场价比例）" description="默认 0.70；例如 0.70 表示当前参考价跌到平均入场价的 70% 时卖出，不是绝对价格 0.70。" value={draft.shared.stop_loss_ratio} unit="× 入场价" min={0} max={1} step="0.01" error={errors.stop_loss_ratio} onChange={(value) => update('stop_loss_ratio', value)} />
                 </div>
+                {stopLossFloorViolations(draft).map((violation) => (
+                  <div key={violation.venue} className="mt-6 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-800">
+                    无法开启自动止损：{violation.label} 的卖单最小 {violation.floor} 份，当前单笔金额 {violation.orderSize} {violation.currency} 买不到这么多份额，仓位只能持有到结算。请把{violation.label}的单笔金额调到 {violation.floor} {violation.currency} 或以上。
+                  </div>
+                ))}
                 <div className="mt-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
                   <div className="rounded-xl bg-surface p-2.5 text-amber-600"><Info className="h-5 w-5" /></div>
                   <div className="flex-1"><p className="text-sm font-semibold text-amber-900">止损不是保证成交价</p><p className="mt-1 text-xs leading-5 text-amber-800">止损触发依赖扫描间隔（暂停扫描引擎时不会检查），行情跳空或盘口深度不足时可能卖不出去，或成交价明显低于止损线。Polymarket 的止损卖单使用 FOK 立即成交或全部取消；Predict.fun 使用 MARKET 单并受滑点上限约束。未成交时会在下一次扫描重试。请先用模拟账户验证。</p></div>
