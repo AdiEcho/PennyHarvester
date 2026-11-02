@@ -20,7 +20,7 @@ import {
 import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
-import type { Opportunity, OpportunityQuote } from '@/types'
+import type { Opportunity, OpportunityQuote, Position } from '@/types'
 import { formatCompactCurrency, formatCurrency, formatFullDate, formatNumber, formatPercent, formatPrice, formatPriceChange } from '@/lib/format'
 import { categoryCounts, categoryFilters, categoryLabel, matchesCategory, normalizeCategoryFilter, type CategoryFilter } from '@/lib/category'
 import { marketOutcome, marketQuestion, marketURL, persistMarketLanguage, readMarketLanguage, type MarketLanguage } from '@/lib/market-language'
@@ -49,6 +49,57 @@ interface QuoteState {
   quote?: OpportunityQuote
   error?: string
   loading?: boolean
+}
+
+interface HeldPosition {
+  shares: number
+  cost: number
+  entryPrice: number
+  count: number
+}
+
+// The radar marks markets this account already holds. Manual and automatic
+// fills can land on the same token more than once, so the marker shows the
+// share-weighted entry price instead of whichever fill came last.
+function heldPositionsByToken(positions: Position[]): Map<string, HeldPosition> {
+  const groups = new Map<string, { shares: number; cost: number; entryValue: number; count: number }>()
+  for (const position of positions) {
+    if (position.status !== 'open' || !(position.shares > 0)) continue
+    const group = groups.get(position.token_id) || { shares: 0, cost: 0, entryValue: 0, count: 0 }
+    group.shares += position.shares
+    group.cost += position.cost
+    group.entryValue += position.entry_price * position.shares
+    group.count += 1
+    groups.set(position.token_id, group)
+  }
+  const result = new Map<string, HeldPosition>()
+  groups.forEach((group, tokenId) => {
+    result.set(tokenId, {
+      shares: group.shares,
+      cost: group.cost,
+      entryPrice: group.entryValue / group.shares,
+      count: group.count,
+    })
+  })
+  return result
+}
+
+function heldTitle(held: HeldPosition) {
+  return `已买入 ${formatNumber(held.shares, 4)} 份 · 成本 ${formatCurrency(held.cost)}${held.count > 1 ? ` · 共 ${held.count} 笔` : ''}`
+}
+
+function HeldBadge({ held, className }: { held?: HeldPosition; className?: string }) {
+  if (!held) return null
+  return (
+    <Badge variant="success" className={className} title={heldTitle(held)}>
+      <CheckCircle2 className="h-3 w-3" />已买入
+    </Badge>
+  )
+}
+
+function HeldPrice({ held }: { held?: HeldPosition }) {
+  if (!held) return null
+  return <p className="mt-1 text-[11px] font-medium tabular-nums text-emerald-700" title={heldTitle(held)}>买入价 {formatPrice(held.entryPrice)}</p>
 }
 
 function quoteAge(quotedAt: string) {
@@ -108,18 +159,18 @@ function ProtocolBadge({ item }: { item: Opportunity }) {
   )
 }
 
-function OpportunityCard({ item, onBuy, onQuote, quote, orderSize, isLive, language }: { item: Opportunity; onBuy: (item: Opportunity) => void; onQuote: () => void; quote?: QuoteState; orderSize: number | null; isLive: boolean; language: MarketLanguage }) {
+function OpportunityCard({ item, held, onBuy, onQuote, quote, orderSize, isLive, language }: { item: Opportunity; held?: HeldPosition; onBuy: (item: Opportunity) => void; onQuote: () => void; quote?: QuoteState; orderSize: number | null; isLive: boolean; language: MarketLanguage }) {
   return (
     <Card className="p-4">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          <div className="mb-2 flex flex-wrap items-center gap-1.5"><Badge variant="info">{marketOutcome(item, language)}</Badge><Badge variant="default">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
+          <div className="mb-2 flex flex-wrap items-center gap-1.5"><Badge variant="info">{marketOutcome(item, language)}</Badge><Badge variant="default">{categoryLabel(item.category)}</Badge><HeldBadge held={held} />{item.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
           <h3 className="text-sm font-medium leading-6 text-slate-900">{marketQuestion(item, language)}</h3>
         </div>
         <MarketLink url={marketURL(item.url, language)} compact />
       </div>
       <div className="mt-4 grid grid-cols-2 gap-3 rounded-xl bg-slate-50 p-3">
-        <div><p className="text-[11px] text-slate-500">指示价格</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPrice(item.price)}</p>{item.price_change_24h != null && <p className={cn('mt-0.5 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}</div>
+        <div><p className="text-[11px] text-slate-500">指示价格</p><p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatPrice(item.price)}</p>{item.price_change_24h != null && <p className={cn('mt-0.5 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}<HeldPrice held={held} /></div>
         <div><p className="text-[11px] text-slate-500">毛收益</p><p className="mt-1 text-sm font-semibold tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</p></div>
       </div>
       {item.sports_game && <p className="mt-3 flex items-start gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-4 text-amber-800"><ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大。</p>}
@@ -139,7 +190,7 @@ function OpportunityCard({ item, onBuy, onQuote, quote, orderSize, isLive, langu
 }
 
 export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => void }) {
-  const { account } = useAccount()
+  const { account, accountId } = useAccount()
   const isLive = account?.mode === 'live'
   const liveReady = !isLive || Boolean(account?.live_ready)
   const [query, setQuery] = useState('')
@@ -161,6 +212,11 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const { toast } = useToast()
   const fetchOpportunities = useCallback((signal: AbortSignal) => api.opportunities(signal), [])
   const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchOpportunities)
+  // Open positions for the selected account drive the 「已买入」 markers. They
+  // are polled separately so auto-trade fills show up without a radar scan.
+  const fetchHeldPositions = useCallback((signal: AbortSignal) => api.positions(accountId, 'open', signal), [accountId])
+  const { data: heldData, refresh: refreshHeld } = usePolling(fetchHeldPositions, { enabled: Boolean(accountId) })
+  const heldByToken = useMemo(() => heldPositionsByToken(heldData?.items || []), [heldData])
 
   useEffect(() => () => {
     scanController.current?.abort()
@@ -201,6 +257,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const numericAmount = Number(amount)
   const validAmount = amount.trim() !== '' && Number.isFinite(numericAmount) && numericAmount > 0
   const selectedQuote = selected ? quotes[selected.token_id]?.quote : undefined
+  const selectedHeld = selected ? heldByToken.get(selected.token_id) : undefined
 
   const fetchQuote = async (item: Opportunity, quoteAmount?: number) => {
     quoteControllers.current.get(item.token_id)?.abort()
@@ -235,6 +292,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
       const result = await api.scan(controller.signal)
       toast({ title: '扫描完成', description: `本次返回 ${formatNumber(result.total, 0)} 个候选机会；仅刷新行情，未自动下单。`, variant: 'success' })
       refresh()
+      refreshHeld()
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
       toast({ title: '扫描失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
@@ -260,6 +318,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
       }, controller.signal)
       toast({ title: isLive ? '实盘买入已成交' : '模拟买入已成交', description: `已创建${isLive ? '实盘' : '模拟'}持仓 #${position.id}，成交份额 ${formatNumber(position.shares, 4)}。`, variant: 'success' })
       setSelected(null)
+      refreshHeld()
       onOrderCreated()
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
@@ -283,7 +342,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3 md:justify-end">
             <p className="text-xs text-slate-500" aria-live="polite"><span className="font-semibold tabular-nums text-slate-800">{formatNumber(filtered.length, 0)}</span> 个匹配结果{(query || category !== 'all') && data ? <span> / 共 {formatNumber(data.total, 0)} 个</span> : null}</p>
-            <Button variant="ghost" size="sm" onClick={refresh} disabled={isRefreshing}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />刷新</Button>
+            <Button variant="ghost" size="sm" onClick={() => { refresh(); refreshHeld() }} disabled={isRefreshing}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />刷新</Button>
           </div>
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-3">
@@ -337,8 +396,8 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
                 <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>
                   {filtered.map((item) => (
                     <tr key={`${item.market_id}-${item.token_id}`} className="group hover:bg-slate-50/70">
-                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex flex-wrap items-center gap-1.5"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><Badge variant="default" className="px-2 py-0.5 text-[11px]">{categoryLabel(item.category)}</Badge>{item.sports_game && <Badge variant="warning" className="px-2 py-0.5 text-[11px]" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
-                      <td className="px-4 py-4 text-right"><div className="font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</div>{item.price_change_24h != null && <p className={cn('mt-1 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}</td>
+                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex flex-wrap items-center gap-1.5"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><Badge variant="default" className="px-2 py-0.5 text-[11px]">{categoryLabel(item.category)}</Badge><HeldBadge held={heldByToken.get(item.token_id)} className="px-2 py-0.5 text-[11px]" />{item.sports_game && <Badge variant="warning" className="px-2 py-0.5 text-[11px]" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
+                      <td className="px-4 py-4 text-right"><div className="font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</div>{item.price_change_24h != null && <p className={cn('mt-1 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}<HeldPrice held={heldByToken.get(item.token_id)} /></td>
                       <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
                       <td className="px-4 py-4 text-right"><RealYield state={quotes[item.token_id]} onQuote={() => fetchQuote(item)} /></td>
                       <td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatCompactCurrency(item.liquidity)}</td>
@@ -350,7 +409,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               </table>
             </div>
           </Card>
-          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} onBuy={openBuy} onQuote={() => fetchQuote(item)} quote={quotes[item.token_id]} orderSize={orderSize} isLive={isLive} language={marketLanguage} />)}</div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} held={heldByToken.get(item.token_id)} onBuy={openBuy} onQuote={() => fetchQuote(item)} quote={quotes[item.token_id]} orderSize={orderSize} isLive={isLive} language={marketLanguage} />)}</div>
         </>
       )}
 
@@ -366,6 +425,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               <p className="pr-4 text-sm font-medium leading-6 text-slate-900">{marketQuestion(selected, marketLanguage)}</p>
               <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><Badge variant="default">{categoryLabel(selected.category)}</Badge>{selected.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={selected} /><span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
             </div>
+            {selectedHeld && <div className="flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs leading-5 text-emerald-800" role="status"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">已买入：</span>买入价 {formatPrice(selectedHeld.entryPrice)} · {formatNumber(selectedHeld.shares, 4)} 份 · 成本 {formatCurrency(selectedHeld.cost)}{selectedHeld.count > 1 ? `（${selectedHeld.count} 笔）` : ''}。再次买入会增加该头寸。</span></div>}
             {selected.sports_game && <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">体育赛事盘口：</span>可能包含加时、延长赛或点球决胜，临近结算时价格波动明显。请确认你已理解该风险。</span></div>}
             <div>
               <div className="mb-2 flex items-center justify-between"><label htmlFor="paper-amount" className="text-sm font-medium text-slate-700">{isLive ? '实盘投入金额' : '投入虚拟金额'}</label><span className="text-xs text-slate-400">USD</span></div>
