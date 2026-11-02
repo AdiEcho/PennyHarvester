@@ -8,40 +8,49 @@ import (
 )
 
 // classifyOpportunities enriches candidates with their category and sports
-// risk flags, then applies the configured sports policy. Gamma normally
+// risk flags, then applies the configured sports policy. A venue normally
 // includes tags in the market payload; a batched event-tag fallback is used
-// only when a provider omits them. Local heuristics still identify game markets
-// through their start time and title if tags are unavailable.
+// only when that venue's provider omits them. Local heuristics still identify
+// game markets through their start time and title if tags are unavailable.
+//
+// markets is keyed by marketKey so two venues' ids can never collide, and the
+// tag fallback is resolved through the provider that owns each opportunity.
 func (e *Engine) classifyOpportunities(ctx context.Context, opportunities []Opportunity, markets map[string]market.Market, settings Settings) []Opportunity {
-	tagsByEvent := map[string][]market.Tag{}
-	if provider, ok := e.provider.(market.EventTagProvider); ok {
-		eventIDs := make([]string, 0, len(opportunities))
-		seen := make(map[string]bool, len(opportunities))
-		for _, opportunity := range opportunities {
-			item := markets[opportunity.MarketID]
-			if len(item.Tags) > 0 {
-				continue
-			}
-			eventID := item.EventID
-			if eventID == "" || seen[eventID] {
-				continue
-			}
-			seen[eventID] = true
-			eventIDs = append(eventIDs, eventID)
+	eventIDsByVenue := map[market.Venue][]string{}
+	seenByVenue := map[market.Venue]map[string]bool{}
+	for _, opportunity := range opportunities {
+		v := opportunity.EffectiveVenue()
+		item := markets[marketKey(v, opportunity.MarketID)]
+		if len(item.Tags) > 0 || item.EventID == "" {
+			continue
 		}
-		if len(eventIDs) > 0 {
-			if tags, err := provider.EventTags(ctx, eventIDs); err == nil {
-				tagsByEvent = tags
-			}
+		if seenByVenue[v] == nil {
+			seenByVenue[v] = map[string]bool{}
+		}
+		if seenByVenue[v][item.EventID] {
+			continue
+		}
+		seenByVenue[v][item.EventID] = true
+		eventIDsByVenue[v] = append(eventIDsByVenue[v], item.EventID)
+	}
+	tagsByVenue := map[market.Venue]map[string][]market.Tag{}
+	for v, eventIDs := range eventIDsByVenue {
+		provider, ok := e.data(v).(market.EventTagProvider)
+		if !ok || provider == nil || len(eventIDs) == 0 {
+			continue
+		}
+		if tags, err := provider.EventTags(ctx, eventIDs); err == nil {
+			tagsByVenue[v] = tags
 		}
 	}
 
 	filtered := make([]Opportunity, 0, len(opportunities))
 	for _, opportunity := range opportunities {
-		item := markets[opportunity.MarketID]
+		v := opportunity.EffectiveVenue()
+		item := markets[marketKey(v, opportunity.MarketID)]
 		tags := item.Tags
 		if len(tags) == 0 {
-			tags = tagsByEvent[item.EventID]
+			tags = tagsByVenue[v][item.EventID]
 		}
 		classification := market.Classify(item, tags)
 		opportunity.Category = string(classification.Category)
@@ -69,7 +78,7 @@ func sportsPolicyExcludes(classification market.Classification, policy string) b
 func (e *Engine) classifyMarket(ctx context.Context, item market.Market) market.Classification {
 	tags := item.Tags
 	if len(tags) == 0 {
-		if provider, ok := e.provider.(market.EventTagProvider); ok && item.EventID != "" {
+		if provider, ok := e.data(item.EffectiveVenue()).(market.EventTagProvider); ok && item.EventID != "" {
 			if byEvent, err := provider.EventTags(ctx, []string{item.EventID}); err == nil {
 				tags = byEvent[item.EventID]
 			}

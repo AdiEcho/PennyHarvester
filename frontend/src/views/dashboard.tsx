@@ -32,27 +32,34 @@ import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import type { AccountMode, EquityPoint, Metrics } from '@/types'
-import { formatAxisDate, formatAxisCurrency, formatCurrency, formatDate, formatFullDate, formatNumber, formatPercent, pnlClass } from '@/lib/format'
+import { formatAxisDate, formatDate, formatFullDate, formatNumber, formatPercent, pnlClass } from '@/lib/format'
+import { fmtMoney, fmtMoneyAxis, venueMeta, venueOf, type Venue } from '@/lib/venue'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { EmptyState, ErrorState, Skeleton } from '@/components/ui/feedback'
 import { InlineError, PageHeader } from '@/components/page-header'
-import { OrderModeBadge, OrderStatusBadge } from '@/components/status-badges'
+import { OrderModeBadge, OrderStatusBadge, VenueChip } from '@/components/status-badges'
+import { orderTypeLabel } from '@/views/orders'
 
-function StatCard({ label, value, detail, icon: Icon, accent, loading }: {
+function StatCard({ label, value, detail, icon: Icon, venue, accent, loading }: {
   label: string
   value: string
   detail: React.ReactNode
   icon: LucideIcon
+  /** Metrics are always per account, and an account belongs to one venue. */
+  venue: Venue
   accent?: boolean
   loading: boolean
 }) {
   return (
     <Card className="relative overflow-hidden p-5">
       <div className="flex items-start justify-between gap-3">
-        <p className="text-sm font-medium text-slate-500">{label}</p>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <p className="text-sm font-medium text-slate-500">{label}</p>
+          <VenueChip venue={venue} />
+        </div>
         <div className={cn('rounded-xl p-2', accent ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500')}>
           <Icon className="h-[18px] w-[18px]" strokeWidth={1.8} />
         </div>
@@ -63,7 +70,7 @@ function StatCard({ label, value, detail, icon: Icon, accent, loading }: {
   )
 }
 
-function EquityTooltip({ active, payload, mode }: { active?: boolean; payload?: Array<{ payload: EquityPoint }>; mode: AccountMode }) {
+function EquityTooltip({ active, payload, mode, venue }: { active?: boolean; payload?: Array<{ payload: EquityPoint }>; mode: AccountMode; venue: Venue }) {
   if (!active || !payload?.length) return null
   const point = payload[0].payload
   return (
@@ -71,22 +78,23 @@ function EquityTooltip({ active, payload, mode }: { active?: boolean; payload?: 
       <p className="text-xs text-slate-500">{formatFullDate(point.time)}</p>
       <div className="mt-2 flex items-center justify-between gap-5">
         <span className="flex items-center gap-2 text-xs text-slate-500"><span className="h-0.5 w-4 rounded bg-[var(--series-equity)]" />{mode === 'live' ? '实盘权益' : '模拟权益'}</span>
-        <span className="text-sm font-semibold text-slate-900">{formatCurrency(point.value)}</span>
+        <span className="text-sm font-semibold text-slate-900">{fmtMoney(point.value, point.venue ?? venue)}</span>
       </div>
     </div>
   )
 }
 
-function EquityChart({ data, refreshing, mode }: { data: EquityPoint[]; refreshing: boolean; mode: AccountMode }) {
+function EquityChart({ data, refreshing, mode, venue }: { data: EquityPoint[]; refreshing: boolean; mode: AccountMode; venue: Venue }) {
   const [view, setView] = useState<'chart' | 'table'>('chart')
   const label = mode === 'live' ? '实盘权益' : '模拟权益'
+  const meta = venueMeta(venue)
 
   return (
     <Card className="min-w-0 xl:col-span-2">
       <CardHeader className="flex-col gap-4 space-y-0 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <CardTitle>权益曲线</CardTitle>
-          <CardDescription className="mt-1">{label} · USD · {data.length} 个记录点</CardDescription>
+          <div className="flex flex-wrap items-center gap-2"><CardTitle>权益曲线</CardTitle><VenueChip venue={venue} /></div>
+          <CardDescription className="mt-1">{meta.label} · {label} · {meta.currency} · {data.length} 个记录点</CardDescription>
         </div>
         <div className="flex shrink-0 self-start rounded-lg border border-slate-200 bg-slate-50 p-1" aria-label="权益数据展示方式">
           <button className={cn('flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-xs transition', view === 'chart' ? 'bg-surface font-medium text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800')} onClick={() => setView('chart')} aria-pressed={view === 'chart'}>
@@ -103,19 +111,19 @@ function EquityChart({ data, refreshing, mode }: { data: EquityPoint[]; refreshi
         ) : view === 'table' ? (
           <div className="scrollbar-thin max-h-[310px] overflow-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-sm">
-              <caption className="sr-only">{label}历史数据</caption>
+              <caption className="sr-only">{label}历史数据（{meta.currency}）</caption>
               <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
-                <tr><th className="px-4 py-3 font-medium">记录时间</th><th className="px-4 py-3 text-right font-medium">{label}</th></tr>
+                <tr><th className="px-4 py-3 font-medium">记录时间</th><th className="px-4 py-3 text-right font-medium">{label}（{meta.currency}）</th></tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {[...data].reverse().map((point, index) => (
-                  <tr key={`${point.time}-${index}`}><td className="px-4 py-3 text-slate-600">{formatFullDate(point.time)}</td><td className="px-4 py-3 text-right font-medium tabular-nums text-slate-900">{formatCurrency(point.value)}</td></tr>
+                  <tr key={`${point.time}-${index}`}><td className="px-4 py-3 text-slate-600">{formatFullDate(point.time)}</td><td className="px-4 py-3 text-right font-medium tabular-nums text-slate-900">{fmtMoney(point.value, point.venue ?? venue)}</td></tr>
                 ))}
               </tbody>
             </table>
           </div>
         ) : (
-          <div className={cn('h-[310px] w-full transition-opacity', refreshing && 'opacity-60')} role="img" aria-label={`${label}随时间变化的折线图；也可切换为数据表查看`}>
+          <div className={cn('h-[310px] w-full transition-opacity', refreshing && 'opacity-60')} role="img" aria-label={`${meta.label}${label}（${meta.currency}）随时间变化的折线图；也可切换为数据表查看`}>
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={data} margin={{ top: 12, right: 8, left: 0, bottom: 0 }}>
                 <defs>
@@ -126,8 +134,8 @@ function EquityChart({ data, refreshing, mode }: { data: EquityPoint[]; refreshi
                 </defs>
                 <CartesianGrid vertical={false} stroke="var(--chart-grid)" strokeWidth={1} />
                 <XAxis dataKey="time" tickFormatter={formatAxisDate} tickLine={false} axisLine={false} minTickGap={42} tickMargin={12} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
-                <YAxis tickFormatter={formatAxisCurrency} tickLine={false} axisLine={false} width={82} tickCount={5} domain={['auto', 'auto']} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
-                <Tooltip content={<EquityTooltip mode={mode} />} cursor={{ stroke: 'var(--chart-muted)', strokeWidth: 1 }} isAnimationActive={false} />
+                <YAxis tickFormatter={fmtMoneyAxis} tickLine={false} axisLine={false} width={82} tickCount={5} domain={['auto', 'auto']} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
+                <Tooltip content={<EquityTooltip mode={mode} venue={venue} />} cursor={{ stroke: 'var(--chart-muted)', strokeWidth: 1 }} isAnimationActive={false} />
                 <Area type="monotone" dataKey="value" stroke="none" fill="url(#equityArea)" isAnimationActive={false} />
                 <Line type="monotone" dataKey="value" name={label} stroke="var(--series-equity)" strokeWidth={2} dot={data.length === 1 ? { r: 4, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 } : false} activeDot={{ r: 5, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 }} isAnimationActive={false} />
               </ComposedChart>
@@ -141,36 +149,44 @@ function EquityChart({ data, refreshing, mode }: { data: EquityPoint[]; refreshi
 
 function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: boolean }) {
   const isLive = metrics?.mode === 'live'
+  // An account belongs to exactly one venue, so these numbers are never a
+  // cross-venue sum; the venue chip keeps the currency unambiguous.
+  const venue = venueOf(metrics)
+  const meta = venueMeta(venue)
   return (
     <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
       <StatCard
         label={isLive ? '实盘账户权益' : '模拟账户权益'}
-        value={metrics ? formatCurrency(metrics.equity) : '—'}
+        value={metrics ? fmtMoney(metrics.equity, venue) : '—'}
         icon={CircleDollarSign}
+        venue={venue}
         accent
         loading={loading}
         detail={metrics ? <span className={cn('inline-flex items-center gap-1 font-medium', pnlClass(metrics.total_return))}>{metrics.total_return >= 0 ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}{formatPercent(metrics.total_return, 2, true)} <span className="font-normal text-slate-400">较{isLive ? '初始基准' : '初始本金'}</span></span> : '正在加载账户数据'}
       />
       <StatCard
         label={isLive ? '策略可用资金' : '可用虚拟资金'}
-        value={metrics ? formatCurrency(metrics.cash) : '—'}
+        value={metrics ? fmtMoney(metrics.cash, venue) : '—'}
         icon={Wallet}
+        venue={venue}
         loading={loading}
         detail={metrics ? (isLive
-          ? <span>钱包 pUSD <span className="font-medium tabular-nums text-slate-700">{formatCurrency(metrics.wallet_cash)}</span>{metrics.wallet_cash_stale && <span className="text-amber-600"> · 暂显上次余额</span>}</span>
-          : `初始本金 ${formatCurrency(metrics.initial_bankroll)}`) : '正在加载账户数据'}
+          ? <span>钱包 {meta.collateral} <span className="font-medium tabular-nums text-slate-700">{fmtMoney(metrics.wallet_cash, venue)}</span>{metrics.wallet_cash_stale && <span className="text-amber-600"> · 暂显上次余额</span>}</span>
+          : `初始本金 ${fmtMoney(metrics.initial_bankroll, venue)}`) : '正在加载账户数据'}
       />
       <StatCard
         label="累计盈亏"
-        value={metrics ? formatCurrency(metrics.total_pnl, true) : '—'}
+        value={metrics ? fmtMoney(metrics.total_pnl, venue, { signed: true }) : '—'}
         icon={Banknote}
+        venue={venue}
         loading={loading}
-        detail={metrics ? <span>已实现 <span className={pnlClass(metrics.realized_pnl)}>{formatCurrency(metrics.realized_pnl, true)}</span> · 浮动 <span className={pnlClass(metrics.unrealized_pnl)}>{formatCurrency(metrics.unrealized_pnl, true)}</span> · 手续费 <span className="font-medium tabular-nums text-slate-700">{formatCurrency(metrics.fees_paid)}</span></span> : '正在加载账户数据'}
+        detail={metrics ? <span>已实现 <span className={pnlClass(metrics.realized_pnl)}>{fmtMoney(metrics.realized_pnl, venue, { signed: true })}</span> · 浮动 <span className={pnlClass(metrics.unrealized_pnl)}>{fmtMoney(metrics.unrealized_pnl, venue, { signed: true })}</span> · 手续费 <span className="font-medium tabular-nums text-slate-700">{fmtMoney(metrics.fees_paid, venue)}</span></span> : '正在加载账户数据'}
       />
       <StatCard
         label="当前持仓投入"
-        value={metrics ? formatCurrency(metrics.open_exposure) : '—'}
+        value={metrics ? fmtMoney(metrics.open_exposure, venue) : '—'}
         icon={Layers3}
+        venue={venue}
         loading={loading}
         detail={metrics ? `${formatNumber(metrics.open_positions, 0)} 个持有中仓位` : '正在加载账户数据'}
       />
@@ -181,13 +197,15 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
 export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
   const { account, accountId, isLoading: accountLoading } = useAccount()
   const fetchDashboard = useCallback((signal: AbortSignal) => api.dashboard(accountId, signal), [accountId])
-  const fetchOrders = useCallback((signal: AbortSignal) => api.orders(accountId, 'all', 6, 0, signal), [accountId])
+  const fetchOrders = useCallback((signal: AbortSignal) => api.orders(accountId, 'all', 6, 0, null, signal), [accountId])
   const dashboard = usePolling(fetchDashboard, { enabled: Boolean(accountId) })
   const orders = usePolling(fetchOrders, { enabled: Boolean(accountId) })
   const data = dashboard.data
   const mode: AccountMode = account?.mode || 'paper'
   const isLive = mode === 'live'
   const loading = accountLoading || (Boolean(accountId) && dashboard.isLoading)
+  const venue = venueOf(data?.account ?? account)
+  const meta = venueMeta(venue)
 
   return (
     <>
@@ -195,7 +213,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
         eyebrow={isLive ? 'LIVE PORTFOLIO' : 'PAPER PORTFOLIO'}
         title={`${account?.name || '账户'}总览`}
         description={isLive
-          ? '实时掌握实盘资金、持仓盈亏与系统状态。当前账户的买单会直接通过真实钱包提交到 Polymarket。'
+          ? `实时掌握实盘资金、持仓盈亏与系统状态。当前账户的买单会直接通过真实钱包提交到 ${meta.label}，并以 ${meta.currency} 结算。`
           : '使用独立虚拟资金同步真实行情，零成本验证策略表现，不会发出任何真实订单。'}
         actions={<Button variant="secondary" onClick={() => { dashboard.refresh(); orders.refresh() }} disabled={dashboard.isRefreshing}><RefreshCw className={cn('h-4 w-4', dashboard.isRefreshing && 'animate-spin')} />刷新数据</Button>}
       />
@@ -205,11 +223,11 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
       <MetricsCards metrics={data?.metrics || null} loading={loading} />
 
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
-        {loading ? <Card className="xl:col-span-2"><div className="p-6"><Skeleton className="h-5 w-32" /><Skeleton className="mt-8 h-[260px] w-full" /></div></Card> : data ? <EquityChart data={data.equity} refreshing={dashboard.isRefreshing} mode={mode} /> : <Card className="xl:col-span-2"><ErrorState message={dashboard.error || '暂无总览数据。'} onRetry={dashboard.refresh} /></Card>}
+        {loading ? <Card className="xl:col-span-2"><div className="p-6"><Skeleton className="h-5 w-32" /><Skeleton className="mt-8 h-[260px] w-full" /></div></Card> : data ? <EquityChart data={data.equity} refreshing={dashboard.isRefreshing} mode={mode} venue={venue} /> : <Card className="xl:col-span-2"><ErrorState message={dashboard.error || '暂无总览数据。'} onRetry={dashboard.refresh} /></Card>}
 
         <Card>
           <CardHeader className="flex-row items-start justify-between space-y-0">
-            <div><CardTitle>系统状态</CardTitle><CardDescription className="mt-1">后台自动扫描与行情连接情况</CardDescription></div>
+            <div><div className="flex flex-wrap items-center gap-2"><CardTitle>系统状态</CardTitle><VenueChip venue={venue} /></div><CardDescription className="mt-1">后台自动扫描与行情连接情况</CardDescription></div>
             {data && <Badge variant={data.engine.running ? 'success' : 'default'}><span className={cn('h-1.5 w-1.5 rounded-full', data.engine.running ? 'bg-emerald-500' : 'bg-slate-400')} />{data.engine.running ? '运行中' : '已暂停'}</Badge>}
           </CardHeader>
           <CardContent>
@@ -222,7 +240,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
                 </div>
                 <div className="flex items-center gap-3 rounded-xl p-3.5">
                   <div className={cn('rounded-lg p-2', isLive ? 'bg-amber-50 text-amber-700' : 'bg-blue-50 text-blue-600')}>{isLive ? <Radio className="h-4 w-4" /> : <Database className="h-4 w-4" />}</div>
-                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">{isLive ? '实盘钱包' : '当前账户'}</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.account.live_maker || data.account.live_signer || undefined}>{isLive ? (data.account.live_ready ? (data.account.live_maker || data.account.live_signer || '已就绪') : data.account.live_configured ? '配置待完善' : '尚未配置私钥') : data.account.name}</p></div>
+                  <div className="min-w-0 flex-1"><p className="text-xs text-slate-500">{isLive ? `${meta.label} 实盘钱包` : '当前账户'}</p><p className="mt-0.5 truncate text-sm font-medium text-slate-800" title={data.account.live_maker || data.account.live_signer || undefined}>{isLive ? (data.account.live_ready ? (data.account.live_maker || data.account.live_signer || '已就绪') : data.account.live_configured ? '配置待完善' : '尚未配置私钥') : data.account.name}</p></div>
                   {isLive && <Badge variant={data.account.live_ready ? 'success' : data.account.live_configured ? 'warning' : 'danger'}>{data.account.live_ready ? '已就绪' : data.account.live_configured ? '待完善' : '未配置'}</Badge>}
                 </div>
                 <div className="flex items-center gap-3 rounded-xl p-3.5">
@@ -237,7 +255,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
                 {isLive && !data.account.live_ready && (
                   <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
                     <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>{data.account.live_configured ? <>实盘配置待完善：{data.account.live_error || '请检查钱包、Funder 与 API 凭据设置。'}</> : <>实盘尚未配置：在「系统设置 → 实盘交易凭据」中填写私钥，或设置 <code className="rounded bg-amber-100 px-1">POLYMARKET_PRIVATE_KEY</code> 后重启服务。</>}</span>
+                    <span>{data.account.live_configured ? <>实盘配置待完善：{data.account.live_error || '请检查钱包、Funder 与 API 凭据设置。'}</> : <>实盘尚未配置：在「系统设置 → 实盘交易凭据」中填写 {meta.label} 私钥，或设置 <code className="rounded bg-amber-100 px-1">{meta.envHint}</code> 后重启服务。</>}</span>
                   </div>
                 )}
                 {data.account.live_error && data.account.live_ready && <div className="mt-4 break-words rounded-lg border border-rose-100 bg-rose-50 p-3 text-xs leading-5 text-rose-700"><span className="font-medium">实盘错误：</span>{data.account.live_error}</div>}
@@ -250,7 +268,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
 
       <Card className="mt-4 overflow-hidden">
         <CardHeader className="flex-row items-center justify-between space-y-0">
-          <div><CardTitle>最近订单</CardTitle><CardDescription className="mt-1">{isLive ? '最近的实盘买入与到期结算动态' : '最近的模拟买入与到期结算动态'}</CardDescription></div>
+          <div><CardTitle>最近订单</CardTitle><CardDescription className="mt-1">{isLive ? '最近的实盘买入、卖出与到期结算动态' : '最近的模拟买入、卖出与到期结算动态'}</CardDescription></div>
           <Button variant="ghost" size="sm" onClick={onOpenOrders}>查看全部<ChevronRight className="h-3.5 w-3.5" /></Button>
         </CardHeader>
         {orders.isLoading ? <div className="space-y-3 px-6 pb-6">{[1, 2, 3].map((item) => <Skeleton key={item} className="h-12 w-full" />)}</div> : orders.error && !orders.data ? <ErrorState compact message={orders.error} onRetry={orders.refresh} /> : !orders.data?.items.length ? <EmptyState compact title="还没有交易记录" description={isLive ? '去「机会雷达」挑选市场下单，或开启自动交易后，订单记录就会显示在这里。' : '去「机会雷达」试下一笔模拟单，或开启自动交易后，订单记录就会显示在这里。'} /> : (
@@ -259,12 +277,18 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
               <table className="w-full min-w-[720px] text-left text-sm">
                 <thead className="border-y border-slate-100 bg-slate-50/70 text-xs text-slate-500"><tr><th className="px-6 py-3 font-medium">市场 / 方向</th><th className="px-4 py-3 font-medium">类型</th><th className="px-4 py-3 text-right font-medium">金额</th><th className="px-4 py-3 font-medium">状态</th><th className="px-6 py-3 text-right font-medium">时间</th></tr></thead>
                 <tbody className="divide-y divide-slate-100">
-                  {orders.data.items.map((order) => <tr key={order.id} className="hover:bg-slate-50/60"><td className="max-w-[340px] px-6 py-3.5"><p className="truncate font-medium text-slate-800" title={order.question}>{order.question}</p><p className="mt-1 text-xs text-slate-500">{order.outcome} · {order.type === 'buy' ? (isLive ? '实盘买入' : '模拟买入') : '结算'}</p></td><td className="px-4 py-3.5"><OrderModeBadge mode={mode} kind={order.kind} /></td><td className="px-4 py-3.5 text-right font-medium tabular-nums text-slate-800">{formatCurrency(order.amount)}</td><td className="px-4 py-3.5"><OrderStatusBadge status={order.status} /></td><td className="px-6 py-3.5 text-right text-xs text-slate-500">{formatDate(order.created_at)}</td></tr>)}
+                  {orders.data.items.map((order) => {
+                    const orderVenue = venueOf(order)
+                    return <tr key={order.id} className="hover:bg-slate-50/60"><td className="max-w-[340px] px-6 py-3.5"><p className="truncate font-medium text-slate-800" title={order.question}>{order.question}</p><p className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-500"><VenueChip venue={orderVenue} />{order.outcome} · {orderTypeLabel(order, isLive)}</p></td><td className="px-4 py-3.5"><OrderModeBadge mode={mode} kind={order.action === 'stop' ? 'stop' : order.kind} /></td><td className="px-4 py-3.5 text-right font-medium tabular-nums text-slate-800">{fmtMoney(order.amount, orderVenue)}</td><td className="px-4 py-3.5"><OrderStatusBadge status={order.status} /></td><td className="px-6 py-3.5 text-right text-xs text-slate-500">{formatDate(order.created_at)}</td></tr>
+                  })}
                 </tbody>
               </table>
             </div>
             <div className="divide-y divide-slate-100 sm:hidden">
-              {orders.data.items.map((order) => <div key={order.id} className="px-5 py-4"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="line-clamp-2 text-sm font-medium leading-5 text-slate-800">{order.question}</p><p className="mt-1 text-xs text-slate-500">{order.outcome} · {order.type === 'buy' ? (isLive ? '实盘买入' : '模拟买入') : '结算'}</p></div><span className="shrink-0 text-sm font-semibold tabular-nums text-slate-800">{formatCurrency(order.amount)}</span></div><div className="mt-3 flex flex-wrap items-center gap-2"><OrderModeBadge mode={mode} kind={order.kind} /><OrderStatusBadge status={order.status} /><span className="ml-auto text-[11px] text-slate-400">{formatDate(order.created_at)}</span></div></div>)}
+              {orders.data.items.map((order) => {
+                const orderVenue = venueOf(order)
+                return <div key={order.id} className="px-5 py-4"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="line-clamp-2 text-sm font-medium leading-5 text-slate-800">{order.question}</p><p className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-500"><VenueChip venue={orderVenue} />{order.outcome} · {orderTypeLabel(order, isLive)}</p></div><span className="shrink-0 text-sm font-semibold tabular-nums text-slate-800">{fmtMoney(order.amount, orderVenue)}</span></div><div className="mt-3 flex flex-wrap items-center gap-2"><OrderModeBadge mode={mode} kind={order.action === 'stop' ? 'stop' : order.kind} /><OrderStatusBadge status={order.status} /><span className="ml-auto text-[11px] text-slate-400">{formatDate(order.created_at)}</span></div></div>
+              })}
             </div>
           </>
         )}

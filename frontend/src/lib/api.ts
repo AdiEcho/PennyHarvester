@@ -22,6 +22,11 @@ import type {
   RelayerProbeResult,
   Settings,
   SystemSettings,
+  Venue,
+  VenuesResponse,
+  VenueLiveSettings,
+  VenueSystemPatch,
+  VenueApprovalResponse,
 } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api/v1'
@@ -84,10 +89,18 @@ function withAccount(path: string, accountId?: number): string {
   return `${path}${path.includes('?') ? '&' : '?'}account_id=${accountId}`
 }
 
+// A venue filter is only appended when one is selected. The UI's "all" scope
+// maps to null, so the request stays untouched and the backend returns both
+// venues; the literal "all" is never sent as a venue value.
+function withVenue(path: string, venue?: Venue | null): string {
+  if (!venue) return path
+  return `${path}${path.includes('?') ? '&' : '?'}venue=${encodeURIComponent(venue)}`
+}
+
 export const api = {
   health: (signal?: AbortSignal) => request<Health>('/health', { signal }),
   accounts: (signal?: AbortSignal) => request<AccountsResponse>('/accounts', { signal }),
-  createAccount: (body: { name: string; mode: AccountMode }, signal?: AbortSignal) =>
+  createAccount: (body: { name: string; mode: AccountMode; venue?: Venue }, signal?: AbortSignal) =>
     request<Account>('/accounts', { method: 'POST', body, signal }),
   updateAccount: (id: number, body: { name?: string; auto_trade?: boolean; is_default?: boolean }, signal?: AbortSignal) =>
     request<Account>(`/accounts/${id}`, { method: 'PATCH', body, signal }),
@@ -95,22 +108,35 @@ export const api = {
     request<void>(`/accounts/${id}`, { method: 'DELETE', signal }),
   dashboard: (accountId: number | undefined, signal?: AbortSignal) =>
     request<Dashboard>(withAccount('/dashboard', accountId), { signal }),
-  opportunities: (signal?: AbortSignal) => request<OpportunitiesResponse>('/opportunities', { signal }),
-  quoteOpportunity: (tokenId: string, amount?: number, signal?: AbortSignal) =>
+  getVenues: (signal?: AbortSignal) =>
+    request<VenuesResponse>('/venues', { signal }).then((response) => response?.venues ?? []),
+  opportunities: (venue?: Venue | null, signal?: AbortSignal) =>
+    request<OpportunitiesResponse>(withVenue('/opportunities', venue), { signal }),
+  quoteOpportunity: (tokenId: string, amount?: number, venue?: Venue | null, signal?: AbortSignal) =>
     request<OpportunityQuote>('/opportunities/quote', {
       method: 'POST',
-      body: amount && amount > 0 ? { token_id: tokenId, amount } : { token_id: tokenId },
+      body: {
+        token_id: tokenId,
+        ...(amount && amount > 0 ? { amount } : {}),
+        // Token ids are venue-local, so the quote must resolve inside one venue.
+        ...(venue ? { venue } : {}),
+      },
       signal,
     }),
-  positions: (accountId: number | undefined, status: PositionStatus | 'all', signal?: AbortSignal) =>
-    request<PositionsResponse>(withAccount(`/positions?status=${status}`, accountId), { signal }),
+  positions: (
+    accountId: number | undefined,
+    status: PositionStatus | 'all',
+    venue?: Venue | null,
+    signal?: AbortSignal,
+  ) => request<PositionsResponse>(withVenue(withAccount(`/positions?status=${status}`, accountId), venue), { signal }),
   orders: (
     accountId: number | undefined,
     status: OrderStatusFilter = 'all',
     limit = 100,
     offset = 0,
+    venue?: Venue | null,
     signal?: AbortSignal,
-  ) => request<OrdersResponse>(withAccount(`/orders?status=${status}&limit=${limit}&offset=${offset}`, accountId), { signal }),
+  ) => request<OrdersResponse>(withVenue(withAccount(`/orders?status=${status}&limit=${limit}&offset=${offset}`, accountId), venue), { signal }),
   settings: (signal?: AbortSignal) => request<Settings>('/settings', { signal }),
   updateSettings: (settings: Settings, signal?: AbortSignal) =>
     request<Settings>('/settings', { method: 'PUT', body: settings, signal }),
@@ -124,25 +150,40 @@ export const api = {
     request<void>('/auth/password/disable', { method: 'POST', body: { current_password: currentPassword }, signal }),
   system: (signal?: AbortSignal) => request<SystemSettings>('/system', { signal }),
   updateSystem: (
-    body: { proxy?: ProxyConfig; data_source?: DataSourceSettings; live?: LiveSettings },
+    body: {
+      proxy?: ProxyConfig
+      data_source?: DataSourceSettings
+      live?: LiveSettings
+      venues?: VenueSystemPatch
+    },
     signal?: AbortSignal,
   ) => request<SystemSettings>('/system', { method: 'PUT', body, signal }),
   testProxy: (proxy: ProxyConfig, signal?: AbortSignal) =>
     request<ProxyTestResult>('/system/proxy/test', { method: 'POST', body: { proxy }, signal }),
-  testLive: (live: LiveSettings, clobBaseURL: string, signal?: AbortSignal) =>
-    request<LiveProbeResult>('/system/live/test', {
+  testLive: (live: LiveSettings | VenueLiveSettings, clobBaseURL: string, venue?: Venue | null, signal?: AbortSignal) =>
+    request<LiveProbeResult>(withVenue('/system/live/test', venue), {
       method: 'POST',
       body: { live, clob_base_url: clobBaseURL },
       signal,
     }),
+  /** 只读读取链上授权状态（不发交易）。 */
+  getVenueApproval: (venue: Venue, signal?: AbortSignal) =>
+    request<VenueApprovalResponse>(withVenue('/system/live/approval', venue), { signal }),
+  /**
+   * 发送缺失的授权交易。这是真的链上交易：钱包需要 BNB 支付 gas，
+   * 因此只在用户显式点击时调用。
+   */
+  approveVenue: (venue: Venue, signal?: AbortSignal) =>
+    request<VenueApprovalResponse>(withVenue('/system/live/approve', venue), { method: 'POST', signal }),
   testRelayer: (
-    live: LiveSettings,
+    live: LiveSettings | VenueLiveSettings,
     clobBaseURL: string,
     relayerAPIKey: string,
     relayerAddress: string,
+    venue?: Venue | null,
     signal?: AbortSignal,
   ) =>
-    request<RelayerProbeResult>('/system/relayer/test', {
+    request<RelayerProbeResult>(withVenue('/system/relayer/test', venue), {
       method: 'POST',
       body: {
         live,
@@ -160,10 +201,11 @@ export const api = {
     }),
   toggleEngine: (running: boolean, signal?: AbortSignal) =>
     request<Engine>('/engine/toggle', { method: 'POST', body: { running }, signal }),
-  scan: (signal?: AbortSignal, execute = false, accountId?: number) => {
+  scan: (signal?: AbortSignal, execute = false, accountId?: number, venue?: Venue | null) => {
     const params = new URLSearchParams()
     if (execute) params.set('execute', 'true')
     if (accountId) params.set('account_id', String(accountId))
+    if (venue) params.set('venue', venue)
     const query = params.toString()
     return request<OpportunitiesResponse>(`/scan${query ? `?${query}` : ''}`, { method: 'POST', signal })
   },

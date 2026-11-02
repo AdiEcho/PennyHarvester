@@ -20,8 +20,10 @@ import {
 import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
-import type { Opportunity, OpportunityQuote, Position } from '@/types'
-import { formatCompactCurrency, formatCurrency, formatFullDate, formatNumber, formatPercent, formatPrice, formatPriceChange } from '@/lib/format'
+import { useVenues } from '@/hooks/useVenues'
+import type { Opportunity, OpportunityQuote, Position, Settings } from '@/types'
+import { formatFullDate, formatNumber, formatPercent, formatPrice, formatPriceChange } from '@/lib/format'
+import { currencyOf, fmtMoney, protocolVersionOf, venueMeta, venueOf, venueOrderSize, VENUES, type Venue } from '@/lib/venue'
 import { categoryCounts, categoryFilters, categoryLabel, matchesCategory, normalizeCategoryFilter, type CategoryFilter } from '@/lib/category'
 import { marketOutcome, marketQuestion, marketURL, persistMarketLanguage, readMarketLanguage, type MarketLanguage } from '@/lib/market-language'
 import { cn } from '@/lib/utils'
@@ -35,11 +37,13 @@ import { Input } from '@/components/ui/input'
 import { InlineError, PageHeader } from '@/components/page-header'
 import { MarketLanguageSelect } from '@/components/market-language-select'
 import { RiskNotice } from '@/components/risk-notice'
+import { VenueChip } from '@/components/status-badges'
+import { VenueFilter, useVenueScope, type VenueScope } from '@/components/venue-filter'
 
 function MarketLink({ url, compact = false }: { url: string; compact?: boolean }) {
   if (!/^https?:\/\//i.test(url)) return null
   return (
-    <a href={url} target="_blank" rel="noreferrer" className={cn('inline-flex items-center justify-center gap-1.5 rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600', compact ? 'h-8 w-8' : 'px-2 py-1.5 text-xs')} aria-label="在新窗口打开 Polymarket 市场" title="查看公开市场">
+    <a href={url} target="_blank" rel="noreferrer" className={cn('inline-flex items-center justify-center gap-1.5 rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600', compact ? 'h-8 w-8' : 'px-2 py-1.5 text-xs')} aria-label="在新窗口打开市场" title="查看公开市场">
       <ExternalLink className="h-3.5 w-3.5" />{!compact && '市场'}
     </a>
   )
@@ -56,25 +60,36 @@ interface HeldPosition {
   cost: number
   entryPrice: number
   count: number
+  venue: Venue
+}
+
+// Both venues identify outcomes with decimal ERC-1155 ids, and the id spaces
+// overlap: a Polymarket position must never light up a Predict.fun row. Every
+// token-keyed map is therefore keyed by `${venue}:${token_id}`.
+function tokenKey(value: { venue?: string; token_id: string }): string {
+  return `${venueOf(value)}:${value.token_id}`
 }
 
 // The radar marks markets this account already holds. Manual and automatic
 // fills can land on the same token more than once, so the marker shows the
 // share-weighted entry price instead of whichever fill came last.
 function heldPositionsByToken(positions: Position[]): Map<string, HeldPosition> {
-  const groups = new Map<string, { shares: number; cost: number; entryValue: number; count: number }>()
+  const groups = new Map<string, { venue: Venue; shares: number; cost: number; entryValue: number; count: number }>()
   for (const position of positions) {
     if (position.status !== 'open' || !(position.shares > 0)) continue
-    const group = groups.get(position.token_id) || { shares: 0, cost: 0, entryValue: 0, count: 0 }
+    const venue = venueOf(position)
+    const key = tokenKey({ venue, token_id: position.token_id })
+    const group = groups.get(key) || { venue, shares: 0, cost: 0, entryValue: 0, count: 0 }
     group.shares += position.shares
     group.cost += position.cost
     group.entryValue += position.entry_price * position.shares
     group.count += 1
-    groups.set(position.token_id, group)
+    groups.set(key, group)
   }
   const result = new Map<string, HeldPosition>()
-  groups.forEach((group, tokenId) => {
-    result.set(tokenId, {
+  groups.forEach((group, key) => {
+    result.set(key, {
+      venue: group.venue,
       shares: group.shares,
       cost: group.cost,
       entryPrice: group.entryValue / group.shares,
@@ -85,7 +100,7 @@ function heldPositionsByToken(positions: Position[]): Map<string, HeldPosition> 
 }
 
 function heldTitle(held: HeldPosition) {
-  return `已买入 ${formatNumber(held.shares, 4)} 份 · 成本 ${formatCurrency(held.cost)}${held.count > 1 ? ` · 共 ${held.count} 笔` : ''}`
+  return `已买入 ${formatNumber(held.shares, 4)} 份 · 成本 ${fmtMoney(held.cost, held.venue)}${held.count > 1 ? ` · 共 ${held.count} 笔` : ''}`
 }
 
 function HeldBadge({ held, className }: { held?: HeldPosition; className?: string }) {
@@ -113,15 +128,16 @@ function quoteAge(quotedAt: string) {
   return `${Math.floor(minutes / 60)} 小时前`
 }
 
-function RealYield({ state, onQuote }: { state?: QuoteState; onQuote: () => void }) {
+function RealYield({ state, venue, onQuote }: { state?: QuoteState; venue: Venue; onQuote: () => void }) {
   const quote = state?.quote
+  const meta = venueMeta(venue)
   if (state?.loading && !quote) {
     return <span className="inline-flex items-center gap-1.5 text-xs text-slate-500"><RefreshCw className="h-3.5 w-3.5 animate-spin" />读取盘口…</span>
   }
   if (!quote) {
     return (
       <div className="flex flex-col items-end gap-1">
-        <Button variant="ghost" size="sm" onClick={onQuote} title="读取 Polymarket 实时订单簿与 FeeSchedule，按参数设置中的单笔金额估算"><Zap className="h-3.5 w-3.5" />获取真实收益</Button>
+        <Button variant="ghost" size="sm" onClick={onQuote} title={`读取 ${meta.label} 实时订单簿与 taker 手续费，按参数设置中的 ${meta.label} 单笔金额估算`}><Zap className="h-3.5 w-3.5" />获取真实收益</Button>
         {state?.error && <span className="line-clamp-2 max-w-[210px] text-right text-[11px] leading-4 text-rose-600" title={state.error}>{state.error}</span>}
       </div>
     )
@@ -129,15 +145,15 @@ function RealYield({ state, onQuote }: { state?: QuoteState; onQuote: () => void
   return (
     <div className="flex flex-col items-end gap-0.5 text-right">
       <span className={cn('font-semibold tabular-nums', quote.net_yield > 0 ? 'text-emerald-700' : 'text-rose-700')}>{formatPercent(quote.net_yield, 2, true)}</span>
-      <span className="text-[11px] tabular-nums text-slate-500" title={`限价 ${formatPrice(quote.limit_price)} · 盘口可用 ${formatCurrency(quote.available_notional)}`}>成交均价 {formatPrice(quote.fill_price)} · 费 {formatCurrency(quote.fee)}</span>
+      <span className="text-[11px] tabular-nums text-slate-500" title={`限价 ${formatPrice(quote.limit_price)} · 盘口可用 ${fmtMoney(quote.available_notional, venue)}`}>成交均价 {formatPrice(quote.fill_price)} · 费 {fmtMoney(quote.fee, venue)}</span>
       <span className="flex items-center gap-1 text-[11px] tabular-nums text-slate-400">
-        {formatCurrency(quote.amount)} · {quoteAge(quote.quoted_at)}
+        {fmtMoney(quote.amount, venue)} · {quoteAge(quote.quoted_at)}
         <button type="button" onClick={onQuote} disabled={state?.loading} className="rounded p-0.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50" title="重新读取真实盘口与手续费" aria-label="刷新真实收益">
           <RefreshCw className={cn('h-3 w-3', state?.loading && 'animate-spin')} />
         </button>
       </span>
       {quote.exceeds_max_price && <span className="text-[11px] leading-4 text-rose-600">超出最高买入价，实盘会拒单</span>}
-      {!quote.fully_filled && <span className="text-[11px] leading-4 text-amber-600">深度不足，仅可成交 {formatCompactCurrency(quote.available_notional)}</span>}
+      {!quote.fully_filled && <span className="text-[11px] leading-4 text-amber-600">深度不足，仅可成交 {fmtMoney(quote.available_notional, venue, { compact: true })}</span>}
       {state?.error && <span className="line-clamp-2 max-w-[210px] text-right text-[11px] leading-4 text-rose-600" title={state.error}>{state.error}</span>}
     </div>
   )
@@ -146,9 +162,9 @@ function RealYield({ state, onQuote }: { state?: QuoteState; onQuote: () => void
 // ProtocolBadge marks Polymarket Protocol V2 markets. They quote themselves
 // through positionIds and settle on ExchangeV3, which the live executor cannot
 // sign for yet, so a live order is refused with an explicit reason while paper
-// accounts still rehearse on them.
+// accounts still rehearse on them. Predict.fun has no protocol versions.
 function ProtocolBadge({ item }: { item: Opportunity }) {
-  if (item.version !== 'v2') return null
+  if (protocolVersionOf(item) !== 'v2') return null
   return (
     <Badge
       variant="danger"
@@ -159,12 +175,14 @@ function ProtocolBadge({ item }: { item: Opportunity }) {
   )
 }
 
-function OpportunityCard({ item, held, onBuy, onQuote, quote, orderSize, isLive, language }: { item: Opportunity; held?: HeldPosition; onBuy: (item: Opportunity) => void; onQuote: () => void; quote?: QuoteState; orderSize: number | null; isLive: boolean; language: MarketLanguage }) {
+function OpportunityCard({ item, held, onBuy, onQuote, quote, orderSize, isLive, liveReady, language }: { item: Opportunity; held?: HeldPosition; onBuy: (item: Opportunity) => void; onQuote: () => void; quote?: QuoteState; orderSize: number; isLive: boolean; liveReady: boolean; language: MarketLanguage }) {
+  const venue = venueOf(item)
+  const meta = venueMeta(venue)
   return (
     <Card className="p-4">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          <div className="mb-2 flex flex-wrap items-center gap-1.5"><Badge variant="info">{marketOutcome(item, language)}</Badge><Badge variant="default">{categoryLabel(item.category)}</Badge><HeldBadge held={held} />{item.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
+          <div className="mb-2 flex flex-wrap items-center gap-1.5"><VenueChip venue={venue} /><Badge variant="info">{marketOutcome(item, language)}</Badge><Badge variant="default">{categoryLabel(item.category)}</Badge><HeldBadge held={held} />{item.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">#{item.market_id.slice(0, 10)}</span></div>
           <h3 className="text-sm font-medium leading-6 text-slate-900">{marketQuestion(item, language)}</h3>
         </div>
         <MarketLink url={marketURL(item.url, language)} compact />
@@ -177,13 +195,13 @@ function OpportunityCard({ item, held, onBuy, onQuote, quote, orderSize, isLive,
       <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 p-3">
         <div>
           <p className="text-[11px] text-slate-500">真实收益（含手续费）</p>
-          <p className="text-[10px] text-slate-400">按单笔 {orderSize ? formatCurrency(orderSize) : '金额'} · 实时盘口 + FeeSchedule</p>
+          <p className="text-[10px] text-slate-400">按单笔 {orderSize > 0 ? fmtMoney(orderSize, venue) : '金额'} · {meta.label} 实时盘口</p>
         </div>
-        <RealYield state={quote} onQuote={onQuote} />
+        <RealYield state={quote} venue={venue} onQuote={onQuote} />
       </div>
       <div className="mt-3 flex items-center justify-between gap-3">
-        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-500"><span>流动性 {formatCompactCurrency(item.liquidity)}</span><span>{formatNumber(item.days_to_end, 1)} 天 · {formatFullDate(item.end_date)} 到期</span></div>
-        <Button size="sm" variant={isLive ? 'danger' : 'primary'} onClick={() => onBuy(item)}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button>
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-500"><span>流动性 {fmtMoney(item.liquidity, venue, { compact: true })}</span><span>{formatNumber(item.days_to_end, 1)} 天 · {formatFullDate(item.end_date)} 到期</span></div>
+        <Button size="sm" variant={isLive ? 'danger' : 'primary'} onClick={() => onBuy(item)} disabled={!liveReady} title={!liveReady ? `${meta.label} 实盘凭据未就绪` : undefined}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button>
       </div>
     </Card>
   )
@@ -192,7 +210,7 @@ function OpportunityCard({ item, held, onBuy, onQuote, quote, orderSize, isLive,
 export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => void }) {
   const { account, accountId } = useAccount()
   const isLive = account?.mode === 'live'
-  const liveReady = !isLive || Boolean(account?.live_ready)
+  const accountVenue = venueOf(account)
   const [query, setQuery] = useState('')
   const [marketLanguage, setMarketLanguage] = useState<MarketLanguage>(readMarketLanguage)
   const [category, setCategory] = useState<CategoryFilter>('non_sports')
@@ -206,16 +224,31 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const [submitting, setSubmitting] = useState(false)
   const [orderError, setOrderError] = useState('')
   const [quotes, setQuotes] = useState<Record<string, QuoteState>>({})
-  const [orderSize, setOrderSize] = useState<number | null>(null)
+  const [settings, setSettings] = useState<Settings | null>(null)
   const scanController = useRef<AbortController | null>(null)
   const orderController = useRef<AbortController | null>(null)
   const quoteControllers = useRef<Map<string, AbortController>>(new Map())
   const { toast } = useToast()
-  const fetchOpportunities = useCallback((signal: AbortSignal) => api.opportunities(signal), [])
+  const { venues } = useVenues()
+  const { scope, scopeRef, setScope } = useVenueScope(venues)
+  // The fetcher must keep a stable identity: usePolling drops the current rows
+  // when the fetcher changes, which would flash skeletons on every chip click.
+  // The scope is read from a ref and a change triggers refresh() instead, so
+  // the previous page stays visible (dimmed) until the new one arrives.
+  const fetchOpportunities = useCallback(
+    (signal: AbortSignal) => api.opportunities(scopeRef.current === 'all' ? null : scopeRef.current, signal),
+    [scopeRef],
+  )
   const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchOpportunities)
+  const lastScope = useRef<VenueScope>(scope)
+  useEffect(() => {
+    if (lastScope.current === scope) return
+    lastScope.current = scope
+    refresh()
+  }, [scope, refresh])
   // Open positions for the selected account drive the 「已买入」 markers. They
   // are polled separately so auto-trade fills show up without a radar scan.
-  const fetchHeldPositions = useCallback((signal: AbortSignal) => api.positions(accountId, 'open', signal), [accountId])
+  const fetchHeldPositions = useCallback((signal: AbortSignal) => api.positions(accountId, 'open', null, signal), [accountId])
   const { data: heldData, refresh: refreshHeld } = usePolling(fetchHeldPositions, { enabled: Boolean(accountId) })
   const heldByToken = useMemo(() => heldPositionsByToken(heldData?.items || []), [heldData])
 
@@ -230,19 +263,25 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     persistMarketLanguage(marketLanguage)
   }, [marketLanguage])
 
-  // The real-yield button quotes the configured single-order size. Show it so
-  // the amount is not mistaken for a hardcoded value; it is edited in 参数设置.
-  // The same request supplies the default radar category. A manual category
+  // The real-yield button quotes the venue's configured single-order size. The
+  // same request supplies the default radar category. A manual category
   // selection must not be overwritten by a later poll.
   useEffect(() => {
     const controller = new AbortController()
-    api.settings(controller.signal).then((settings) => {
-      setOrderSize(settings.order_size)
-      setSportsPolicy(settings.sports_policy)
-      if (!categoryTouched.current) setCategory(normalizeCategoryFilter(settings.default_category))
+    api.settings(controller.signal).then((next) => {
+      setSettings(next)
+      setSportsPolicy(next.sports_policy)
+      if (!categoryTouched.current) setCategory(normalizeCategoryFilter(next.default_category))
     }).catch(() => {})
     return () => controller.abort()
   }, [])
+
+  const orderSizeFor = useCallback((venue: Venue) => venueOrderSize(settings, venue), [settings])
+  const scopeLabel = scope === 'all' ? VENUES.map((venue) => venueMeta(venue).label).join(' + ') : venueMeta(scope).label
+  const scopedOrderSize = scope === 'all' ? 0 : orderSizeFor(scope)
+  // A live account can only trade its own venue; another venue's rows stay
+  // visible but cannot be bought with this account's credentials.
+  const venueReady = (venue: Venue) => !isLive || (accountVenue === venue && Boolean(account?.live_ready))
 
   const allItems = useMemo(() => data?.items || [], [data])
   const counts = useMemo(() => categoryCounts(allItems), [allItems])
@@ -257,23 +296,24 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
 
   const numericAmount = Number(amount)
   const validAmount = amount.trim() !== '' && Number.isFinite(numericAmount) && numericAmount > 0
-  const selectedQuote = selected ? quotes[selected.token_id]?.quote : undefined
-  const selectedHeld = selected ? heldByToken.get(selected.token_id) : undefined
+  const selectedVenue = selected ? venueOf(selected) : accountVenue
+  const selectedQuote = selected ? quotes[tokenKey(selected)]?.quote : undefined
+  const selectedHeld = selected ? heldByToken.get(tokenKey(selected)) : undefined
 
   const fetchQuote = async (item: Opportunity, quoteAmount?: number) => {
-    quoteControllers.current.get(item.token_id)?.abort()
+    const key = tokenKey(item)
+    quoteControllers.current.get(key)?.abort()
     const controller = new AbortController()
-    quoteControllers.current.set(item.token_id, controller)
-    setQuotes((current) => ({ ...current, [item.token_id]: { ...current[item.token_id], loading: true, error: undefined } }))
+    quoteControllers.current.set(key, controller)
+    setQuotes((current) => ({ ...current, [key]: { ...current[key], loading: true, error: undefined } }))
     try {
-      const quote = await api.quoteOpportunity(item.token_id, quoteAmount, controller.signal)
-      if (!quoteAmount) setOrderSize(quote.amount)
-      setQuotes((current) => ({ ...current, [item.token_id]: { quote } }))
+      const quote = await api.quoteOpportunity(item.token_id, quoteAmount, venueOf(item), controller.signal)
+      setQuotes((current) => ({ ...current, [key]: { quote } }))
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
-      setQuotes((current) => ({ ...current, [item.token_id]: { ...current[item.token_id], loading: false, error: caught instanceof Error ? caught.message : '获取真实收益失败，请重试。' } }))
+      setQuotes((current) => ({ ...current, [key]: { ...current[key], loading: false, error: caught instanceof Error ? caught.message : '获取真实收益失败，请重试。' } }))
     } finally {
-      if (quoteControllers.current.get(item.token_id) === controller) quoteControllers.current.delete(item.token_id)
+      if (quoteControllers.current.get(key) === controller) quoteControllers.current.delete(key)
     }
   }
 
@@ -291,13 +331,13 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     scanController.current = controller
     setScanning(true)
     try {
-      const result = await api.scan(controller.signal, execute, accountId)
+      const result = await api.scan(controller.signal, execute, accountId, scope === 'all' ? null : scope)
       if (execute) {
         const summary = result.auto_trade
         const placed = summary?.orders_placed ?? 0
         const skipped = summary?.skipped_held ?? 0
         const details = [
-          `本次返回 ${formatNumber(result.total, 0)} 个候选机会`,
+          `本次返回 ${formatNumber(result.total, 0)} 个候选机会（${scopeLabel}）`,
           placed > 0 ? `已对 ${placed} 个未持仓盘口自动下单` : '没有符合条件的新盘口，本轮未下单',
           skipped > 0 ? `跳过 ${skipped} 个已有持仓记录的盘口` : '',
         ].filter(Boolean).join('；')
@@ -307,7 +347,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           variant: summary?.error ? 'error' : placed > 0 ? 'success' : 'info',
         })
       } else {
-        toast({ title: '扫描完成', description: `本次返回 ${formatNumber(result.total, 0)} 个候选机会；本次仅刷新行情，未自动下单。`, variant: 'success' })
+        toast({ title: '扫描完成', description: `本次返回 ${formatNumber(result.total, 0)} 个候选机会（${scopeLabel}）；本次仅刷新行情，未自动下单。`, variant: 'success' })
       }
       refresh()
       refreshHeld()
@@ -346,9 +386,13 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     }
   }
 
+  // A live account can only auto-trade its own venue, even when the radar shows both.
+  const scopeMatchesAccount = scope === 'all' || scope === accountVenue
+  const sources = data?.venues?.length ? data.venues : venues
+
   return (
     <>
-      <PageHeader eyebrow={isLive ? 'LIVE OPPORTUNITY RADAR' : 'OPPORTUNITY RADAR'} title="机会雷达" description={isLive ? '筛选公开市场价格偏离。点击实盘买入会把订单提交到 Polymarket CLOB，请务必确认金额与盘口深度。' : '筛选公开市场的价格偏离，以理论收益辅助研究，不构成结算承诺。'} actions={<><MarketLanguageSelect value={marketLanguage} onChange={setMarketLanguage} /><Button variant="primary" onClick={() => setScanPrompt(true)} loading={scanning}><Radar className={cn('h-4 w-4', !scanning && 'text-emerald-200 dark:text-emerald-950')} />{scanning ? '正在扫描…' : '立即扫描'}</Button></>} />
+      <PageHeader eyebrow={isLive ? 'LIVE OPPORTUNITY RADAR' : 'OPPORTUNITY RADAR'} title="机会雷达" description={isLive ? `筛选公开市场价格偏离。点击实盘买入会把订单提交到 ${venueMeta(accountVenue).label}，请务必确认金额与盘口深度。` : '筛选公开市场的价格偏离，以理论收益辅助研究，不构成结算承诺。'} actions={<><MarketLanguageSelect value={marketLanguage} onChange={setMarketLanguage} /><Button variant="primary" onClick={() => setScanPrompt(true)} loading={scanning}><Radar className={cn('h-4 w-4', !scanning && 'text-emerald-200 dark:text-emerald-950')} />{scanning ? '正在扫描…' : '立即扫描'}</Button></>} />
       {error && data && <InlineError message={error} onRetry={refresh} />}
 
       <Card className="mb-4 p-4 sm:p-5">
@@ -362,6 +406,9 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
             <p className="text-xs text-slate-500" aria-live="polite"><span className="font-semibold tabular-nums text-slate-800">{formatNumber(filtered.length, 0)}</span> 个匹配结果{(query || category !== 'all') && data ? <span> / 共 {formatNumber(data.total, 0)} 个</span> : null}</p>
             <Button variant="ghost" size="sm" onClick={() => { refresh(); refreshHeld() }} disabled={isRefreshing}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />刷新</Button>
           </div>
+        </div>
+        <div className="mt-3 border-t border-slate-100 pt-3">
+          <VenueFilter available={venues} value={scope} onChange={setScope} />
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-3">
           <span className="mr-1 inline-flex items-center gap-1 text-[11px] font-medium text-slate-400"><Filter className="h-3.5 w-3.5" />分类</span>
@@ -386,17 +433,24 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
         )}
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-slate-100 pt-3 text-[11px] text-slate-400">
           <span>毛收益 = (1 − 价格) / 价格（未计手续费）</span>
-          <span>真实收益 = 实时盘口成交价 + 真实手续费，按「参数设置 → 单笔金额」{orderSize ? `（${formatCurrency(orderSize)}）` : ''}估算</span>
+          <span>真实收益 = 实时盘口成交价 + 真实手续费，按「参数设置 → 场所单笔金额」{scopedOrderSize > 0 ? `（${fmtMoney(scopedOrderSize, scope === 'all' ? accountVenue : scope)}）` : '（逐场所）'}估算</span>
           <span>到期时间按本地时区显示</span>
           <span>立即扫描会先询问是否自动下单；自动下单只处理当前账户尚无持仓记录的盘口</span>
           <span>默认分类来自「参数设置」；体育赛事盘口默认按加时/波动风险过滤</span>
-          <span>{marketLanguage === 'zh' ? '市场问题与方向优先使用 Polymarket 中文文案' : '市场问题与方向显示 Polymarket 英文原文'}</span>
-          {data && <span className="sm:ml-auto">来源 {data.source} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
+          <span>{marketLanguage === 'zh' ? '市场问题与方向优先使用中文文案' : '市场问题与方向显示英文原文'}</span>
+          {data && <span className="sm:ml-auto">来源 {data.source}{sources.length > 1 ? ` · ${sources.map((venue) => venueMeta(venue).label).join(' + ')}` : ''} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
         </div>
       </Card>
 
+      {isLive && !venueReady(accountVenue) && (
+        <div className="mb-4 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs leading-6 text-rose-700" role="alert">
+          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+          <span><span className="font-medium">{venueMeta(accountVenue).label} 实盘凭据未就绪。</span> {account?.live_configured ? (account.live_error || '请检查钱包、Funder 与 API 凭据。') : `可在「系统设置 → 实盘交易凭据」中完成配置，或设置 ${venueMeta(accountVenue).envHint} 后重启服务。`} 仅有凭据就绪的场所可以提交实盘买单。</span>
+        </div>
+      )}
+
       {isLoading ? <Card><LoadingBlock rows={6} /></Card> : error && !data ? <Card><ErrorState message={error} onRetry={refresh} /></Card> : !data?.items.length ? (
-        <Card><EmptyState icon={Binoculars} title="雷达暂未发现机会" description="当前筛选条件下没有候选市场。你可以重新扫描，或在参数设置中调整筛选阈值。" action={<Button variant="secondary" onClick={() => setScanPrompt(true)} loading={scanning}><Radar className="h-4 w-4" />重新扫描</Button>} /></Card>
+        <Card><EmptyState icon={Binoculars} title="雷达暂未发现机会" description={`当前筛选条件下没有候选市场（场所：${scopeLabel}）。你可以重新扫描，或在参数设置中调整筛选阈值。`} action={<Button variant="secondary" onClick={() => setScanPrompt(true)} loading={scanning}><Radar className="h-4 w-4" />重新扫描</Button>} /></Card>
       ) : filtered.length === 0 ? (
         query.trim() ? (
           <Card><EmptyState icon={Search} title="没有匹配的市场" description={`没有找到与“${query}”相关的机会，请尝试其他关键词。`} action={<Button variant="secondary" onClick={() => setQuery('')}>清除搜索</Button>} /></Card>
@@ -409,25 +463,30 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
             <div className="overflow-x-auto">
               <table className="w-full min-w-[1080px] text-left text-sm">
                 <thead className="border-b border-slate-100 bg-slate-50/70 text-xs text-slate-500">
-                  <tr><th className="px-5 py-3.5 font-medium">市场 / 方向</th><th className="px-4 py-3.5 text-right font-medium">指示价格</th><th className="px-4 py-3.5 text-right font-medium">毛收益</th><th className="px-4 py-3.5 text-right font-medium">真实收益<p className="mt-0.5 text-[10px] font-normal text-slate-400">按单笔 {orderSize ? formatCurrency(orderSize) : '金额'}</p></th><th className="px-4 py-3.5 text-right font-medium">流动性</th><th className="px-4 py-3.5 text-right font-medium">到期</th><th className="px-5 py-3.5 text-right font-medium">操作</th></tr>
+                  <tr><th className="px-5 py-3.5 font-medium">市场 / 方向</th><th className="px-4 py-3.5 text-right font-medium">指示价格</th><th className="px-4 py-3.5 text-right font-medium">毛收益</th><th className="px-4 py-3.5 text-right font-medium">真实收益<p className="mt-0.5 text-[10px] font-normal text-slate-400">按单笔 {scopedOrderSize > 0 ? fmtMoney(scopedOrderSize, scope === 'all' ? accountVenue : scope) : '场所金额'}</p></th><th className="px-4 py-3.5 text-right font-medium">流动性</th><th className="px-4 py-3.5 text-right font-medium">到期</th><th className="px-5 py-3.5 text-right font-medium">操作</th></tr>
                 </thead>
                 <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>
-                  {filtered.map((item) => (
-                    <tr key={`${item.market_id}-${item.token_id}`} className="group hover:bg-slate-50/70">
-                      <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex flex-wrap items-center gap-1.5"><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><Badge variant="default" className="px-2 py-0.5 text-[11px]">{categoryLabel(item.category)}</Badge><HeldBadge held={heldByToken.get(item.token_id)} className="px-2 py-0.5 text-[11px]" />{item.sports_game && <Badge variant="warning" className="px-2 py-0.5 text-[11px]" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
-                      <td className="px-4 py-4 text-right"><div className="font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</div>{item.price_change_24h != null && <p className={cn('mt-1 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}<HeldPrice held={heldByToken.get(item.token_id)} /></td>
-                      <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
-                      <td className="px-4 py-4 text-right"><RealYield state={quotes[item.token_id]} onQuote={() => fetchQuote(item)} /></td>
-                      <td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatCompactCurrency(item.liquidity)}</td>
-                      <td className="px-4 py-4 text-right"><span className="tabular-nums text-slate-700">{formatNumber(item.days_to_end, 1)} 天</span><p className="mt-1 whitespace-nowrap text-[11px] tabular-nums text-slate-400">{formatFullDate(item.end_date)}</p></td>
-                      <td className="px-5 py-4"><div className="flex items-center justify-end gap-1"><MarketLink url={marketURL(item.url, marketLanguage)} compact /><Button size="sm" variant="secondary" className={isLive ? 'text-rose-700 group-hover:border-rose-200 group-hover:bg-rose-50 group-hover:text-rose-800' : 'group-hover:border-emerald-200 group-hover:bg-emerald-50 group-hover:text-emerald-800'} onClick={() => openBuy(item)}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button></div></td>
-                    </tr>
-                  ))}
+                  {filtered.map((item) => {
+                    const venue = venueOf(item)
+                    const held = heldByToken.get(tokenKey(item))
+                    const ready = venueReady(venue)
+                    return (
+                      <tr key={`${venue}:${item.market_id}:${item.token_id}`} className="group hover:bg-slate-50/70">
+                        <td className="max-w-[390px] px-5 py-4"><div className="flex items-start gap-3"><div className="mt-0.5 rounded-lg bg-slate-100 p-2 text-slate-400 group-hover:bg-surface group-hover:text-emerald-600"><Sparkles className="h-4 w-4" /></div><div className="min-w-0"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={marketQuestion(item, marketLanguage)}>{marketQuestion(item, marketLanguage)}</p><div className="mt-1.5 flex flex-wrap items-center gap-1.5"><VenueChip venue={venue} className="px-2 py-0.5 text-[11px]" /><Badge variant="info" className="px-2 py-0.5 text-[11px]">{marketOutcome(item, marketLanguage)}</Badge><Badge variant="default" className="px-2 py-0.5 text-[11px]">{categoryLabel(item.category)}</Badge><HeldBadge held={held} className="px-2 py-0.5 text-[11px]" />{item.sports_game && <Badge variant="warning" className="px-2 py-0.5 text-[11px]" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={item} /><span className="text-[11px] text-slate-400">{item.slug || item.market_id.slice(0, 12)}</span></div></div></div></td>
+                        <td className="px-4 py-4 text-right"><div className="font-semibold tabular-nums text-slate-800">{formatPrice(item.price)}</div>{item.price_change_24h != null && <p className={cn('mt-1 text-[11px] tabular-nums', Math.abs(item.price_change_24h) >= 0.05 ? 'text-amber-600' : 'text-slate-400')}>24h {formatPriceChange(item.price_change_24h)}</p>}<HeldPrice held={held} /></td>
+                        <td className="px-4 py-4 text-right font-medium tabular-nums text-emerald-700">{formatPercent(item.gross_yield, 2, true)}</td>
+                        <td className="px-4 py-4 text-right"><RealYield state={quotes[tokenKey(item)]} venue={venue} onQuote={() => fetchQuote(item, orderSizeFor(venue) || undefined)} /></td>
+                        <td className="px-4 py-4 text-right tabular-nums text-slate-600">{fmtMoney(item.liquidity, venue, { compact: true })}</td>
+                        <td className="px-4 py-4 text-right"><span className="tabular-nums text-slate-700">{formatNumber(item.days_to_end, 1)} 天</span><p className="mt-1 whitespace-nowrap text-[11px] tabular-nums text-slate-400">{formatFullDate(item.end_date)}</p></td>
+                        <td className="px-5 py-4"><div className="flex items-center justify-end gap-1"><MarketLink url={marketURL(item.url, marketLanguage)} compact /><Button size="sm" variant="secondary" className={isLive ? 'text-rose-700 group-hover:border-rose-200 group-hover:bg-rose-50 group-hover:text-rose-800' : 'group-hover:border-emerald-200 group-hover:bg-emerald-50 group-hover:text-emerald-800'} onClick={() => openBuy(item)} disabled={!ready} title={!ready ? `${venueMeta(venue).label} 实盘凭据未就绪` : undefined}>{isLive ? <Radio className="h-3.5 w-3.5" /> : <FlaskConical className="h-3.5 w-3.5" />}{isLive ? '实盘买入' : '模拟买入'}</Button></div></td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
           </Card>
-          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} held={heldByToken.get(item.token_id)} onBuy={openBuy} onQuote={() => fetchQuote(item)} quote={quotes[item.token_id]} orderSize={orderSize} isLive={isLive} language={marketLanguage} />)}</div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${venueOf(item)}:${item.market_id}:${item.token_id}`} item={item} held={heldByToken.get(tokenKey(item))} onBuy={openBuy} onQuote={() => fetchQuote(item, orderSizeFor(venueOf(item)) || undefined)} quote={quotes[tokenKey(item)]} orderSize={orderSizeFor(venueOf(item))} isLive={isLive} liveReady={venueReady(venueOf(item))} language={marketLanguage} />)}</div>
         </>
       )}
 
@@ -436,20 +495,23 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           <div>
             <div className="mb-3 flex flex-wrap items-center gap-2">
               <Badge variant={isLive ? 'danger' : 'success'}>{isLive ? <Radio className="h-3 w-3" /> : <FlaskConical className="h-3 w-3" />}{isLive ? '实盘账户' : '模拟账户'}</Badge>
+              <VenueChip venue={accountVenue} full />
               <span className="text-xs text-slate-400">{account?.name || '当前账户'}</span>
             </div>
             <DialogTitle>立即扫描：是否自动下单？</DialogTitle>
             <DialogDescription className="mt-2">扫描会拉取最新公开行情、刷新持仓盯市并记录净值。需要同时按自动交易规则买入本轮出现的新机会吗？</DialogDescription>
           </div>
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-600">
-            <p><span className="font-medium text-slate-800">自动下单范围：</span>仅当前账户中尚无持仓记录的盘口；已有持仓、已结算或已止损卖出的盘口会跳过。</p>
-            <p className="mt-1"><span className="font-medium text-slate-800">仍需通过：</span>单笔金额{orderSize ? `（${formatCurrency(orderSize)}）` : ''}、单市场与总敞口上限、尾盘下单窗口、未决订单熔断及实盘凭据检查。</p>
-            {isLive && <p className="mt-1 font-medium text-rose-700">实盘账户会向 Polymarket CLOB 提交真实买单，并动用真实 pUSD。</p>}
+            <p><span className="font-medium text-slate-800">本次扫描场所：</span>{scopeLabel}（按当前场所筛选）。扫描全部场所时会逐场所执行。</p>
+            <p className="mt-1"><span className="font-medium text-slate-800">自动下单范围：</span>仅当前账户中尚无持仓记录的盘口；已有持仓、已结算或已止损卖出的盘口会跳过。</p>
+            <p className="mt-1"><span className="font-medium text-slate-800">仍需通过：</span>单笔金额{orderSizeFor(accountVenue) > 0 ? `（${fmtMoney(orderSizeFor(accountVenue), accountVenue)}）` : ''}、单市场与总敞口上限、尾盘下单窗口、未决订单熔断及实盘凭据检查。</p>
+            {isLive && <p className="mt-1 font-medium text-rose-700">实盘账户会向 {venueMeta(accountVenue).label} 提交真实买单，并动用真实 {venueMeta(accountVenue).collateral}。</p>}
+            {isLive && !scopeMatchesAccount && <p className="mt-1 text-amber-700">当前账户属于 {venueMeta(accountVenue).label}，无法在 {venueMeta(scope).label} 范围内自动下单；可切换场所筛选，或本次只扫描行情。</p>}
           </div>
-          {isLive && !liveReady && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span>{account?.live_configured ? '实盘凭据未就绪，本次只能刷新行情。' : '实盘凭据未配置，本次只能刷新行情。'} 请先在「系统设置 → 实盘交易凭据」中完成配置。</span></div>}
+          {isLive && !venueReady(accountVenue) && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span>{account?.live_configured ? '实盘凭据未就绪，本次只能刷新行情。' : '实盘凭据未配置，本次只能刷新行情。'} 请先在「系统设置 → 实盘交易凭据」中完成 {venueMeta(accountVenue).label} 的配置。</span></div>}
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
             <Button variant="secondary" onClick={() => runScan(false)} disabled={scanning}><Radar className="h-4 w-4" />仅扫描行情</Button>
-            <Button variant={isLive ? 'danger' : 'primary'} onClick={() => runScan(true)} loading={scanning} disabled={!accountId || !liveReady}><Zap className="h-4 w-4" />扫描并自动下单</Button>
+            <Button variant={isLive ? 'danger' : 'primary'} onClick={() => runScan(true)} loading={scanning} disabled={!accountId || !venueReady(accountVenue) || !scopeMatchesAccount}><Zap className="h-4 w-4" />扫描并自动下单</Button>
           </div>
           <p className="-mt-2 text-center text-[11px] leading-5 text-slate-400">自动下单只对本次扫描与当前账户生效，会忽略该账户的后台自动交易开关与引擎暂停状态。</p>
         </DialogContent>
@@ -459,48 +521,48 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
         <DialogContent>
           {selected && <>
             <div>
-              <div className="mb-3 flex items-center gap-2"><Badge variant={isLive ? 'danger' : 'success'}>{isLive ? <Radio className="h-3 w-3" /> : <FlaskConical className="h-3 w-3" />}{isLive ? '真实资金' : '虚拟资金'}</Badge><span className="text-xs text-slate-400">{isLive ? '订单将提交至 Polymarket CLOB' : '不会发出真实订单'}</span></div>
+              <div className="mb-3 flex flex-wrap items-center gap-2"><Badge variant={isLive ? 'danger' : 'success'}>{isLive ? <Radio className="h-3 w-3" /> : <FlaskConical className="h-3 w-3" />}{isLive ? '真实资金' : '虚拟资金'}</Badge><VenueChip venue={selectedVenue} full /><span className="text-xs text-slate-400">{isLive ? `订单将提交至 ${venueMeta(selectedVenue).label}（${venueMeta(selectedVenue).orderTypes.join(' / ')}）` : '不会发出真实订单'}</span></div>
               <DialogTitle>{isLive ? '确认实盘买入' : '确认模拟买入'}</DialogTitle>
-              <DialogDescription className="mt-2">{isLive ? '按下确认后，系统会立即向 Polymarket 提交真实买单。成交价由当前订单簿决定，可能与下方指示价格不同。' : '仅在 PennyHarvester 内记录虚拟头寸，用于验证策略与风控规则。'}</DialogDescription>
+              <DialogDescription className="mt-2">{isLive ? `按下确认后，系统会立即向 ${venueMeta(selectedVenue).label} 提交真实买单。成交价由当前订单簿决定，可能与下方指示价格不同。` : '仅在 PennyHarvester 内记录虚拟头寸，用于验证策略与风控规则。'}</DialogDescription>
             </div>
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
               <p className="pr-4 text-sm font-medium leading-6 text-slate-900">{marketQuestion(selected, marketLanguage)}</p>
-              <div className="mt-3 flex flex-wrap items-center gap-2"><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><Badge variant="default">{categoryLabel(selected.category)}</Badge>{selected.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={selected} /><span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
+              <div className="mt-3 flex flex-wrap items-center gap-2"><VenueChip venue={selectedVenue} /><Badge variant="info">{marketOutcome(selected, marketLanguage)}</Badge><Badge variant="default">{categoryLabel(selected.category)}</Badge>{selected.sports_game && <Badge variant="warning" title="体育赛事盘口可能包含加时、延长赛或点球决胜，临近结算时价格波动较大">赛事 · 加时风险</Badge>}<ProtocolBadge item={selected} /><span className="text-xs text-slate-500">指示价格 <span className="font-semibold text-slate-800">{formatPrice(selected.price)}</span></span><span className="text-xs text-slate-400">·</span><span className="text-xs text-slate-500">理论毛收益 <span className="text-emerald-700">{formatPercent(selected.gross_yield, 2, true)}</span></span></div>
             </div>
-            {selectedHeld && <div className="flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs leading-5 text-emerald-800" role="status"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">已买入：</span>买入价 {formatPrice(selectedHeld.entryPrice)} · {formatNumber(selectedHeld.shares, 4)} 份 · 成本 {formatCurrency(selectedHeld.cost)}{selectedHeld.count > 1 ? `（${selectedHeld.count} 笔）` : ''}。再次买入会增加该头寸。</span></div>}
+            {selectedHeld && <div className="flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs leading-5 text-emerald-800" role="status"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">已买入：</span>买入价 {formatPrice(selectedHeld.entryPrice)} · {formatNumber(selectedHeld.shares, 4)} 份 · 成本 {fmtMoney(selectedHeld.cost, selectedHeld.venue)}{selectedHeld.count > 1 ? `（${selectedHeld.count} 笔）` : ''}。再次买入会增加该头寸。</span></div>}
             {selected.sports_game && <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">体育赛事盘口：</span>可能包含加时、延长赛或点球决胜，临近结算时价格波动明显。请确认你已理解该风险。</span></div>}
             <div>
-              <div className="mb-2 flex items-center justify-between"><label htmlFor="paper-amount" className="text-sm font-medium text-slate-700">{isLive ? '实盘投入金额' : '投入虚拟金额'}</label><span className="text-xs text-slate-400">USD</span></div>
+              <div className="mb-2 flex items-center justify-between"><label htmlFor="paper-amount" className="text-sm font-medium text-slate-700">{isLive ? '实盘投入金额' : '投入虚拟金额'}</label><span className="text-xs text-slate-400">{currencyOf(selectedVenue)}</span></div>
               <div className="relative"><CircleDollarSign className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><Input id="paper-amount" type="number" min="0.01" step="any" inputMode="decimal" autoFocus value={amount} onChange={(event) => setAmount(event.target.value)} className="h-11 pl-9 text-base" placeholder="0.00" aria-describedby="amount-help" /></div>
               <div className="mt-2 flex items-center justify-between gap-4 text-xs" id="amount-help"><span className="text-slate-500">预计份额（{isLive ? '按指示价估算，实际以盘口为准' : '未计费用与滑点'}）</span><span className="font-medium tabular-nums text-slate-700">{validAmount && selected.price > 0 ? formatNumber(numericAmount / selected.price, 4) : '—'}</span></div>
               {amount && !validAmount && <p className="mt-2 text-xs text-rose-600">请输入大于 0 的有效金额。</p>}
             </div>
             <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-3.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs font-medium text-emerald-900">真实净收益（实盘盘口 + FeeSchedule）</span>
-                <button type="button" onClick={() => fetchQuote(selected, validAmount ? numericAmount : undefined)} disabled={quotes[selected.token_id]?.loading} className="rounded-md px-1.5 py-0.5 text-[11px] font-medium text-emerald-800 underline-offset-2 transition hover:bg-emerald-100 hover:underline disabled:opacity-50">
-                  {quotes[selected.token_id]?.loading ? '读取中…' : `按 ${validAmount ? formatCurrency(numericAmount) : orderSize ? `单笔 ${formatCurrency(orderSize)}` : '单笔金额'} 获取`}
+                <span className="text-xs font-medium text-emerald-900">真实净收益（{venueMeta(selectedVenue).label} 盘口 + 手续费）</span>
+                <button type="button" onClick={() => fetchQuote(selected, validAmount ? numericAmount : (orderSizeFor(selectedVenue) || undefined))} disabled={quotes[tokenKey(selected)]?.loading} className="rounded-md px-1.5 py-0.5 text-[11px] font-medium text-emerald-800 underline-offset-2 transition hover:bg-emerald-100 hover:underline disabled:opacity-50">
+                  {quotes[tokenKey(selected)]?.loading ? '读取中…' : `按 ${validAmount ? fmtMoney(numericAmount, selectedVenue) : orderSizeFor(selectedVenue) > 0 ? `单笔 ${fmtMoney(orderSizeFor(selectedVenue), selectedVenue)}` : '单笔金额'} 获取`}
                 </button>
               </div>
               {selectedQuote ? <>
-                <div className="mt-1.5 flex items-baseline justify-between gap-3"><span className="text-sm font-semibold tabular-nums text-emerald-800">{formatPercent(selectedQuote.net_yield, 2, true)}</span><span className="text-[11px] tabular-nums text-emerald-800/80">净利 {formatCurrency(selectedQuote.net_profit)}</span></div>
-                <p className="mt-1 text-[11px] leading-5 text-emerald-800/80">按 {formatCurrency(selectedQuote.amount)} · 成交均价 {formatPrice(selectedQuote.fill_price)} · 限价 {formatPrice(selectedQuote.limit_price)} · 手续费 {formatCurrency(selectedQuote.fee)} · 总成本 {formatCurrency(selectedQuote.total_cost)}</p>
+                <div className="mt-1.5 flex items-baseline justify-between gap-3"><span className="text-sm font-semibold tabular-nums text-emerald-800">{formatPercent(selectedQuote.net_yield, 2, true)}</span><span className="text-[11px] tabular-nums text-emerald-800/80">净利 {fmtMoney(selectedQuote.net_profit, selectedVenue)}</span></div>
+                <p className="mt-1 text-[11px] leading-5 text-emerald-800/80">按 {fmtMoney(selectedQuote.amount, selectedVenue)} · 成交均价 {formatPrice(selectedQuote.fill_price)} · 限价 {formatPrice(selectedQuote.limit_price)} · 手续费 {fmtMoney(selectedQuote.fee, selectedVenue)} · 总成本 {fmtMoney(selectedQuote.total_cost, selectedVenue)}</p>
                 {selectedQuote.exceeds_max_price && <p className="mt-1 text-[11px] leading-5 text-rose-700">盘口成交价超过最高买入价 {formatPrice(selectedQuote.max_price)}，实盘会被拒单。</p>}
-                {!selectedQuote.fully_filled && <p className="mt-1 text-[11px] leading-5 text-amber-700">盘口深度仅 {formatCompactCurrency(selectedQuote.available_notional)}，无法一次成交该金额。</p>}
+                {!selectedQuote.fully_filled && <p className="mt-1 text-[11px] leading-5 text-amber-700">盘口深度仅 {fmtMoney(selectedQuote.available_notional, selectedVenue)}，无法一次成交该金额。</p>}
                 {!isLive && <p className="mt-1 text-[11px] leading-5 text-emerald-800/60">模拟账户仍按参数设置中的滑点与费率记账，此处仅供对照实盘口径。</p>}
-              </> : <p className="mt-1 text-[11px] leading-5 text-emerald-800/70">读取 Polymarket 实时订单簿与 taker 手续费后显示，不会提交订单。</p>}
-              {quotes[selected.token_id]?.error && <p className="mt-1 break-words text-[11px] leading-5 text-rose-700">报价失败：{quotes[selected.token_id]?.error}</p>}
+              </> : <p className="mt-1 text-[11px] leading-5 text-emerald-800/70">读取 {venueMeta(selectedVenue).label} 实时盘口与手续费后显示，不会提交订单。</p>}
+              {quotes[tokenKey(selected)]?.error && <p className="mt-1 break-words text-[11px] leading-5 text-rose-700">报价失败：{quotes[tokenKey(selected)]?.error}</p>}
             </div>
             <RiskNotice compact />
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 p-3.5 transition hover:bg-slate-50">
               <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} className="mt-0.5 h-4 w-4 rounded border-slate-300 accent-emerald-600 dark:accent-emerald-500" />
-              <span className="text-xs leading-5 text-slate-600">{isLive ? <><span className="font-medium text-rose-800">我确认这是真实资金实盘买入。</span> 我理解订单会立即提交到 Polymarket，且高价结果失败时可能损失大部分本金。</> : <><span className="font-medium text-slate-800">我确认这是模拟买入。</span> 仅使用虚拟资金；当前价格不保证最终结算。</>}</span>
+              <span className="text-xs leading-5 text-slate-600">{isLive ? <><span className="font-medium text-rose-800">我确认这是真实资金实盘买入。</span> 我理解订单会立即提交到 {venueMeta(selectedVenue).label}，使用 {currencyOf(selectedVenue)} 结算，且高价结果失败时可能损失大部分本金。</> : <><span className="font-medium text-slate-800">我确认这是模拟买入。</span> 仅使用虚拟资金；当前价格不保证最终结算。</>}</span>
             </label>
-            {!liveReady && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">{account?.live_configured ? '实盘凭据未就绪。' : '实盘凭据未配置。'}</span> {account?.live_configured ? (account.live_error || '请检查 Funder、CLOB 凭据与 pUSD 授权。') : '可在「系统设置 → 实盘交易凭据」中填写私钥，或设置 POLYMARKET_PRIVATE_KEY 后重启服务。'}</span></div>}
+            {!venueReady(selectedVenue) && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">{account?.live_configured ? '实盘凭据未就绪。' : '实盘凭据未配置。'}</span> {account?.live_configured ? (account.live_error || `请检查 ${venueMeta(selectedVenue).label} 的钱包、Funder 与 API 凭据。`) : `可在「系统设置 → 实盘交易凭据」中填写 ${venueMeta(selectedVenue).label} 的私钥，或设置 ${venueMeta(selectedVenue).envHint} 后重启服务。`}</span></div>}
             {orderError && <div className="break-words rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><span className="font-medium">订单未提交：</span>{orderError}</div>}
             <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
               <Button variant="secondary" onClick={() => setSelected(null)} disabled={submitting}>取消</Button>
-              <Button variant={isLive ? 'danger' : 'primary'} onClick={submitOrder} loading={submitting} disabled={!validAmount || !confirmed || !liveReady}><CheckCircle2 className="h-4 w-4" />{submitting ? (isLive ? '正在提交实盘订单…' : '正在记录…') : `${isLive ? '确认实盘买入' : '确认模拟买入'}${validAmount ? ` ${formatCurrency(numericAmount)}` : ''}`}</Button>
+              <Button variant={isLive ? 'danger' : 'primary'} onClick={submitOrder} loading={submitting} disabled={!validAmount || !confirmed || !venueReady(selectedVenue)}><CheckCircle2 className="h-4 w-4" />{submitting ? (isLive ? '正在提交实盘订单…' : '正在记录…') : `${isLive ? '确认实盘买入' : '确认模拟买入'}${validAmount ? ` ${fmtMoney(numericAmount, selectedVenue)}` : ''}`}</Button>
             </div>
             <div className="-mt-2 flex items-center justify-center gap-1.5 text-[11px] text-slate-400"><CalendarDays className="h-3 w-3" />市场到期：{formatFullDate(selected.end_date)}（本地时间）<ArrowUpRight className="h-3 w-3" /></div>
           </>}

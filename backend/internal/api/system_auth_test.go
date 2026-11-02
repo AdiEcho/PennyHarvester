@@ -13,6 +13,7 @@ import (
 
 	"pennyharvester/backend/internal/api"
 	"pennyharvester/backend/internal/engine"
+	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
 	"pennyharvester/backend/internal/store"
 )
@@ -25,7 +26,8 @@ func newSystemRouter(t *testing.T) (http.Handler, *store.SQLite) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { repository.Close() })
-	instance, err := engine.New(context.Background(), repository, testProvider(), nil, nil)
+	registry := apiTestRegistry(t, testProvider(), nil)
+	instance, err := engine.New(context.Background(), repository, registry, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,3 +373,94 @@ func TestRelayerProbeRejectsInvalidLiveSettings(t *testing.T) {
 		t.Fatalf("invalid live settings must be rejected: %d %s", response.Code, response.Body.String())
 	}
 }
+
+func TestSystemSettingsVenueBlocksRoundTrip(t *testing.T) {
+	handler, repository := newSystemRouter(t)
+	ctx := context.Background()
+	key := "0x" + strings.Repeat("2", 64)
+	wallet := "0x" + strings.Repeat("3", 40)
+
+	update := request(t, handler, http.MethodPut, "/api/v1/system", map[string]any{
+		"venues": map[string]any{
+			"predictfun": map[string]any{
+				"data_source": map[string]any{"base_url": "https://api.predict.fun"},
+				"live": map[string]any{
+					"api_key": "pf-key", "private_key": key, "smart_wallet": wallet, "testnet": true,
+				},
+			},
+		},
+	})
+	if update.Code != http.StatusOK {
+		t.Fatalf("saving predictfun settings failed: %d %s", update.Code, update.Body.String())
+	}
+	var saved struct {
+		Venues map[market.Venue]struct {
+			DataSource engine.VenueDataSourceSettings `json:"data_source"`
+			Live       engine.VenueLiveSettings       `json:"live"`
+			LiveOK     bool                           `json:"live_configured"`
+			KeyOK      bool                           `json:"private_key_configured"`
+		} `json:"venues"`
+		Runtime engine.SystemRuntime `json:"runtime"`
+	}
+	if err := json.Unmarshal(update.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	pf := saved.Venues[market.VenuePredictFun]
+	if pf.DataSource.BaseURL != "https://api.predict.fun" || pf.Live.APIKey != "pf-key" || !testnetOn(pf.Live.Testnet) {
+		t.Fatalf("predictfun venue block was not returned: %+v", pf)
+	}
+	if pf.Live.PrivateKey != netproxy.RedactedSecret || !pf.LiveOK || !pf.KeyOK {
+		t.Fatalf("predictfun secrets must be redacted with configured flags: %+v", pf)
+	}
+	if len(saved.Runtime.Venues) != 1 || saved.Runtime.Venues[0].Venue != market.VenuePolymarket {
+		t.Fatalf("runtime must report one row per registered venue: %+v", saved.Runtime.Venues)
+	}
+
+	stored, err := repository.LoadSystemSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pfStored := stored.Venues[market.VenuePredictFun]
+	if pfStored.Live.PrivateKey != key || pfStored.Live.SmartWallet != wallet || !testnetOn(pfStored.Live.Testnet) {
+		t.Fatalf("stored predictfun credentials = %+v", pfStored.Live)
+	}
+	if pfStored.DataSource.BaseURL != "https://api.predict.fun" {
+		t.Fatalf("stored predictfun data source = %+v", pfStored.DataSource)
+	}
+
+	// A flat-only update (old frontend) must keep working and be mirrored into
+	// the venues.polymarket view. The key must differ from Predict.fun's.
+	pmKey := "0x" + strings.Repeat("4", 64)
+	update = request(t, handler, http.MethodPut, "/api/v1/system", map[string]any{
+		"live": map[string]any{
+			"private_key": pmKey, "api_key": "pm-key", "api_secret": "pm-secret",
+			"api_passphrase": "pm-passphrase", "signature_type": 0,
+		},
+	})
+	if update.Code != http.StatusOK {
+		t.Fatalf("flat live update failed: %d %s", update.Code, update.Body.String())
+	}
+	stored, err = repository.LoadSystemSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pmStored := stored.Venues[market.VenuePolymarket]
+	if pmStored.Live.PrivateKey != pmKey || pmStored.Live.APIKey != "pm-key" || pmStored.Live.APISecret != "pm-secret" {
+		t.Fatalf("venues.polymarket must mirror the flat fields: %+v", pmStored.Live)
+	}
+	var response struct {
+		Venues map[market.Venue]struct {
+			Live engine.VenueLiveSettings `json:"live"`
+		} `json:"venues"`
+	}
+	if err := json.Unmarshal(update.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Venues[market.VenuePolymarket].Live.APISecret != netproxy.RedactedSecret {
+		t.Fatalf("venues.polymarket must not echo secrets: %+v", response.Venues)
+	}
+}
+
+// testnetOn reads the tri-state network flag; nil means "inherit the process
+// environment", which in these tests is mainnet.
+func testnetOn(v *bool) bool { return v != nil && *v }

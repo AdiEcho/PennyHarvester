@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"pennyharvester/backend/internal/engine"
+	"pennyharvester/backend/internal/market"
 )
 
 func TestLegacyDatabaseMigratesToPaperAccount(t *testing.T) {
@@ -80,14 +81,14 @@ func TestLegacyDatabaseMigratesToPaperAccount(t *testing.T) {
 	if !live.IsDefault {
 		t.Fatal("live account must be the default after migration")
 	}
-	positions, err := repository.ListPositions(ctx, paper.ID, "all")
+	positions, err := repository.ListPositions(ctx, paper.ID, "all", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(positions) != 1 || positions[0].AccountID != paper.ID {
 		t.Fatalf("legacy positions must migrate to the paper account: %+v", positions)
 	}
-	orders, err := repository.ListOrders(ctx, paper.ID, "all", 10, 0)
+	orders, err := repository.ListOrders(ctx, paper.ID, "all", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +195,7 @@ func TestSchemaMigratesLegacyStatusConstraints(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("stop-loss order was not accepted after migration: %v", err)
 	}
-	orders, err := repository.ListOrders(ctx, paper.ID, "all", 10, 0)
+	orders, err := repository.ListOrders(ctx, paper.ID, "all", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +327,7 @@ func TestMigrationKeepsNewerSchemaAndTriggers(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("stop-loss order was rejected by the newer schema: %v", err)
 	}
-	sold, err := repository.ListPositions(ctx, paper.ID, "sold")
+	sold, err := repository.ListPositions(ctx, paper.ID, "sold", "")
 	if err != nil || len(sold) != 1 || sold[0].ExitKind != "stop" {
 		t.Fatalf("sold filter did not read exit_kind: %+v err=%v", sold, err)
 	}
@@ -406,7 +407,7 @@ func TestOrderFeeIsPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orders, err := repository.ListOrders(ctx, account.ID, "all", 10, 0)
+	orders, err := repository.ListOrders(ctx, account.ID, "all", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,5 +416,295 @@ func TestOrderFeeIsPersisted(t *testing.T) {
 	}
 	if orders[0].ID != order.ID || orders[0].Fee != 0.15 || orders[0].Amount != 100.15 {
 		t.Fatalf("order fee was not persisted: %+v", orders[0])
+	}
+}
+
+func TestLegacyDatabaseMigrationIsIdempotentAndDefaultsVenueCurrency(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy-venues.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const legacySchema = `
+	CREATE TABLE accounts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, mode TEXT NOT NULL,
+		is_default INTEGER NOT NULL DEFAULT 0, auto_trade INTEGER NOT NULL DEFAULT 0,
+		baseline_equity REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+	);
+	CREATE TABLE positions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT NOT NULL, condition_id TEXT NOT NULL,
+		question TEXT NOT NULL, outcome TEXT NOT NULL, token_id TEXT NOT NULL, side TEXT NOT NULL,
+		entry_price REAL NOT NULL, current_price REAL NOT NULL, shares REAL NOT NULL, cost REAL NOT NULL,
+		fee REAL NOT NULL, status TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT,
+		end_date TEXT NOT NULL, realized_pnl REAL NOT NULL DEFAULT 0, unrealized_pnl REAL NOT NULL DEFAULT 0
+	);
+	CREATE TABLE orders (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, position_id INTEGER, market_id TEXT NOT NULL,
+		question TEXT NOT NULL, outcome TEXT NOT NULL, token_id TEXT NOT NULL,
+		kind TEXT NOT NULL, type TEXT NOT NULL, amount REAL NOT NULL, price REAL NOT NULL,
+		shares REAL NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL
+	);
+	CREATE TABLE equity_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, value REAL NOT NULL);`
+	if _, err := db.ExecContext(ctx, legacySchema); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `INSERT INTO accounts(name, mode, is_default, baseline_equity, created_at)
+		VALUES('legacy live', 'live', 1, 0, ?), ('legacy paper', 'paper', 0, 0, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO positions(
+		market_id, condition_id, question, outcome, token_id, side, entry_price, current_price,
+		shares, cost, fee, status, opened_at, end_date
+	) VALUES('m1', 'c1', 'legacy question', 'Yes', 't1', 'BUY', 0.98, 0.98, 102, 100, 0, 'open', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO orders(
+		position_id, market_id, question, outcome, token_id, kind, type, amount, price, shares, status, reason, created_at
+	) VALUES(1, 'm1', 'legacy question', 'Yes', 't1', 'manual', 'buy', 100, 0.98, 102, 'filled', 'legacy', ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO equity_snapshots(time, value) VALUES(?, 10100)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repository, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := repository.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paper engine.Account
+	for _, account := range accounts {
+		if account.Venue != market.VenuePolymarket || account.Currency != market.CurrencyUSDC {
+			t.Fatalf("legacy account venue/currency = %q/%q, want %q/%q: %+v",
+				account.Venue, account.Currency, market.VenuePolymarket, market.CurrencyUSDC, account)
+		}
+		if account.Mode == engine.AccountModePaper {
+			paper = account
+		}
+	}
+	if paper.ID == 0 {
+		t.Fatal("legacy paper account was not found")
+	}
+	positions, err := repository.ListPositions(ctx, paper.ID, "all", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(positions) != 1 || positions[0].Venue != market.VenuePolymarket || positions[0].Currency != market.CurrencyUSDC {
+		t.Fatalf("legacy position venue/currency = %+v", positions)
+	}
+	orders, err := repository.ListOrders(ctx, paper.ID, "all", 10, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].Venue != market.VenuePolymarket || orders[0].Currency != market.CurrencyUSDC {
+		t.Fatalf("legacy order venue/currency = %+v", orders)
+	}
+	points, err := repository.ListSnapshots(ctx, paper.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Venue != market.VenuePolymarket || points[0].Currency != market.CurrencyUSDC {
+		t.Fatalf("legacy snapshot venue/currency = %+v", points)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Opening the migrated database again must be a no-op and must not drop
+	// the columns or reset the legacy defaults.
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("second open after migration failed: %v", err)
+	}
+	defer reopened.Close()
+	accounts, err = reopened.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("migration duplicated accounts on the second open: %+v", accounts)
+	}
+	positions, err = reopened.ListPositions(ctx, paper.ID, "all", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(positions) != 1 || positions[0].Venue != market.VenuePolymarket || positions[0].Currency != market.CurrencyUSDC {
+		t.Fatalf("position venue/currency after second open = %+v", positions)
+	}
+	orders, err = reopened.ListOrders(ctx, paper.ID, "all", 10, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].Venue != market.VenuePolymarket || orders[0].Currency != market.CurrencyUSDC {
+		t.Fatalf("order venue/currency after second open = %+v", orders)
+	}
+	points, err = reopened.ListSnapshots(ctx, paper.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Venue != market.VenuePolymarket || points[0].Currency != market.CurrencyUSDC {
+		t.Fatalf("snapshot venue/currency after second open = %+v", points)
+	}
+}
+
+func TestOrderVenueFilterAppliesBeforePagination(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, filepath.Join(t.TempDir(), "venue-orders.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	account, err := repository.DefaultAccount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		if _, err := repository.CreateOrder(ctx, engine.Order{
+			AccountID: account.ID, Venue: market.VenuePredictFun, Currency: market.CurrencyUSDT,
+			MarketID: "pf", Question: "predictfun", Outcome: "Yes", TokenID: "pf-token",
+			Kind: "manual", Type: "buy", Amount: 10, Price: 0.5, Shares: 20,
+			Status: "filled", CreatedAt: now.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := repository.CreateOrder(ctx, engine.Order{
+			AccountID: account.ID, Venue: market.VenuePolymarket, Currency: market.CurrencyUSDC,
+			MarketID: "pm", Question: "polymarket", Outcome: "Yes", TokenID: "pm-token",
+			Kind: "manual", Type: "buy", Amount: 10, Price: 0.5, Shares: 20,
+			Status: "filled", CreatedAt: now.Add(time.Duration(10+i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	orders, err := repository.ListOrders(ctx, account.ID, "all", 2, 0, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 2 {
+		t.Fatalf("filtered page returned %d orders, want 2: %+v", len(orders), orders)
+	}
+	for _, order := range orders {
+		if order.Venue != market.VenuePredictFun || order.Currency != market.CurrencyUSDT {
+			t.Fatalf("filtered page contains another venue: %+v", order)
+		}
+	}
+	if count, err := repository.CountOrders(ctx, account.ID, "all", market.VenuePredictFun); err != nil || count != 2 {
+		t.Fatalf("predictfun order count = %d, err = %v", count, err)
+	}
+	if count, err := repository.CountOrders(ctx, account.ID, "all", ""); err != nil || count != 5 {
+		t.Fatalf("unfiltered order count = %d, err = %v", count, err)
+	}
+}
+
+func TestPositionVenueAndCurrencyRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, filepath.Join(t.TempDir(), "venue-positions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	account, err := repository.DefaultAccount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	created, err := repository.CreatePosition(ctx, engine.Position{
+		AccountID: account.ID, Venue: market.VenuePredictFun, Currency: market.CurrencyUSDT,
+		MarketID: "pf-market", ConditionID: "pf-condition", Question: "predictfun position",
+		Outcome: "Yes", TokenID: "pf-token", Side: "BUY", Kind: "manual",
+		EntryPrice: 0.4, CurrentPrice: 0.45, Shares: 25, Cost: 10, Fee: 0.01,
+		Status: "open", OpenedAt: now, EndDate: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Venue != market.VenuePredictFun || created.Currency != market.CurrencyUSDT {
+		t.Fatalf("created position venue/currency = %q/%q", created.Venue, created.Currency)
+	}
+	positions, err := repository.ListPositions(ctx, account.ID, "all", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(positions) != 1 {
+		t.Fatalf("unexpected positions: %+v", positions)
+	}
+	got := positions[0]
+	if got.Venue != market.VenuePredictFun || got.Currency != market.CurrencyUSDT {
+		t.Fatalf("position venue/currency did not round-trip: %+v", got)
+	}
+	filtered, err := repository.ListPositions(ctx, account.ID, "all", market.VenuePredictFun)
+	if err != nil || len(filtered) != 1 {
+		t.Fatalf("predictfun position filter = %+v, err = %v", filtered, err)
+	}
+	if filtered, err = repository.ListPositions(ctx, account.ID, "all", market.VenuePolymarket); err != nil || len(filtered) != 0 {
+		t.Fatalf("polymarket position filter = %+v, err = %v", filtered, err)
+	}
+}
+
+func TestAccountVenueRoundTripAndUpdateKeepsVenue(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, filepath.Join(t.TempDir(), "venue-accounts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	now := time.Now().UTC()
+	created, err := repository.CreateAccount(ctx, engine.Account{
+		Name: "Predict.fun paper", Mode: engine.AccountModePaper,
+		Venue: market.VenuePredictFun, CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := repository.AccountByID(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Venue != market.VenuePredictFun || got.Currency != market.CurrencyUSDT {
+		t.Fatalf("created account venue/currency = %q/%q", got.Venue, got.Currency)
+	}
+
+	// UpdateAccount may send a different venue, but only name and auto_trade are
+	// mutable here.
+	if err := repository.UpdateAccount(ctx, engine.Account{
+		ID: created.ID, Name: "renamed", Venue: market.VenuePolymarket, AutoTrade: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = repository.AccountByID(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "renamed" || !got.AutoTrade {
+		t.Fatalf("account edit was not applied: %+v", got)
+	}
+	if got.Venue != market.VenuePredictFun {
+		t.Fatalf("UpdateAccount changed venue to %q", got.Venue)
+	}
+
+	defaulted, err := repository.CreateAccount(ctx, engine.Account{
+		Name: "legacy default venue", Mode: engine.AccountModePaper, CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = repository.AccountByID(ctx, defaulted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Venue != market.VenuePolymarket {
+		t.Fatalf("empty account venue was not coalesced: %+v", got)
 	}
 }

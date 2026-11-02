@@ -12,13 +12,13 @@ import (
 
 	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
+	"pennyharvester/backend/internal/venue"
 )
 
 type Engine struct {
-	repo     Repository
-	provider market.Provider
-	live     LiveExecutor
-	proxy    *netproxy.Manager
+	repo   Repository
+	venues *venue.Registry
+	proxy  *netproxy.Manager
 
 	tradeMu       sync.Mutex
 	mu            sync.RWMutex
@@ -26,6 +26,9 @@ type Engine struct {
 	system        SystemSettings
 	systemError   string
 	opportunities []Opportunity
+	// scannedVenues records which venues contributed market data to the last
+	// scan, including venues that returned markets but no qualifying rows.
+	scannedVenues []market.Venue
 	lastScanAt    *time.Time
 	lastSyncAt    *time.Time
 	lastError     string
@@ -37,7 +40,7 @@ type Engine struct {
 	done      chan struct{}
 }
 
-func New(ctx context.Context, repo Repository, provider market.Provider, live LiveExecutor, proxy *netproxy.Manager) (*Engine, error) {
+func New(ctx context.Context, repo Repository, venues *venue.Registry, proxy *netproxy.Manager) (*Engine, error) {
 	settings, err := repo.LoadSettings(ctx)
 	if err != nil {
 		return nil, err
@@ -46,6 +49,9 @@ func New(ctx context.Context, repo Repository, provider market.Provider, live Li
 	if err != nil {
 		return nil, err
 	}
+	// A fresh database returns the built-in defaults without normalizing them;
+	// normalize once here so venues.polymarket always has a readable view.
+	system = system.Normalize()
 	if proxy == nil {
 		proxy = netproxy.NewMust(system.Proxy)
 	} else if err := proxy.Apply(system.Proxy); err != nil {
@@ -68,8 +74,11 @@ func New(ctx context.Context, repo Repository, provider market.Provider, live Li
 			}
 		}
 	}
+	if venues == nil {
+		venues = venue.NewRegistry()
+	}
 	instance := &Engine{
-		repo: repo, provider: provider, live: live, proxy: proxy, settings: settings, system: system,
+		repo: repo, venues: venues, proxy: proxy, settings: settings, system: system,
 		opportunities: []Opportunity{}, running: true, done: make(chan struct{}),
 	}
 	// Apply web-managed runtime settings on top of the process environment. A
@@ -80,6 +89,120 @@ func New(ctx context.Context, repo Repository, provider market.Provider, live Li
 		instance.systemError = err.Error()
 	}
 	return instance, nil
+}
+
+// Venues lists the registered venues in presentation order.
+func (e *Engine) Venues() []market.Venue {
+	if e.venues == nil {
+		return nil
+	}
+	return e.venues.Venues()
+}
+
+// VenueCapabilities returns every registered venue's fact sheet for the API.
+func (e *Engine) VenueCapabilities() []venue.Capabilities {
+	if e.venues == nil {
+		return []venue.Capabilities{}
+	}
+	return e.venues.All()
+}
+
+// data returns a venue's market data source. A nil result means the venue is
+// not registered, which callers must treat as unavailable rather than falling
+// back to another venue.
+func (e *Engine) data(v market.Venue) venue.MarketData {
+	if e.venues == nil {
+		return nil
+	}
+	return e.venues.Data(effectiveVenue(v))
+}
+
+// executor resolves a venue's trading surface. The error distinguishes a
+// read-only venue from one that is merely unconfigured.
+func (e *Engine) executor(v market.Venue) (venue.Executor, error) {
+	if e.venues == nil {
+		return nil, fmt.Errorf("%w: %s", ErrVenueReadOnly, effectiveVenue(v).Label())
+	}
+	exec, err := e.venues.ExecutorFor(effectiveVenue(v))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrVenueReadOnly, err)
+	}
+	return exec, nil
+}
+
+func (e *Engine) capabilities(v market.Venue) (venue.Capabilities, bool) {
+	if e.venues == nil {
+		return venue.Capabilities{}, false
+	}
+	return e.venues.Capabilities(effectiveVenue(v))
+}
+
+// supportsSettlement reports whether the engine may settle this venue's
+// positions from reference data. Predict.fun has no resolution feed this build
+// understands, so its positions must stay open instead of being guessed closed.
+func (e *Engine) supportsSettlement(v market.Venue) bool {
+	caps, ok := e.capabilities(v)
+	if !ok {
+		return effectiveVenue(v) == market.VenuePolymarket
+	}
+	return caps.SupportsSettlement
+}
+
+// sourceName is the aggregate label the radar and dashboard render. With one
+// registered venue it is exactly that provider's name, which keeps the
+// Polymarket label byte-identical.
+func (e *Engine) sourceName() string {
+	names := make([]string, 0, len(e.Venues()))
+	for _, v := range e.Venues() {
+		if data := e.data(v); data != nil {
+			names = append(names, data.Name())
+		}
+	}
+	return strings.Join(names, " + ")
+}
+
+// marketKey namespaces an identifier by venue. Token and market ids are only
+// unique inside one venue: both exchanges use decimal ERC-1155 ids, so a bare
+// string key would let a Predict.fun row mask a Polymarket row.
+func marketKey(v market.Venue, id string) string {
+	return string(effectiveVenue(v)) + "\x00" + id
+}
+
+// venueList returns the venues a scan should visit for the given options.
+func (e *Engine) venueList(settings Settings, only market.Venue) []market.Venue {
+	if only != "" && !only.Valid() {
+		return nil
+	}
+	venues := make([]market.Venue, 0, len(e.Venues()))
+	for _, v := range e.Venues() {
+		if only != "" && v != only {
+			continue
+		}
+		if !settings.For(v).Enabled {
+			continue
+		}
+		venues = append(venues, v)
+	}
+	return venues
+}
+
+// venueScanContext gives one venue its own slice of the scan deadline so a
+// slow upstream cannot consume the budget of another venue.
+func venueScanContext(ctx context.Context, venues int) (context.Context, context.CancelFunc) {
+	const budget = 90 * time.Second
+	window := budget
+	if venues > 1 {
+		window = budget / time.Duration(venues)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < window {
+			window = remaining
+		}
+	}
+	if window <= 0 {
+		window = time.Second
+	}
+	return context.WithTimeout(ctx, window)
 }
 
 func (e *Engine) Start(parent context.Context) {
@@ -125,7 +248,24 @@ func (e *Engine) run(ctx context.Context) {
 func (e *Engine) Settings() Settings {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.settings
+	settings := e.settings
+	// The venue map is shared state: a caller that mutates what it loaded would
+	// change the engine's configuration without saving it.
+	settings.Venues = cloneVenueSettings(settings.Venues)
+	return settings
+}
+
+// cloneVenueSettings copies the per-venue strategy blocks so a returned snapshot
+// is safe to edit and save back.
+func cloneVenueSettings(in map[market.Venue]VenueSettings) map[market.Venue]VenueSettings {
+	if in == nil {
+		return nil
+	}
+	out := make(map[market.Venue]VenueSettings, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
@@ -144,11 +284,26 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	if settings.StopLossRatio == 0 {
 		settings.StopLossRatio = defaults.StopLossRatio
 	}
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	// Read-modify-write for the venue map: an old client that only sends the
+	// flat fields must not erase per-venue overrides it does not know about.
+	previous := e.Settings()
+	if settings.Venues == nil {
+		settings.Venues = previous.Venues
+	} else if len(previous.Venues) > 0 {
+		merged := make(map[market.Venue]VenueSettings, len(previous.Venues)+len(settings.Venues))
+		for v, entry := range previous.Venues {
+			merged[v] = entry
+		}
+		for v, entry := range settings.Venues {
+			merged[v] = entry
+		}
+		settings.Venues = merged
+	}
 	if err := settings.Validate(); err != nil {
 		return err
 	}
-	e.tradeMu.Lock()
-	defer e.tradeMu.Unlock()
 	if err := e.repo.SaveSettings(ctx, settings); err != nil {
 		return err
 	}
@@ -161,7 +316,22 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 func (e *Engine) SystemSettings() SystemSettings {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.system
+	system := e.system
+	system.Venues = cloneVenueSystemSettings(system.Venues)
+	return system
+}
+
+// cloneVenueSystemSettings copies the per-venue credential blocks so a returned
+// snapshot cannot be edited in place behind the engine's back.
+func cloneVenueSystemSettings(in map[market.Venue]VenueSystemSettings) map[market.Venue]VenueSystemSettings {
+	if in == nil {
+		return nil
+	}
+	out := make(map[market.Venue]VenueSystemSettings, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 // UpdateSystemSettings persists the runtime egress, endpoint and live-trading
@@ -191,37 +361,113 @@ func (e *Engine) UpdateSystemSettings(ctx context.Context, settings SystemSettin
 	e.system = settings
 	e.systemError = ""
 	e.mu.Unlock()
-	if reloader, ok := e.live.(interface{ ReloadProxy() }); ok && reloader != nil {
-		reloader.ReloadProxy()
+	for _, v := range e.Venues() {
+		if reloader, ok := e.venues.Executor(v).(interface{ ReloadProxy() }); ok && reloader != nil {
+			reloader.ReloadProxy()
+		}
 	}
 	return nil
 }
 
-// ProbeLive checks candidate live credentials against the CLOB without saving
-// them or placing an order. The browser echoes masked secrets back, so they are
-// restored from the stored settings first.
-func (e *Engine) ProbeLive(ctx context.Context, settings LiveSettings, clobBaseURL string) (LiveProbe, error) {
-	settings = settings.MergeSecret(e.SystemSettings().Live).Normalize()
-	if err := settings.Validate(); err != nil {
+// ProbeLive checks candidate live credentials against the venue's trading API
+// without saving them or placing an order. The browser echoes masked secrets
+// back, so they are restored from the stored settings first. Only the
+// Polymarket adapter implements the probe interface today.
+func (e *Engine) ProbeLive(ctx context.Context, v market.Venue, settings LiveSettings, clobBaseURL string) (LiveProbe, error) {
+	return e.ProbeLiveVenue(ctx, v, VenueLiveSettings{LiveSettings: settings}, clobBaseURL)
+}
+
+// VenueApproval reports the on-chain allowances a venue's live trading needs. A
+// venue that trades through a proxy, or one that is registered read-only,
+// reports that no approval is required instead of failing.
+func (e *Engine) VenueApproval(ctx context.Context, v market.Venue) (venue.Approval, error) {
+	approver, label, err := e.approver(v)
+	if err != nil {
+		return venue.Approval{}, err
+	}
+	approval, err := approver.ApprovalState(ctx)
+	if err != nil {
+		return venue.Approval{}, fmt.Errorf("%w: %s 授权状态读取失败: %v", ErrUpstream, label, err)
+	}
+	return approval, nil
+}
+
+// ApproveVenue grants the missing on-chain allowances and returns the new state.
+// It holds the trade mutex: an approval transaction must not interleave with an
+// order that is being signed against the old allowance.
+func (e *Engine) ApproveVenue(ctx context.Context, v market.Venue) (venue.Approval, error) {
+	approver, label, err := e.approver(v)
+	if err != nil {
+		return venue.Approval{}, err
+	}
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	approval, err := approver.GrantApprovals(ctx)
+	if err != nil {
+		return venue.Approval{}, fmt.Errorf("%w: %s 链上授权失败: %v", ErrUpstream, label, err)
+	}
+	return approval, nil
+}
+
+// approver resolves the venue's approval capability, explaining the two cases in
+// which there is nothing to approve.
+func (e *Engine) approver(v market.Venue) (venue.Approver, string, error) {
+	label := effectiveVenue(v).Label()
+	exec, err := e.executor(v)
+	if err != nil {
+		return nil, label, fmt.Errorf("%w: %s 只读运行，无法执行链上授权", ErrVenueReadOnly, label)
+	}
+	approver, ok := exec.(venue.Approver)
+	if !ok || approver == nil {
+		return nil, label, fmt.Errorf("%w: %s 通过托管账户交易", ErrNoApproval, label)
+	}
+	// Reading allowances needs a wallet to read them for, so an unconfigured
+	// venue answers with the configuration error instead of a chain-timeout.
+	if !exec.Configured() {
+		return nil, label, fmt.Errorf("%w: %s 未配置实盘凭据，无法读取链上授权", ErrInvalidSettings, label)
+	}
+	return approver, label, nil
+}
+
+// ProbeLiveVenue is the venue-aware credential check used by the settings page.
+// Polymarket keeps its dedicated /auth probe; Predict.fun has no such endpoint,
+// so its credentials are validated locally and a collateral read through the
+// BNB chain proves the key and the RPC endpoint agree.
+func (e *Engine) ProbeLiveVenue(ctx context.Context, v market.Venue, settings VenueLiveSettings, clobBaseURL string) (LiveProbe, error) {
+	v = effectiveVenue(v)
+	if v == market.VenuePredictFun {
+		return e.probePredictFunLive(ctx, v, settings)
+	}
+	flat := settings.LiveSettings.MergeSecret(e.SystemSettings().Live).Normalize()
+	if err := flat.Validate(); err != nil {
 		return LiveProbe{}, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
 	}
-	probe, ok := e.live.(liveProbeRuntime)
-	if !ok || probe == nil {
-		return LiveProbe{}, fmt.Errorf("当前实盘执行器不支持凭据检测")
+	exec, err := e.executor(v)
+	if err != nil {
+		return LiveProbe{}, fmt.Errorf("%w", ErrVenueReadOnly)
 	}
-	return probe.Probe(ctx, settings, clobBaseURL)
+	probe, ok := exec.(liveProbeRuntime)
+	if !ok || probe == nil {
+		return LiveProbe{}, fmt.Errorf("%w: %s 暂不支持凭据检测", ErrInvalidSettings, v.Label())
+	}
+	return probe.Probe(ctx, flat, clobBaseURL)
 }
 
 // ProbeRelayer checks a Relayer API key without submitting anything. Relayer
 // keys only authenticate gasless wallet batches; they cannot place orders.
-func (e *Engine) ProbeRelayer(ctx context.Context, settings LiveSettings, clobBaseURL, apiKey, address string) (RelayerProbe, error) {
+func (e *Engine) ProbeRelayer(ctx context.Context, v market.Venue, settings LiveSettings, clobBaseURL, apiKey, address string) (RelayerProbe, error) {
+	v = effectiveVenue(v)
 	settings = settings.MergeSecret(e.SystemSettings().Live).Normalize()
 	if err := settings.Validate(); err != nil {
 		return RelayerProbe{}, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
 	}
-	probe, ok := e.live.(relayerProbeRuntime)
+	exec, err := e.executor(v)
+	if err != nil {
+		return RelayerProbe{}, fmt.Errorf("%w", ErrVenueReadOnly)
+	}
+	probe, ok := exec.(relayerProbeRuntime)
 	if !ok || probe == nil {
-		return RelayerProbe{}, fmt.Errorf("当前实盘执行器不支持 Relayer 凭据检测")
+		return RelayerProbe{}, fmt.Errorf("%w: %s 暂不支持 Relayer 凭据检测", ErrInvalidSettings, v.Label())
 	}
 	return probe.ProbeRelayer(ctx, settings, clobBaseURL, apiKey, address)
 }
@@ -230,69 +476,274 @@ func (e *Engine) ProbeRelayer(ctx context.Context, settings LiveSettings, clobBa
 // configured signer and detects its wallet type (EOA / Proxy / Safe / Deposit).
 // It works before a funder is set, so the settings page can fill both fields
 // instead of asking the operator to copy an address and guess a type.
-func (e *Engine) DiscoverWallet(ctx context.Context, settings LiveSettings, endpoints WalletEndpoints) (WalletDiscovery, error) {
+func (e *Engine) DiscoverWallet(ctx context.Context, v market.Venue, settings LiveSettings, endpoints WalletEndpoints) (WalletDiscovery, error) {
+	v = effectiveVenue(v)
+	if v != market.VenuePolymarket {
+		return WalletDiscovery{}, fmt.Errorf("%w: %s 不支持钱包自动检测", ErrInvalidSettings, v.Label())
+	}
 	settings = settings.MergeSecret(e.SystemSettings().Live).Normalize()
 	runtime := e.SystemRuntime()
 	if strings.TrimSpace(endpoints.Gamma) == "" {
 		endpoints.Gamma = runtime.GammaBaseURL
 	}
-	discovery, ok := e.live.(walletDiscovery)
+	exec, err := e.executor(v)
+	if err != nil {
+		return WalletDiscovery{}, fmt.Errorf("%w", ErrVenueReadOnly)
+	}
+	discovery, ok := exec.(walletDiscovery)
 	if !ok || discovery == nil {
 		return WalletDiscovery{}, fmt.Errorf("当前实盘执行器不支持钱包自动检测")
 	}
 	return discovery.DiscoverWallet(ctx, settings, endpoints)
 }
 
-// applyRuntimeSettings applies proxy, data-source and live credentials in
-// order. If a later step fails, earlier steps are rolled back to previous.
+// applyRuntimeSettings applies proxy, per-venue data-source endpoints and the
+// Polymarket live credentials in order. If a later step fails, earlier steps
+// are rolled back so an unusable value never becomes effective.
 func (e *Engine) applyRuntimeSettings(settings SystemSettings) error {
+	settings = settings.Normalize()
 	previous := e.SystemSettings()
 	if e.proxy != nil {
 		if err := e.proxy.Apply(settings.Proxy); err != nil {
 			return err
 		}
 	}
-	provider, hasProvider := e.provider.(dataSourceRuntime)
-	if hasProvider {
-		if err := provider.SetBaseURL(settings.DataSource.GammaBaseURL); err != nil {
-			if e.proxy != nil {
-				_ = e.proxy.Apply(previous.Proxy)
-			}
+	type restore struct {
+		provider dataSourceRuntime
+		baseURL  string
+	}
+	var restored []restore
+	rollback := func() {
+		for i := len(restored) - 1; i >= 0; i-- {
+			_ = restored[i].provider.SetBaseURL(restored[i].baseURL)
+		}
+		if e.proxy != nil {
+			_ = e.proxy.Apply(previous.Proxy)
+		}
+	}
+	for _, v := range e.Venues() {
+		provider, ok := e.data(v).(dataSourceRuntime)
+		if !ok || provider == nil {
+			continue
+		}
+		restored = append(restored, restore{provider: provider, baseURL: provider.BaseURL()})
+		if err := provider.SetBaseURL(venueBaseURL(settings, v)); err != nil {
+			rollback()
 			return err
 		}
 	}
-	updater, hasLive := e.live.(liveSettingsRuntime)
-	if hasLive {
-		if err := updater.UpdateSettings(settings.Live, settings.DataSource.CLOBBaseURL); err != nil {
-			if hasProvider {
-				_ = provider.SetBaseURL(previous.DataSource.GammaBaseURL)
-			}
-			if e.proxy != nil {
-				_ = e.proxy.Apply(previous.Proxy)
-			}
+	if updater, ok := e.venues.Executor(market.VenuePolymarket).(liveSettingsRuntime); ok && updater != nil {
+		pm := settings.Venues[market.VenuePolymarket]
+		if err := updater.UpdateSettings(pm.Live.LiveSettings, pm.DataSource.CLOBBaseURL); err != nil {
+			rollback()
 			return err
+		}
+	}
+	// Predict.fun shares one configuration between its data client and its
+	// executor, so the executor applies the stored credentials directly. They
+	// are validated before the swap, which keeps the previous ones effective
+	// when a stored row is unusable. An absent venue block means "inherit the
+	// process environment", so the constructor's credentials are left alone.
+	if pf, ok := settings.Venues[market.VenuePredictFun]; ok {
+		if updater, ok := e.venues.Executor(market.VenuePredictFun).(venueCredentialRuntime); ok && updater != nil {
+			err := updater.ApplyLiveSettings(pf.Live.APIKey, pf.Live.PrivateKey, pf.Live.SmartWallet, pf.Live.Testnet, pf.DataSource.BaseURL)
+			if err != nil {
+				rollback()
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-// SystemRuntime reports the effective endpoints and the live executor state.
+// venueCredentialRuntime lets the engine hand a venue its stored credentials
+// without a restart. Predict.fun implements it on the data client and on the
+// executor, which share one atomic configuration.
+type venueCredentialRuntime interface {
+	ApplyLiveSettings(apiKey, privateKey, smartWallet string, testnet *bool, baseURL string) error
+}
+
+// venueCredentialResetter restores the startup configuration. Credential
+// application treats empty strings as "keep", so it cannot express "go back to
+// the process wallet"; a reset can, and a test run must never leave the
+// executor holding candidate credentials.
+type venueCredentialResetter interface {
+	ResetLiveSettings() error
+}
+
+// probePredictFunLive checks candidate credentials without saving them. The
+// candidate is applied, the collateral balance is read through the chain
+// endpoint, and the stored credentials are restored afterwards so a test never
+// leaves the executor half-configured.
+func (e *Engine) probePredictFunLive(ctx context.Context, v market.Venue, candidate VenueLiveSettings) (LiveProbe, error) {
+	// The probe swaps credentials on the executor that live orders also use, so
+	// it runs under the same mutex: a scan must not sign an order with the
+	// candidate key, and a half-applied probe must not race a settings save.
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	exec, err := e.executor(v)
+	if err != nil {
+		return LiveProbe{}, fmt.Errorf("%w", ErrVenueReadOnly)
+	}
+	runtime, ok := exec.(venueCredentialRuntime)
+	if !ok || runtime == nil {
+		return LiveProbe{}, fmt.Errorf("%w: %s 暂不支持凭据检测", ErrInvalidSettings, v.Label())
+	}
+	stored := e.SystemSettings().Venues[v].Live
+	value := func(candidate, stored string) string {
+		if candidate == "" || candidate == netproxy.RedactedSecret {
+			return stored
+		}
+		return candidate
+	}
+	apiKey := value(strings.TrimSpace(candidate.APIKey), stored.APIKey)
+	privateKey := value(candidate.PrivateKey, stored.PrivateKey)
+	smartWallet := value(strings.TrimSpace(candidate.SmartWallet), stored.SmartWallet)
+	testnet := candidate.Testnet
+	if err := runtime.ApplyLiveSettings(apiKey, privateKey, smartWallet, testnet, ""); err != nil {
+		return LiveProbe{}, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
+	defer e.restoreLiveCredentials(v, exec, runtime, stored)
+	if message := exec.ReadyError(); message != "" {
+		return LiveProbe{}, fmt.Errorf("%w: %s", ErrInvalidSettings, message)
+	}
+	start := time.Now()
+	snapshot, err := exec.Collateral(ctx)
+	if err != nil {
+		return LiveProbe{}, err
+	}
+	return LiveProbe{
+		Signer:    exec.Signer(),
+		Maker:     exec.Maker(),
+		APIKey:    maskCredential(apiKey),
+		Source:    "chain",
+		Mode:      "live",
+		Cash:      snapshot.Amount,
+		Allowance: snapshot.Allowance,
+		LatencyMS: float64(time.Since(start).Milliseconds()),
+	}, nil
+}
+
+// restoreLiveCredentials puts the executor back on its startup configuration and
+// then re-applies what the operator saved. A reset alone would drop persisted
+// credentials; re-applying alone would keep the candidate's wallet, because an
+// empty string means "keep" rather than "inherit".
+func (e *Engine) restoreLiveCredentials(v market.Venue, exec venue.Executor, runtime venueCredentialRuntime, stored VenueLiveSettings) {
+	var restoreErr error
+	if resetter, ok := exec.(venueCredentialResetter); ok {
+		if err := resetter.ResetLiveSettings(); err == nil {
+			if block, exists := e.SystemSettings().Venues[v]; exists {
+				restoreErr = runtime.ApplyLiveSettings(block.Live.APIKey, block.Live.PrivateKey, block.Live.SmartWallet, block.Live.Testnet, block.DataSource.BaseURL)
+			}
+		} else {
+			restoreErr = err
+		}
+	} else {
+		restoreErr = runtime.ApplyLiveSettings(stored.APIKey, stored.PrivateKey, stored.SmartWallet, stored.Testnet, "")
+	}
+	if restoreErr == nil {
+		return
+	}
+	// A probe that cannot put the saved credentials back leaves the executor on
+	// the tested candidate, so the failure has to be visible: swallowing it would
+	// let a "credential check" silently switch what the next order signs with.
+	e.mu.Lock()
+	e.systemError = fmt.Sprintf("%s 凭据检测后恢复已存配置失败：%v", v.Label(), restoreErr)
+	e.mu.Unlock()
+}
+
+// maskCredential keeps the identifying prefix of an API key, matching how the
+// Polymarket probe reports it.
+func maskCredential(value string) string {
+	if len(value) <= 8 {
+		return value
+	}
+	return value[:8] + "…"
+}
+
+// venueBaseURL is the data-source override for one venue. Polymarket keeps the
+// legacy gamma_base_url field; Predict.fun uses its own base_url.
+func venueBaseURL(settings SystemSettings, v market.Venue) string {
+	entry, ok := settings.Venues[v]
+	if !ok {
+		return ""
+	}
+	if v == market.VenuePredictFun {
+		return entry.DataSource.BaseURL
+	}
+	return entry.DataSource.GammaBaseURL
+}
+
+// SystemRuntime reports the effective endpoints and every venue's executor
+// state. The flat Gamma/CLOB fields remain the Polymarket view.
 func (e *Engine) SystemRuntime() SystemRuntime {
 	runtime := SystemRuntime{}
-	if provider, ok := e.provider.(dataSourceRuntime); ok && provider != nil {
+	if provider, ok := e.data(market.VenuePolymarket).(dataSourceRuntime); ok && provider != nil {
 		runtime.GammaBaseURL = provider.BaseURL()
 		runtime.GammaDefault = provider.DefaultBaseURL()
 	}
-	if live, ok := e.live.(liveSettingsRuntime); ok && live != nil {
+	if live, ok := e.venues.Executor(market.VenuePolymarket).(liveSettingsRuntime); ok && live != nil {
 		runtime.CLOBBaseURL = live.EffectiveCLOBURL()
 		runtime.LiveEnvironment = live.Environment()
 		runtime.CLOBDefault = runtime.LiveEnvironment.CLOBBaseURL
 	}
 	runtime.LiveConfigured, runtime.LiveReady, runtime.LiveError = e.LiveStatus()
+	runtime.Venues = e.venueRuntimes()
 	e.mu.RLock()
 	runtime.Error = e.systemError
 	e.mu.RUnlock()
+	// A venue without settlement support must say so where an operator can see
+	// it, instead of leaving positions open with no explanation.
+	var notices []string
+	for _, v := range e.Venues() {
+		if caps, ok := e.capabilities(v); ok && !caps.SupportsSettlement {
+			notices = append(notices, fmt.Sprintf("%s 暂不支持自动结算", v.Label()))
+		}
+	}
+	if notice := strings.Join(notices, "; "); notice != "" {
+		if runtime.Error != "" {
+			runtime.Error += "; " + notice
+		} else {
+			runtime.Error = notice
+		}
+	}
 	return runtime
+}
+
+// venueRuntimes builds one status row per registered venue.
+// venueNetworkReporter is implemented by executors that can say which network
+// they are trading on right now.
+type venueNetworkReporter interface {
+	Testnet() bool
+}
+
+func (e *Engine) venueRuntimes() []VenueRuntime {
+	runtimes := make([]VenueRuntime, 0, len(e.Venues()))
+	for _, v := range e.Venues() {
+		status := VenueRuntime{Venue: v}
+		if caps, ok := e.capabilities(v); ok {
+			status.Testnet = caps.Testnet
+		}
+		exec := e.venues.Executor(v)
+		// Prefer the network the executor is actually pointed at: capabilities
+		// are frozen at registration, so a credential save that switches networks
+		// would otherwise leave the badge lying about which chain is live.
+		if reporter, ok := exec.(venueNetworkReporter); ok {
+			status.Testnet = reporter.Testnet()
+		}
+		if exec == nil {
+			status.Error = ErrVenueReadOnly.Error()
+			runtimes = append(runtimes, status)
+			continue
+		}
+		status.Configured = exec.Configured()
+		status.Signer = exec.Signer()
+		status.Maker = exec.Maker()
+		status.Error = exec.ReadyError()
+		status.Ready = status.Configured && status.Error == ""
+		runtimes = append(runtimes, status)
+	}
+	return runtimes
 }
 
 func (e *Engine) Status() EngineStatus {
@@ -324,14 +775,15 @@ func (e *Engine) Opportunities() OpportunityList {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	items := append([]Opportunity{}, e.opportunities...)
-	return OpportunityList{Items: items, Total: len(items), ScannedAt: e.lastSyncAt, Source: e.provider.Name()}
+	venues := append([]market.Venue{}, e.scannedVenues...)
+	return OpportunityList{Items: items, Total: len(items), ScannedAt: e.lastSyncAt, Source: e.sourceName(), Venues: venues}
 }
 
 // QuoteOpportunity returns a real-data estimate for one radar row: the ask
-// book and taker fee schedule are read from the CLOB, so NetYield is net of
-// fees and uses the price a FAK order would actually pay instead of the Gamma
-// reference price. It is read-only and available for paper accounts too.
-func (e *Engine) QuoteOpportunity(ctx context.Context, tokenID string, amount float64) (OpportunityQuote, error) {
+// book and taker fee are read from the venue that owns the token, so NetYield
+// is net of that venue's fees and uses the price a real order would pay. It is
+// read-only and available for paper accounts too.
+func (e *Engine) QuoteOpportunity(ctx context.Context, tokenID string, amount float64, onlyVenue market.Venue) (OpportunityQuote, error) {
 	tokenID = strings.TrimSpace(tokenID)
 	if tokenID == "" {
 		return OpportunityQuote{}, fmt.Errorf("%w: token_id 不能为空", ErrInvalidOrder)
@@ -340,29 +792,33 @@ func (e *Engine) QuoteOpportunity(ctx context.Context, tokenID string, amount fl
 		return OpportunityQuote{}, fmt.Errorf("%w: 金额必须为有限正数", ErrInvalidOrder)
 	}
 	settings := e.Settings()
-	if amount == 0 {
-		amount = settings.OrderSize
-	}
 
 	e.mu.RLock()
 	var target Opportunity
 	found := false
 	for _, opportunity := range e.opportunities {
-		if opportunity.TokenID == tokenID {
-			target = opportunity
-			found = true
-			break
+		if opportunity.TokenID != tokenID {
+			continue
 		}
+		if onlyVenue != "" && opportunity.EffectiveVenue() != onlyVenue {
+			continue
+		}
+		target = opportunity
+		found = true
+		break
 	}
 	e.mu.RUnlock()
 	if !found {
 		return OpportunityQuote{}, fmt.Errorf("%w: 该 token 不在当前雷达列表，请先刷新行情", ErrInvalidOrder)
 	}
-	if e.live == nil {
-		return OpportunityQuote{}, fmt.Errorf("%w: 未配置实盘执行器", ErrLiveUnavailable)
+	if amount == 0 {
+		amount = settings.For(target.EffectiveVenue()).OrderSize
 	}
-
-	quote, err := e.live.Quote(ctx, target.TokenID, target.ConditionID, amount)
+	exec, err := e.executor(target.EffectiveVenue())
+	if err != nil {
+		return OpportunityQuote{}, err
+	}
+	quote, err := exec.Quote(ctx, target.TokenID, target.ConditionID, amount)
 	if err != nil {
 		return OpportunityQuote{}, fmt.Errorf("%w: 读取真实盘口或手续费失败: %v", ErrUpstream, err)
 	}
@@ -377,12 +833,16 @@ func (e *Engine) QuoteOpportunity(ctx context.Context, tokenID string, amount fl
 	if quote.FillPrice > 0 && quote.FillPrice < 1 {
 		grossYield = (1 - quote.FillPrice) / quote.FillPrice
 	}
+	v := target.EffectiveVenue()
 	return OpportunityQuote{
-		TokenID: target.TokenID, ConditionID: target.ConditionID, Amount: amount,
+		TokenID: target.TokenID, ConditionID: target.ConditionID,
+		Venue: v, Currency: target.EffectiveCurrency(), Amount: roundForVenue(v, amount),
 		BestAsk: quote.BestAsk, LimitPrice: quote.LimitPrice, FillPrice: quote.FillPrice,
-		Shares: quote.Shares, Notional: quote.Notional, FeeRate: quote.FeeRate, Fee: quote.Fee,
-		TotalCost: totalCost, Payout: payout, NetProfit: netProfit, NetYield: netYield,
-		GrossYield: grossYield, AvailableNotional: quote.AvailableNotional,
+		Shares: roundForVenue(v, quote.Shares), Notional: roundForVenue(v, quote.Notional),
+		FeeRate: quote.FeeRate, Fee: roundForVenue(v, quote.Fee),
+		TotalCost: roundForVenue(v, totalCost), Payout: roundForVenue(v, payout),
+		NetProfit: roundForVenue(v, netProfit), NetYield: netYield,
+		GrossYield: grossYield, AvailableNotional: roundForVenue(v, quote.AvailableNotional),
 		FullyFilled:     quote.FullyFilled,
 		ExceedsMaxPrice: quote.LimitPrice > settings.MaxPrice+1e-9, MaxPrice: settings.MaxPrice,
 		QuotedAt: time.Now().UTC(),
@@ -417,6 +877,9 @@ func (e *Engine) ResolveAccount(ctx context.Context, id int64) (Account, error) 
 }
 
 func (e *Engine) decorateAccount(account Account) Account {
+	account.Venue = account.EffectiveVenue()
+	account.Currency = account.EffectiveCurrency()
+	account.BaselineEquity = roundForVenue(account.Venue, account.BaselineEquity)
 	if account.Mode == AccountModePaper && account.BaselineEquity <= 0 {
 		// New() backfills persisted accounts; this is a last-resort display
 		// fallback for a caller that constructed an engine without New.
@@ -430,30 +893,38 @@ func (e *Engine) decorateAccount(account Account) Account {
 	if account.Mode != AccountModeLive {
 		return account
 	}
-	if e.live == nil {
-		account.LiveError = "未配置实盘执行器"
+	exec, err := e.executor(account.EffectiveVenue())
+	if err != nil {
+		account.LiveError = ErrVenueReadOnly.Error()
 		return account
 	}
-	account.LiveConfigured = e.live.Configured()
-	account.LiveReady = account.LiveConfigured && e.live.ReadyError() == ""
-	account.LiveSigner = e.live.Signer()
-	account.LiveMaker = e.live.Maker()
-	account.LiveError = e.live.ReadyError()
+	account.LiveConfigured = exec.Configured()
+	account.LiveError = exec.ReadyError()
+	account.LiveReady = account.LiveConfigured && account.LiveError == ""
+	account.LiveSigner = exec.Signer()
+	account.LiveMaker = exec.Maker()
 	return account
 }
 
-// LiveStatus reports the executor state independently of the currently
-// selected default account.
+// LiveStatus reports the Polymarket executor state independently of the
+// currently selected default account. It is the legacy health-check shape;
+// SystemRuntime carries the per-venue view.
 func (e *Engine) LiveStatus() (configured, ready bool, message string) {
-	if e.live == nil {
-		return false, false, "未配置实盘执行器"
+	return e.LiveStatusFor(market.VenuePolymarket)
+}
+
+// LiveStatusFor reports one venue's executor state.
+func (e *Engine) LiveStatusFor(v market.Venue) (configured, ready bool, message string) {
+	exec, err := e.executor(v)
+	if err != nil {
+		return false, false, ErrVenueReadOnly.Error()
 	}
-	configured = e.live.Configured()
-	message = e.live.ReadyError()
+	configured = exec.Configured()
+	message = exec.ReadyError()
 	return configured, configured && message == "", message
 }
 
-func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMode) (Account, error) {
+func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMode, v market.Venue) (Account, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return Account{}, fmt.Errorf("%w: 账户名称不能为空", ErrInvalidOrder)
@@ -464,6 +935,10 @@ func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMod
 	if !mode.Valid() {
 		return Account{}, fmt.Errorf("%w: 账户模式仅支持 live 或 paper", ErrInvalidOrder)
 	}
+	v = effectiveVenue(v)
+	if !v.Valid() {
+		return Account{}, fmt.Errorf("%w: 未知场所", ErrInvalidOrder)
+	}
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
 	accounts, err := e.repo.ListAccounts(ctx)
@@ -471,12 +946,14 @@ func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMod
 		return Account{}, err
 	}
 	for _, existing := range accounts {
-		if mode == AccountModeLive && existing.Mode == AccountModeLive {
-			return Account{}, fmt.Errorf("%w: 每个实例只允许一个实盘账户", ErrAccountConflict)
+		// Live accounts are unique per venue: Polymarket and Predict.fun keep
+		// separate wallets, so one live account each may coexist.
+		if mode == AccountModeLive && existing.Mode == AccountModeLive && existing.EffectiveVenue() == v {
+			return Account{}, fmt.Errorf("%w: 每个场所只允许一个实盘账户", ErrAccountConflict)
 		}
 	}
 	account := Account{
-		Name: name, Mode: mode, AutoTrade: false, CreatedAt: time.Now().UTC(),
+		Name: name, Mode: mode, Venue: v, Currency: currencyForVenue(v), AutoTrade: false, CreatedAt: time.Now().UTC(),
 	}
 	if mode == AccountModePaper {
 		account.BaselineEquity = e.Settings().InitialBankroll
@@ -488,12 +965,24 @@ func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMod
 	return e.decorateAccount(account), nil
 }
 
-func (e *Engine) UpdateAccount(ctx context.Context, id int64, name *string, autoTrade *bool, makeDefault *bool) (Account, error) {
+func (e *Engine) UpdateAccount(ctx context.Context, id int64, name *string, autoTrade *bool, makeDefault *bool, v *market.Venue) (Account, error) {
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
 	account, err := e.repo.AccountByID(ctx, id)
 	if err != nil {
 		return Account{}, err
+	}
+	if v != nil {
+		// An account's venue decides which wallet and currency its ledger is
+		// denominated in. Changing it after the fact would silently reinterpret
+		// every historical row, so it is rejected instead of migrated.
+		requested := effectiveVenue(*v)
+		if !requested.Valid() {
+			return Account{}, fmt.Errorf("%w: 未知场所", ErrInvalidOrder)
+		}
+		if requested != account.EffectiveVenue() {
+			return Account{}, fmt.Errorf("%w: 账户所属场所不能修改", ErrInvalidOrder)
+		}
 	}
 	if name != nil {
 		trimmed := strings.TrimSpace(*name)
@@ -507,11 +996,15 @@ func (e *Engine) UpdateAccount(ctx context.Context, id int64, name *string, auto
 	}
 	if autoTrade != nil {
 		if *autoTrade && account.Mode == AccountModeLive {
-			if e.live == nil || !e.live.Configured() {
+			exec, execErr := e.executor(account.EffectiveVenue())
+			if execErr != nil {
 				return Account{}, fmt.Errorf("%w: 配置实盘凭据后才能开启自动交易", ErrLiveUnavailable)
 			}
-			if message := e.live.ReadyError(); message != "" {
-				return Account{}, fmt.Errorf("%w: 实盘凭据未就绪: %s", ErrLiveUnavailable, message)
+			if !exec.Configured() {
+				return Account{}, fmt.Errorf("%w: 配置实盘凭据后才能开启自动交易", ErrVenueNotConfigured)
+			}
+			if message := exec.ReadyError(); message != "" {
+				return Account{}, fmt.Errorf("%w: 实盘凭据未就绪: %s", ErrVenueNotConfigured, message)
 			}
 		}
 		account.AutoTrade = *autoTrade
@@ -568,8 +1061,8 @@ func (e *Engine) ScanOnly(ctx context.Context) error {
 // overrides the account's background AutoTrade switch for this one pass. The
 // summary reports how many positions were opened and how many held markets
 // were skipped so the radar can explain the result.
-func (e *Engine) ManualScan(ctx context.Context, accountID int64, execute bool) (ScanSummary, error) {
-	return e.scan(ctx, ScanOptions{Execute: execute, AccountID: accountID, Manual: accountID > 0})
+func (e *Engine) ManualScan(ctx context.Context, accountID int64, execute bool, v market.Venue) (ScanSummary, error) {
+	return e.scan(ctx, ScanOptions{Execute: execute, AccountID: accountID, Manual: accountID > 0, Venue: v})
 }
 
 func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, error) {
@@ -584,17 +1077,59 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 	}
 
 	settings := e.Settings()
-	markets, err := e.provider.ListOpen(ctx, settings.MaxDays)
 	now := time.Now().UTC()
-	e.recordScan(now, err)
-	if err != nil {
-		return summary, fmt.Errorf("%w: %v", ErrUpstream, err)
+	venues := e.venueList(settings, options.Venue)
+	markets := make([]market.Market, 0)
+	byID := make(map[string]market.Market)
+	scanned := make([]market.Venue, 0, len(venues))
+	failures := make([]string, 0)
+	succeeded := 0
+	for _, v := range venues {
+		source := e.data(v)
+		if source == nil {
+			failures = append(failures, fmt.Sprintf("%s: 未注册行情源", v.Label()))
+			continue
+		}
+		// Each venue gets its own deadline so one slow upstream cannot consume
+		// the scan budget of another venue.
+		scanCtx, cancel := venueScanContext(ctx, len(venues))
+		items, listErr := source.ListOpen(scanCtx, settings.MaxDays)
+		cancel()
+		if listErr != nil {
+			// Error isolation: a failing venue is recorded and skipped, but the
+			// opportunities of every other venue survive this scan.
+			failures = append(failures, fmt.Sprintf("%s 行情获取失败: %v", v.Label(), listErr))
+			continue
+		}
+		succeeded++
+		scanned = append(scanned, v)
+		for _, item := range items {
+			// The registry guarantees this data source only returns its own
+			// venue's markets, so stamp it explicitly instead of trusting a
+			// provider that forgot the field.
+			item.Venue = v
+			if item.Currency == "" {
+				item.Currency = currencyForVenue(v)
+			}
+			markets = append(markets, item)
+			byID[marketKey(v, item.ID)] = item
+		}
+	}
+	venueFailure := strings.Join(failures, "; ")
+	if venueFailure != "" {
+		e.recordScan(now, errors.New(venueFailure))
+		if succeeded == 0 {
+			return summary, fmt.Errorf("%w: %s", ErrUpstream, venueFailure)
+		}
+	} else {
+		e.recordScan(now, nil)
 	}
 
 	opportunities := make([]Opportunity, 0)
-	byID := make(map[string]market.Market, len(markets))
 	for _, item := range markets {
-		byID[item.ID] = item
+		if !settings.For(item.EffectiveVenue()).Enabled {
+			continue
+		}
 		for _, outcome := range item.Outcomes {
 			opportunity, candidateErr := findOpportunity(item, outcome.Name, outcome.TokenID, settings, now)
 			if candidateErr == nil {
@@ -604,57 +1139,26 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 	}
 	// Resolve categories and sports risk only for candidates that already
 	// passed the price/liquidity/volatility filters. This also removes sports
-	// game markets before the localization request, which keeps scans cheap.
+	// game markets before localization, which keeps scans cheap.
 	opportunities = e.classifyOpportunities(ctx, opportunities, byID, settings)
-	sort.Slice(opportunities, func(i, j int) bool {
-		if opportunities[i].EndDate.Equal(opportunities[j].EndDate) {
-			return opportunities[i].GrossYield > opportunities[j].GrossYield
-		}
-		return opportunities[i].EndDate.Before(opportunities[j].EndDate)
-	})
+	sortOpportunities(opportunities)
 
 	// Polymarket exposes Chinese question and outcome labels through the Gamma
-	// locale parameter. Fetch them only for the markets that passed the filters
-	// so the radar matches the Chinese Polymarket UI without doubling the
-	// paginated market scan. A translation failure must not break trading; the
-	// original English text remains available as a fallback.
-	if localizedProvider, ok := e.provider.(market.LocalizedProvider); ok && len(opportunities) > 0 {
-		ids := make([]string, 0, len(opportunities))
-		seen := make(map[string]bool, len(opportunities))
-		for _, opportunity := range opportunities {
-			if !seen[opportunity.MarketID] {
-				seen[opportunity.MarketID] = true
-				ids = append(ids, opportunity.MarketID)
-			}
-		}
-		if localized, localizedErr := localizedProvider.MarketsLocale(ctx, ids, "zh"); localizedErr == nil {
-			byID := make(map[string]market.Market, len(localized))
-			for _, item := range localized {
-				byID[item.ID] = item
-			}
-			for i := range opportunities {
-				localizedItem, ok := byID[opportunities[i].MarketID]
-				if !ok {
-					continue
-				}
-				if localizedItem.Question != "" {
-					opportunities[i].QuestionZH = localizedItem.Question
-				}
-				if localizedItem.EventTitle != "" {
-					opportunities[i].EventTitleZH = localizedItem.EventTitle
-				}
-				if opportunities[i].GroupItemTitle == "" {
-					opportunities[i].GroupItemTitle = localizedItem.GroupItemTitle
-				}
-				if outcome, ok := localizedItem.OutcomeByToken(opportunities[i].TokenID); ok && outcome.Name != "" {
-					opportunities[i].OutcomeZH = outcome.Name
-				}
-			}
-		}
-	}
+	// locale parameter. Ask each venue's provider that supports it, only for
+	// the markets that passed the filters. A translation failure must not break
+	// trading; the original text remains available as a fallback.
+	opportunities = e.localizeOpportunities(ctx, opportunities)
 
 	e.mu.Lock()
-	e.opportunities = opportunities
+	// A scan can be scoped to one venue (the radar chip, or a per-venue scan
+	// button). Replacing the whole radar would make the other venues' rows
+	// disappear until the next full scan, so a scoped scan swaps only its own
+	// rows and leaves the rest in place.
+	scoped := options.Venue != ""
+	e.opportunities = mergeOpportunities(e.opportunities, opportunities, scanned, scoped)
+	// The reported venue list must describe what the radar holds now, not just
+	// what this pass touched.
+	e.scannedVenues = coveredVenues(e.opportunities, scanned)
 	e.lastSyncAt = timePointer(now)
 	e.mu.Unlock()
 
@@ -719,8 +1223,144 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 		}
 	}
 	summary.Error = strings.Join(focusErrors, "; ")
-	e.setProcessingError(strings.Join(processingErrors, "; "))
+	processing := strings.Join(processingErrors, "; ")
+	// Keep the per-venue scan failure visible even when account processing
+	// succeeded; an operator must be able to see which venue is degraded.
+	switch {
+	case venueFailure == "":
+		e.setProcessingError(processing)
+	case processing == "":
+		e.setProcessingError(venueFailure)
+	default:
+		e.setProcessingError(venueFailure + "; " + processing)
+	}
 	return summary, nil
+}
+
+// localizeOpportunities enriches each venue's rows from that venue's provider.
+// Venues without a LocalizedProvider (Predict.fun) are left untouched.
+func (e *Engine) localizeOpportunities(ctx context.Context, opportunities []Opportunity) []Opportunity {
+	idsByVenue := make(map[market.Venue][]string)
+	seen := make(map[string]bool, len(opportunities))
+	for _, opportunity := range opportunities {
+		v := opportunity.EffectiveVenue()
+		key := marketKey(v, opportunity.MarketID)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		idsByVenue[v] = append(idsByVenue[v], opportunity.MarketID)
+	}
+	for v, ids := range idsByVenue {
+		provider, ok := e.data(v).(market.LocalizedProvider)
+		if !ok || provider == nil {
+			continue
+		}
+		localized, err := provider.MarketsLocale(ctx, ids, "zh")
+		if err != nil {
+			continue
+		}
+		byID := make(map[string]market.Market, len(localized))
+		for _, item := range localized {
+			byID[marketKey(v, item.ID)] = item
+		}
+		for i := range opportunities {
+			if opportunities[i].EffectiveVenue() != v {
+				continue
+			}
+			localizedItem, ok := byID[marketKey(v, opportunities[i].MarketID)]
+			if !ok {
+				continue
+			}
+			if localizedItem.Question != "" {
+				opportunities[i].QuestionZH = localizedItem.Question
+			}
+			if localizedItem.EventTitle != "" {
+				opportunities[i].EventTitleZH = localizedItem.EventTitle
+			}
+			if opportunities[i].GroupItemTitle == "" {
+				opportunities[i].GroupItemTitle = localizedItem.GroupItemTitle
+			}
+			if outcome, ok := localizedItem.OutcomeByToken(opportunities[i].TokenID); ok && outcome.Name != "" {
+				opportunities[i].OutcomeZH = outcome.Name
+			}
+		}
+	}
+	return opportunities
+}
+
+// sortOpportunities orders the radar the way the UI renders it: soonest to
+// resolve first, highest gross yield first within a day.
+func sortOpportunities(opportunities []Opportunity) {
+	// Stable so equal rows keep their scan order between refreshes: an unstable
+	// sort makes the table reshuffle for no reason and breaks the row identity
+	// the UI keeps across a poll.
+	sort.SliceStable(opportunities, func(i, j int) bool {
+		if opportunities[i].EndDate.Equal(opportunities[j].EndDate) {
+			return opportunities[i].GrossYield > opportunities[j].GrossYield
+		}
+		return opportunities[i].EndDate.Before(opportunities[j].EndDate)
+	})
+}
+
+// mergeOpportunities combines a scan result with the previous radar. A full scan
+// (every requested venue was scanned) replaces it; a scoped scan replaces only
+// the rows of the venues it covered, because dropping the others would look like
+// those markets vanished.
+// mergeOpportunities keeps the radar coherent across scoped scans. A full scan
+// replaces the radar outright (a venue that failed simply keeps no rows, which
+// is honest for a full pass). A scoped scan replaces only the venues it actually
+// covered, because dropping the other venues' rows would empty the table the
+// moment the operator clicks a venue chip.
+//
+// The decision is driven by an explicit flag rather than by comparing venue
+// counts: a scoped scan requests exactly one venue, so "everything requested
+// succeeded" describes both a one-venue scoped scan and a two-venue full scan,
+// and inferring the scope from the counts silently emptied the radar for the
+// former.
+func mergeOpportunities(previous, current []Opportunity, scanned []market.Venue, scoped bool) []Opportunity {
+	if !scoped {
+		return current
+	}
+	covered := make(map[market.Venue]struct{}, len(scanned))
+	for _, v := range scanned {
+		covered[v] = struct{}{}
+	}
+	merged := make([]Opportunity, 0, len(previous)+len(current))
+	for _, item := range previous {
+		if _, replaced := covered[item.EffectiveVenue()]; !replaced {
+			merged = append(merged, item)
+		}
+	}
+	merged = append(merged, current...)
+	sortOpportunities(merged)
+	return merged
+}
+
+// coveredVenues lists the venues present in the radar, in scan order where
+// possible, so a scoped scan does not under-report the venues on screen.
+func coveredVenues(items []Opportunity, scanned []market.Venue) []market.Venue {
+	present := make(map[market.Venue]struct{}, len(scanned))
+	for _, v := range scanned {
+		present[v] = struct{}{}
+	}
+	for _, item := range items {
+		present[item.EffectiveVenue()] = struct{}{}
+	}
+	ordered := make([]market.Venue, 0, len(present))
+	for _, v := range market.VenueOrder {
+		if _, ok := present[v]; ok {
+			ordered = append(ordered, v)
+			delete(present, v)
+		}
+	}
+	// Any venue outside the canonical order still has to be reported.
+	rest := make([]market.Venue, 0, len(present))
+	for v := range present {
+		rest = append(rest, v)
+	}
+	sort.Slice(rest, func(i, j int) bool { return rest[i] < rest[j] })
+	return append(ordered, rest...)
 }
 
 func (e *Engine) recordScan(at time.Time, scanErr error) {
@@ -742,56 +1382,78 @@ func (e *Engine) setProcessingError(message string) {
 }
 
 func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets map[string]market.Market) error {
-	positions, err := e.repo.ListPositions(ctx, accountID, "open")
+	positions, err := e.repo.ListPositions(ctx, accountID, "open", "")
 	if err != nil {
 		return err
 	}
 	var errs []string
 	for _, position := range positions {
-		item, ok := markets[position.MarketID]
+		v := position.EffectiveVenue()
+		item, ok := markets[marketKey(v, position.MarketID)]
 		if !ok {
-			item, err = e.provider.Get(ctx, position.MarketID)
+			source := e.data(v)
+			if source == nil {
+				errs = append(errs, fmt.Sprintf("%s: 未注册 %s 行情源", position.MarketID, v.Label()))
+				continue
+			}
+			item, err = source.Get(ctx, position.MarketID)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", position.MarketID, err))
 				continue
 			}
+			item.Venue = v
+			if item.Currency == "" {
+				item.Currency = currencyForVenue(v)
+			}
+		}
+		if item.EffectiveVenue() != v {
+			// A position must never be marked or settled with another venue's
+			// price feed, even if an upstream returned a colliding id.
+			errs = append(errs, fmt.Sprintf("%s: 市场所属场所与持仓不一致", position.MarketID))
+			continue
 		}
 		outcome, ok := item.OutcomeByToken(position.TokenID)
 		if !ok {
 			errs = append(errs, position.MarketID+": 持仓 token 已不存在")
 			continue
 		}
-		if settlementPrice, resolved := item.SettlementPrice(position.TokenID); resolved {
-			closedAt := time.Now().UTC()
-			position.ClosedAt = &closedAt
-			position.UnrealizedPNL = 0
-			position.CurrentPrice = settlementPrice
-			payout := position.Shares * settlementPrice
-			switch {
-			case settlementPrice == 1:
-				position.Status = "won"
-			case settlementPrice == 0.5:
-				position.Status = "split"
-			default:
-				position.Status = "lost"
+		// Settle only when this venue can resolve from reference data. A venue
+		// without a settlement feed keeps its positions open instead of being
+		// guessed closed from another exchange's prices.
+		if e.supportsSettlement(v) {
+			if settlementPrice, resolved := item.SettlementPrice(position.TokenID); resolved {
+				closedAt := time.Now().UTC()
+				position.ClosedAt = &closedAt
+				position.UnrealizedPNL = 0
+				position.CurrentPrice = settlementPrice
+				payout := position.Shares * settlementPrice
+				switch {
+				case settlementPrice == 1:
+					position.Status = "won"
+				case settlementPrice == 0.5:
+					position.Status = "split"
+				default:
+					position.Status = "lost"
+				}
+				// A partial stop-loss exit may have booked realized PnL already;
+				// the remaining cost basis is settled on top of it.
+				position.RealizedPNL += payout - position.Cost
+				kind := position.Kind
+				if kind == "" {
+					kind = "manual"
+				}
+				order := Order{
+					AccountID: accountID, Venue: v, Currency: position.EffectiveCurrency(),
+					PositionID: &position.ID, MarketID: position.MarketID, Question: position.Question,
+					Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "settle",
+					Amount: payout, Price: position.CurrentPrice, Shares: position.Shares, Status: "settled",
+					Reason: fmt.Sprintf("依据公开结算数据按 %.4f 结算", settlementPrice), CreatedAt: closedAt,
+				}
+				if err := e.repo.SettlePosition(ctx, position, order); err != nil {
+					errs = append(errs, err.Error())
+				}
+				continue
 			}
-			// A partial stop-loss exit may have booked realized PnL already;
-			// the remaining cost basis is settled on top of it.
-			position.RealizedPNL += payout - position.Cost
-			kind := position.Kind
-			if kind == "" {
-				kind = "manual"
-			}
-			order := Order{
-				AccountID: accountID, PositionID: &position.ID, MarketID: position.MarketID, Question: position.Question,
-				Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "settle",
-				Amount: payout, Price: position.CurrentPrice, Shares: position.Shares, Status: "settled",
-				Reason: fmt.Sprintf("依据公开结算数据按 %.4f 结算", settlementPrice), CreatedAt: closedAt,
-			}
-			if err := e.repo.SettlePosition(ctx, position, order); err != nil {
-				errs = append(errs, err.Error())
-			}
-			continue
 		}
 		unrealized := outcome.Price*position.Shares - position.Cost
 		if err := e.repo.UpdateMark(ctx, position.ID, outcome.Price, unrealized); err != nil {
@@ -811,10 +1473,32 @@ type autoTradeOutcome struct {
 }
 
 func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (autoTradeOutcome, error) {
-	if account.Mode == AccountModeLive {
-		return e.autoLiveTrade(ctx, account, opportunities, settings)
+	// One account belongs to one venue, so only that venue's rows may be
+	// traded. Mixing them would spend USDC on a USDT market.
+	venue := account.EffectiveVenue()
+	scoped := make([]Opportunity, 0, len(opportunities))
+	for _, opportunity := range opportunities {
+		if opportunity.EffectiveVenue() == venue {
+			scoped = append(scoped, opportunity)
+		}
 	}
-	return e.autoPaperTrade(ctx, account, opportunities, settings)
+	if account.Mode == AccountModeLive {
+		return e.autoLiveTrade(ctx, account, scoped, settings)
+	}
+	return e.autoPaperTrade(ctx, account, scoped, settings)
+}
+
+// paperFee is the simulated taker fee for one venue. The venue's own reported
+// rate wins; otherwise the venue's effective settings rate is used. Polymarket
+// keeps its historical notional-rate model, Predict.fun uses
+// rate × min(p, 1-p) × shares, so a cheap Predict.fun fill is not underpriced.
+func paperFee(opportunity Opportunity, settings Settings, shares, price float64) float64 {
+	effective := settings.For(opportunity.EffectiveVenue())
+	rate := opportunity.FeeRateBPS
+	if rate <= 0 {
+		rate = effective.FeeBPS
+	}
+	return venue.FeeModelFor(opportunity.EffectiveVenue(), rate)(shares, price)
 }
 
 // autoEntryWindow returns the configured pre-close entry window for an
@@ -841,14 +1525,19 @@ func withinAutoEntryWindow(opportunity Opportunity, settings Settings, now time.
 }
 
 func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (outcome autoTradeOutcome, err error) {
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
+	effective := settings.For(account.EffectiveVenue())
+	if !effective.Enabled {
+		return outcome, nil
+	}
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return outcome, err
 	}
 	// Every position, open or already settled, is the durable "already
 	// ordered" mark for its market. One automatic entry per market is enough:
 	// a second outcome of the same binary market is the mirror bet, and a
-	// settled market must never be re-entered by a later scan.
+	// settled market must never be re-entered by a later scan. The key is
+	// namespaced by venue because token/market ids are only venue-local.
 	orderedMarkets := make(map[string]bool, len(positions))
 	heldMarkets := make(map[string]bool, len(positions))
 	skippedMarkets := make(map[string]bool)
@@ -856,13 +1545,14 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	marketExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
-		orderedMarkets[position.MarketID] = true
-		heldMarkets[position.MarketID] = true
+		key := marketKey(position.EffectiveVenue(), position.MarketID)
+		orderedMarkets[key] = true
+		heldMarkets[key] = true
 		realized += position.RealizedPNL
 		if position.Status != "open" {
 			continue
 		}
-		marketExposure[position.MarketID] += position.Cost
+		marketExposure[key] += position.Cost
 		totalExposure += position.Cost
 	}
 	baseline := account.BaselineEquity
@@ -872,31 +1562,34 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	cash := baseline + realized - totalExposure
 	now := time.Now().UTC()
 	for _, opportunity := range opportunities {
-		if orderedMarkets[opportunity.MarketID] {
-			if heldMarkets[opportunity.MarketID] {
-				skippedMarkets[opportunity.MarketID] = true
+		key := marketKey(opportunity.EffectiveVenue(), opportunity.MarketID)
+		if orderedMarkets[key] {
+			if heldMarkets[key] {
+				skippedMarkets[key] = true
 			}
 			continue
 		}
 		if !withinAutoEntryWindow(opportunity, settings, now) {
 			continue
 		}
-		fee := settings.OrderSize * settings.FeeBPS / 10000
-		cost := settings.OrderSize + fee
 		fillPrice := opportunity.Price * (1 + settings.SlippageBPS/10000)
-		if fillPrice > settings.MaxPrice || fillPrice >= 1 {
+		if fillPrice <= 0 || fillPrice > settings.MaxPrice || fillPrice >= 1 {
 			continue
 		}
-		if totalExposure+cost > settings.MaxExposure+1e-9 {
+		amount := effective.OrderSize
+		shares := amount / fillPrice
+		fee := paperFee(opportunity, settings, shares, fillPrice)
+		cost := amount + fee
+		if totalExposure+cost > effective.MaxExposure+1e-9 {
 			break
 		}
 		if cost > cash+1e-9 {
 			break
 		}
-		if marketExposure[opportunity.MarketID]+cost > settings.MaxPosition+1e-9 {
+		if marketExposure[key]+cost > effective.MaxPosition+1e-9 {
 			continue
 		}
-		position, err := e.executePaperBuy(ctx, account, opportunity, "auto", settings.OrderSize)
+		position, err := e.executePaperBuy(ctx, account, opportunity, "auto", amount)
 		if err != nil {
 			// A risk rejection is already logged as an order; it must not stop
 			// the engine from evaluating the remaining candidates this round.
@@ -906,8 +1599,8 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 			return outcome, err
 		}
 		outcome.Placed++
-		orderedMarkets[position.MarketID] = true
-		marketExposure[position.MarketID] += position.Cost
+		orderedMarkets[key] = true
+		marketExposure[key] += position.Cost
 		totalExposure += position.Cost
 		cash -= position.Cost
 	}
@@ -915,13 +1608,21 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 }
 
 func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (outcome autoTradeOutcome, err error) {
-	if e.live == nil || !e.live.Configured() {
-		return outcome, fmt.Errorf("%w: 实盘自动交易已开启，但未配置 POLYMARKET_PRIVATE_KEY", ErrLiveUnavailable)
+	effective := settings.For(account.EffectiveVenue())
+	if !effective.Enabled {
+		return outcome, nil
 	}
-	if message := e.live.ReadyError(); message != "" {
-		return outcome, fmt.Errorf("%w: 实盘自动交易已开启，但实盘凭据未就绪: %s", ErrLiveUnavailable, message)
+	exec, execErr := e.executor(account.EffectiveVenue())
+	if execErr != nil {
+		return outcome, fmt.Errorf("%w", ErrVenueReadOnly)
 	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
+	if !exec.Configured() {
+		return outcome, fmt.Errorf("%w: %s 实盘自动交易已开启，但%s", ErrVenueNotConfigured, account.EffectiveVenue().Label(), exec.ReadyError())
+	}
+	if message := exec.ReadyError(); message != "" {
+		return outcome, fmt.Errorf("%w: %s 实盘自动交易已开启，但实盘凭据未就绪: %s", ErrVenueNotConfigured, account.EffectiveVenue().Label(), message)
+	}
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return outcome, err
 	}
@@ -932,11 +1633,12 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	marketExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
-		orderedMarkets[position.MarketID] = true
-		heldMarkets[position.MarketID] = true
+		key := marketKey(position.EffectiveVenue(), position.MarketID)
+		orderedMarkets[key] = true
+		heldMarkets[key] = true
 		realized += position.RealizedPNL
 		if position.Status == "open" {
-			marketExposure[position.MarketID] += position.Cost
+			marketExposure[key] += position.Cost
 			totalExposure += position.Cost
 		}
 	}
@@ -944,18 +1646,20 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		account = e.ensureLiveBaseline(ctx, account, totalExposure, realized)
 	}
 	strategyCash := account.BaselineEquity + realized - totalExposure
-	snapshot, err := e.live.Collateral(ctx)
+	snapshot, err := exec.Collateral(ctx)
 	if err != nil {
-		return outcome, fmt.Errorf("%w: 读取实盘 pUSD 余额失败: %v", ErrLiveUnavailable, err)
+		return outcome, fmt.Errorf("%w: 读取实盘余额失败: %v", ErrLiveUnavailable, err)
 	}
 	cash := math.Min(strategyCash, snapshot.Amount)
 	now := time.Now().UTC()
 	for _, opportunity := range opportunities {
-		// orderedMarkets is keyed by market: all positions, including settled ones,
-		// mark the market as already ordered so auto trading cannot re-enter it.
-		if orderedMarkets[opportunity.MarketID] {
-			if heldMarkets[opportunity.MarketID] {
-				skippedMarkets[opportunity.MarketID] = true
+		key := marketKey(opportunity.EffectiveVenue(), opportunity.MarketID)
+		// The set is keyed by venue+market: all positions, including settled
+		// ones, mark the market as already ordered so auto trading cannot
+		// re-enter it.
+		if orderedMarkets[key] {
+			if heldMarkets[key] {
+				skippedMarkets[key] = true
 			}
 			continue
 		}
@@ -971,8 +1675,8 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 			// still reports the reason explicitly.
 			continue
 		}
-		budget := settings.OrderSize
-		estimatedFee, feeErr := e.live.EstimateBuyFee(ctx, opportunity.ConditionID, budget, opportunity.Price)
+		budget := effective.OrderSize
+		estimatedFee, feeErr := exec.EstimateBuyFee(ctx, opportunity.ConditionID, budget, opportunity.Price)
 		if feeErr != nil {
 			return outcome, fmt.Errorf("%w: 估算实盘手续费失败: %v", ErrLiveUnavailable, feeErr)
 		}
@@ -980,10 +1684,10 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 			return outcome, fmt.Errorf("%w: 实盘手续费估算无效", ErrLiveUnavailable)
 		}
 		cost := budget + estimatedFee
-		if totalExposure+cost > settings.MaxExposure+1e-9 {
+		if totalExposure+cost > effective.MaxExposure+1e-9 {
 			break
 		}
-		if marketExposure[opportunity.MarketID]+cost > settings.MaxPosition+1e-9 {
+		if marketExposure[key]+cost > effective.MaxPosition+1e-9 {
 			continue
 		}
 		if cost > cash+1e-9 {
@@ -994,14 +1698,14 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		}
 		position, err := e.executeLiveBuy(ctx, account, opportunity, "auto", budget)
 		if err != nil {
-			if errors.Is(err, ErrInvalidOrder) || errors.Is(err, ErrLiveUnavailable) {
+			if errors.Is(err, ErrInvalidOrder) || errors.Is(err, ErrLiveUnavailable) || errors.Is(err, ErrVenueNotConfigured) {
 				continue
 			}
 			return outcome, err
 		}
 		outcome.Placed++
-		orderedMarkets[position.MarketID] = true
-		marketExposure[position.MarketID] += position.Cost
+		orderedMarkets[key] = true
+		marketExposure[key] += position.Cost
 		totalExposure += position.Cost
 		cash -= position.Cost
 	}
@@ -1018,7 +1722,7 @@ func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Sett
 	if !settings.StopLossEnabled {
 		return nil
 	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "open")
+	positions, err := e.repo.ListPositions(ctx, account.ID, "open", "")
 	if err != nil {
 		return err
 	}
@@ -1083,7 +1787,8 @@ func applySellFill(position Position, fill LiveFill, action, reason string, now 
 		updated.UnrealizedPNL = remaining*fill.Price - updated.Cost
 	}
 	order := Order{
-		AccountID: position.AccountID, PositionID: &position.ID, MarketID: position.MarketID,
+		AccountID: position.AccountID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
+		PositionID: &position.ID, MarketID: position.MarketID,
 		Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
 		Kind: "auto", Type: "settle", Action: action, Amount: fill.Cost, Price: fill.Price, Shares: sold,
 		Fee: fill.Fee, Status: "filled", Reason: reason, CreatedAt: now,
@@ -1091,13 +1796,35 @@ func applySellFill(position Position, fill LiveFill, action, reason string, now 
 	return updated, order, nil
 }
 
+// reportedFeeRate is the fee rate the radar currently reports for a token, or 0
+// when the market is no longer listed.
+func (e *Engine) reportedFeeRate(v market.Venue, tokenID string) float64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, item := range e.opportunities {
+		if item.TokenID == tokenID && item.EffectiveVenue() == v {
+			return item.FeeRateBPS
+		}
+	}
+	return 0
+}
+
 func (e *Engine) executePaperSell(ctx context.Context, account Account, position Position, reason string, settings Settings) (Position, error) {
 	fillPrice := position.CurrentPrice * (1 - settings.SlippageBPS/10000)
 	if fillPrice <= 0 || fillPrice >= 1 {
 		return Position{}, e.rejectSellOrder(ctx, account.ID, position, "模拟止损卖出价无效")
 	}
+	effective := settings.For(position.EffectiveVenue())
+	// Charge the rate the entry was priced with: the venue's reported rate while
+	// the market is still on the radar, otherwise the settings default. Charging
+	// the default on the way out would price a Predict.fun exit ~13x cheaper than
+	// its entry and inflate every simulated stop-loss.
+	rate := e.reportedFeeRate(position.EffectiveVenue(), position.TokenID)
+	if rate <= 0 {
+		rate = effective.FeeBPS
+	}
+	fee := venue.FeeModelFor(position.EffectiveVenue(), rate)(position.Shares, fillPrice)
 	gross := fillPrice * position.Shares
-	fee := gross * settings.FeeBPS / 10000
 	fill := LiveFill{Shares: position.Shares, Cost: gross - fee, Price: fillPrice, Fee: fee, Status: "filled"}
 	updated, order, err := applySellFill(position, fill, "stop", reason+"；模拟成交；未发送任何真实订单", time.Now().UTC())
 	if err != nil {
@@ -1110,11 +1837,15 @@ func (e *Engine) executePaperSell(ctx context.Context, account Account, position
 }
 
 func (e *Engine) executeLiveSell(ctx context.Context, account Account, position Position, reason string) (Position, error) {
-	if e.live == nil || !e.live.Configured() {
-		return Position{}, e.rejectSellOrder(ctx, account.ID, position,
-			"实盘未配置：无法提交止损卖单")
+	exec, execErr := e.executor(position.EffectiveVenue())
+	if execErr != nil {
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position, "该场所当前只读，无法提交止损卖单")
 	}
-	if message := e.live.ReadyError(); message != "" {
+	if !exec.Configured() {
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position,
+			fmt.Sprintf("%s 实盘未配置：%s", position.EffectiveVenue().Label(), exec.ReadyError()))
+	}
+	if message := exec.ReadyError(); message != "" {
 		return Position{}, e.rejectSellOrder(ctx, account.ID, position,
 			"实盘未就绪："+message)
 	}
@@ -1123,9 +1854,10 @@ func (e *Engine) executeLiveSell(ctx context.Context, account Account, position 
 			"缺少 condition_id 或 token_id，无法提交止损卖单")
 	}
 	var pending Order
-	fill, err := e.live.Sell(ctx, position.TokenID, position.ConditionID, position.Shares, func(orderID string) error {
+	fill, err := exec.Sell(ctx, position.TokenID, position.ConditionID, position.Shares, func(orderID string) error {
 		created, createErr := e.repo.CreateOrder(ctx, Order{
-			AccountID: account.ID, PositionID: &position.ID, MarketID: position.MarketID,
+			AccountID: account.ID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
+			PositionID: &position.ID, MarketID: position.MarketID,
 			Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
 			Kind: "auto", Type: "settle", Action: "stop", Price: position.CurrentPrice, Shares: position.Shares,
 			Status: "pending", Reason: "实盘止损卖单已签名，等待成交回报",
@@ -1165,7 +1897,11 @@ func (e *Engine) executeLiveSell(ctx context.Context, account Account, position 
 		return Position{}, e.rejectSellOrder(ctx, account.ID, position, "实盘止损订单未产生成交")
 	}
 	now := time.Now().UTC()
-	updated, order, err := applySellFill(position, fill, "stop", "Polymarket CLOB 止损成交", now)
+	// venue.Fill.Cost is the gross proceeds; the taker fee is deducted from what
+	// the seller actually receives. Clamp so an implausible fee surfaces as an
+	// invalid fill instead of a negative amount.
+	fill.Cost = math.Max(fill.Cost-fill.Fee, 0)
+	updated, order, err := applySellFill(position, fill, "stop", position.EffectiveVenue().Label()+" CLOB 止损成交", now)
 	if err != nil {
 		return Position{}, err
 	}
@@ -1185,13 +1921,17 @@ func (e *Engine) executeLiveSell(ctx context.Context, account Account, position 
 
 func (e *Engine) rejectSellOrder(ctx context.Context, accountID int64, position Position, reason string) error {
 	_, _ = e.repo.CreateOrder(ctx, Order{
-		AccountID: accountID, PositionID: &position.ID, MarketID: position.MarketID,
+		AccountID: accountID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
+		PositionID: &position.ID, MarketID: position.MarketID,
 		Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
 		Kind: "auto", Type: "settle", Action: "stop", Price: position.CurrentPrice, Shares: position.Shares,
 		Status: "rejected", Reason: reason, CreatedAt: time.Now().UTC(),
 	})
-	if strings.HasPrefix(reason, "实盘未配置") || strings.HasPrefix(reason, "实盘未就绪") {
-		return fmt.Errorf("%w: %s", ErrLiveUnavailable, reason)
+	if strings.Contains(reason, "实盘未配置") || strings.HasPrefix(reason, "实盘未就绪") {
+		return &venueError{kind: ErrVenueNotConfigured, message: reason}
+	}
+	if strings.Contains(reason, "只读") {
+		return fmt.Errorf("%w", ErrVenueReadOnly)
 	}
 	return fmt.Errorf("%w: %s", ErrInvalidOrder, reason)
 }
@@ -1201,6 +1941,9 @@ type OrderRequest struct {
 	Outcome  string  `json:"outcome" binding:"required"`
 	TokenID  string  `json:"token_id" binding:"required"`
 	Amount   float64 `json:"amount" binding:"required"`
+	// Venue is optional. When supplied it must match the account's venue; when
+	// omitted the account's venue decides which provider resolves the market.
+	Venue market.Venue `json:"venue,omitempty"`
 }
 
 func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderRequest) (Position, error) {
@@ -1213,14 +1956,34 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 	if err != nil {
 		return Position{}, err
 	}
-	item, err := e.provider.Get(ctx, request.MarketID)
+	v := account.EffectiveVenue()
+	if request.Venue != "" && effectiveVenue(request.Venue) != v {
+		return Position{}, fmt.Errorf("%w", ErrVenueMismatch)
+	}
+	if !e.Settings().For(v).Enabled {
+		return Position{}, fmt.Errorf("%w: %s 当前已在参数设置中禁用", ErrInvalidOrder, v.Label())
+	}
+	source := e.data(v)
+	if source == nil {
+		return Position{}, fmt.Errorf("%w: 未注册 %s 行情源", ErrUpstream, v.Label())
+	}
+	item, err := source.Get(ctx, request.MarketID)
 	if err != nil {
 		return Position{}, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	// The registry guarantees this data source only returns its own venue's
+	// markets, so stamp it instead of trusting a provider that omitted it.
+	item.Venue = v
+	if item.Currency == "" {
+		item.Currency = currencyForVenue(v)
 	}
 	settings := e.Settings()
 	opportunity, err := findOpportunity(item, request.Outcome, request.TokenID, settings, time.Now().UTC())
 	if err != nil {
 		return Position{}, err
+	}
+	if opportunity.EffectiveVenue() != v {
+		return Position{}, fmt.Errorf("%w", ErrVenueMismatch)
 	}
 	if err := enforceSportsPolicy(e.classifyMarket(ctx, item), settings.SportsPolicy); err != nil {
 		return Position{}, err
@@ -1233,22 +1996,28 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 
 func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64) (Position, error) {
 	settings := e.Settings()
-	fee := amount * settings.FeeBPS / 10000
-	cost := amount + fee
+	effective := settings.For(opportunity.EffectiveVenue())
+	if !effective.Enabled {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, opportunity.EffectiveVenue().Label()+" 当前已在参数设置中禁用", "")
+	}
 	fillPrice := opportunity.Price * (1 + settings.SlippageBPS/10000)
-	if fillPrice > settings.MaxPrice || fillPrice >= 1 {
+	if fillPrice <= 0 || fillPrice > settings.MaxPrice || fillPrice >= 1 {
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "计入滑点后超过最高买入价", "")
 	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
+	shares := amount / fillPrice
+	fee := paperFee(opportunity, settings, shares, fillPrice)
+	cost := amount + fee
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return Position{}, err
 	}
 	marketExposure, totalExposure, realized := 0.0, 0.0, 0.0
+	key := marketKey(opportunity.EffectiveVenue(), opportunity.MarketID)
 	for _, position := range positions {
 		realized += position.RealizedPNL
 		if position.Status == "open" {
 			totalExposure += position.Cost
-			if position.MarketID == opportunity.MarketID {
+			if marketKey(position.EffectiveVenue(), position.MarketID) == key {
 				marketExposure += position.Cost
 			}
 		}
@@ -1262,9 +2031,9 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	switch {
 	case cost > cash+1e-9:
 		reason = "模拟可用现金不足"
-	case totalExposure+cost > settings.MaxExposure+1e-9:
+	case totalExposure+cost > effective.MaxExposure+1e-9:
 		reason = "超过总敞口上限"
-	case marketExposure+cost > settings.MaxPosition+1e-9:
+	case marketExposure+cost > effective.MaxPosition+1e-9:
 		reason = "超过单市场敞口上限"
 	}
 	if reason != "" {
@@ -1272,17 +2041,17 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	}
 
 	now := time.Now().UTC()
-	shares := amount / fillPrice
 	position := Position{
-		AccountID: account.ID,
-		MarketID:  opportunity.MarketID, ConditionID: opportunity.ConditionID,
+		AccountID: account.ID, Venue: opportunity.EffectiveVenue(), Currency: opportunity.EffectiveCurrency(),
+		MarketID: opportunity.MarketID, ConditionID: opportunity.ConditionID,
 		Question: opportunity.Question, Outcome: opportunity.Outcome, TokenID: opportunity.TokenID,
 		Side: "BUY", Kind: kind, EntryPrice: fillPrice, CurrentPrice: opportunity.Price,
 		Shares: shares, Cost: cost, Fee: fee, Status: "open", OpenedAt: now,
 		EndDate: opportunity.EndDate, UnrealizedPNL: opportunity.Price*shares - cost,
 	}
 	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
-		AccountID: account.ID, MarketID: position.MarketID, Question: position.Question,
+		AccountID: account.ID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
+		MarketID: position.MarketID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
 		Amount: cost, Price: fillPrice, Shares: shares, Fee: fee, Status: "filled",
 		Reason: "模拟成交；未发送任何真实订单", CreatedAt: now,
@@ -1294,11 +2063,19 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 }
 
 func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64) (Position, error) {
-	if e.live == nil || !e.live.Configured() {
-		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
-			"实盘未配置：请设置 POLYMARKET_PRIVATE_KEY 后重启服务", "")
+	v := opportunity.EffectiveVenue()
+	if v != account.EffectiveVenue() {
+		return Position{}, fmt.Errorf("%w", ErrVenueMismatch)
 	}
-	if message := e.live.ReadyError(); message != "" {
+	exec, execErr := e.executor(v)
+	if execErr != nil {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, ErrVenueReadOnly.Error(), "")
+	}
+	if !exec.Configured() {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
+			fmt.Sprintf("%s 实盘未配置：%s", v.Label(), exec.ReadyError()), "")
+	}
+	if message := exec.ReadyError(); message != "" {
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
 			"实盘未就绪："+message, "")
 	}
@@ -1316,16 +2093,18 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 			"该市场属于 Polymarket Protocol V2（positionId + ExchangeV3），当前实盘执行器只支持 CTF（v1）市场；请改用模拟账户或等待 V2 签名支持", "")
 	}
 	settings := e.Settings()
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
+	effective := settings.For(v)
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return Position{}, err
 	}
+	key := marketKey(v, opportunity.MarketID)
 	marketExposure, totalExposure, realized := 0.0, 0.0, 0.0
 	for _, position := range positions {
 		realized += position.RealizedPNL
 		if position.Status == "open" {
 			totalExposure += position.Cost
-			if position.MarketID == opportunity.MarketID {
+			if marketKey(position.EffectiveVenue(), position.MarketID) == key {
 				marketExposure += position.Cost
 			}
 		}
@@ -1334,12 +2113,12 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		account = e.ensureLiveBaseline(ctx, account, totalExposure, realized)
 	}
 	strategyCash := account.BaselineEquity + realized - totalExposure
-	snapshot, cashErr := e.live.Collateral(ctx)
+	snapshot, cashErr := exec.Collateral(ctx)
 	if cashErr != nil {
-		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法读取实盘 pUSD 余额："+cashErr.Error(), "")
-		return Position{}, fmt.Errorf("%w: 无法读取实盘 pUSD 余额: %v", ErrLiveUnavailable, cashErr)
+		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法读取实盘余额："+cashErr.Error(), "")
+		return Position{}, fmt.Errorf("%w: 无法读取实盘余额: %v", ErrLiveUnavailable, cashErr)
 	}
-	estimatedFee, feeErr := e.live.EstimateBuyFee(ctx, opportunity.ConditionID, amount, opportunity.Price)
+	estimatedFee, feeErr := exec.EstimateBuyFee(ctx, opportunity.ConditionID, amount, opportunity.Price)
 	if feeErr != nil {
 		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法估算实盘手续费："+feeErr.Error(), "")
 		return Position{}, fmt.Errorf("%w: 无法估算实盘手续费: %v", ErrLiveUnavailable, feeErr)
@@ -1353,17 +2132,18 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	case totalCost > cash+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘策略资金不足（含预估手续费）", "")
 	case snapshot.Allowance > 0 && totalCost > snapshot.Allowance+1e-9:
-		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘 pUSD 授权额度不足，请先在 Polymarket 完成授权", "")
-	case totalExposure+totalCost > settings.MaxExposure+1e-9:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘授权额度不足，请先在 "+v.Label()+" 完成授权", "")
+	case totalExposure+totalCost > effective.MaxExposure+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过总敞口上限（含预估手续费）", "")
-	case marketExposure+totalCost > settings.MaxPosition+1e-9:
+	case marketExposure+totalCost > effective.MaxPosition+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过单市场敞口上限（含预估手续费）", "")
 	}
 
 	var pending Order
-	fill, err := e.live.Buy(ctx, opportunity.TokenID, opportunity.ConditionID, amount, settings.MaxPrice, func(orderID string) error {
+	fill, err := exec.Buy(ctx, opportunity.TokenID, opportunity.ConditionID, amount, settings.MaxPrice, func(orderID string) error {
 		created, createErr := e.repo.CreateOrder(ctx, Order{
-			AccountID: account.ID, MarketID: opportunity.MarketID, Question: opportunity.Question,
+			AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
+			MarketID: opportunity.MarketID, Question: opportunity.Question,
 			Outcome: opportunity.Outcome, TokenID: opportunity.TokenID, Kind: kind, Type: "buy",
 			Amount: amount, Price: opportunity.Price, Status: "pending",
 			Reason: "实盘订单已签名，等待成交回报", ExternalID: orderID, CreatedAt: time.Now().UTC(),
@@ -1383,7 +2163,9 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 			}
 			_ = e.repo.MarkOrderStatus(ctx, pending.ID, status, reason)
 		} else {
-			_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘下单失败："+err.Error(), "")
+			// Keep the exchange-side id even without a row: it is the only handle
+			// reconciliation has on an order that reached the venue.
+			_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘下单失败："+err.Error(), fill.OrderID)
 		}
 		if errors.Is(err, ErrInvalidOrder) {
 			return Position{}, err
@@ -1403,9 +2185,13 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 			"实盘订单未产生成交", fill.OrderID)
 	}
 	now := time.Now().UTC()
+	// venue.Fill.Cost is the gross notional; the buyer pays the taker fee on top,
+	// so the position's basis (and therefore the exposure cap it counts against)
+	// is the fee-inclusive amount.
+	fill.Cost += fill.Fee
 	position := Position{
-		AccountID: account.ID,
-		MarketID:  opportunity.MarketID, ConditionID: opportunity.ConditionID,
+		AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
+		MarketID: opportunity.MarketID, ConditionID: opportunity.ConditionID,
 		Question: opportunity.Question, Outcome: opportunity.Outcome, TokenID: opportunity.TokenID,
 		Side: "BUY", Kind: kind, EntryPrice: fill.Price, CurrentPrice: opportunity.Price,
 		Shares: fill.Shares, Cost: fill.Cost, Fee: fill.Fee, Status: "open", OpenedAt: now,
@@ -1421,10 +2207,11 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	// Defensive fallback for an executor that does not call onSigned. The
 	// real implementation always persists the pending order first.
 	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
-		AccountID: account.ID, MarketID: position.MarketID, Question: position.Question,
+		AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
+		MarketID: position.MarketID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
 		Amount: fill.Cost, Price: fill.Price, Shares: fill.Shares, Fee: fill.Fee, Status: "filled",
-		Reason: "Polymarket CLOB 实盘成交", ExternalID: fill.OrderID, CreatedAt: now,
+		Reason: v.Label() + " CLOB 实盘成交", ExternalID: fill.OrderID, CreatedAt: now,
 	})
 	if err != nil {
 		return Position{}, fmt.Errorf("实盘成交已确认，但本地账务写入失败: %w", err)
@@ -1443,13 +2230,7 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 	if len(orders) == 0 {
 		return 0, nil
 	}
-	if e.live == nil || !e.live.Configured() {
-		return len(orders), fmt.Errorf("实盘未配置，无法对账 %d 笔待确认订单", len(orders))
-	}
-	if message := e.live.ReadyError(); message != "" {
-		return len(orders), fmt.Errorf("实盘未就绪，无法对账: %s", message)
-	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return len(orders), err
 	}
@@ -1464,16 +2245,38 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 			remaining++
 			continue
 		}
-		item, ok := markets[order.MarketID]
+		orderVenue := order.EffectiveVenue()
+		exec, execErr := e.executor(orderVenue)
+		if execErr != nil {
+			errs = append(errs, fmt.Sprintf("订单 %s 对账失败: %v", order.ExternalID, execErr))
+			remaining++
+			continue
+		}
+		if !exec.Configured() {
+			errs = append(errs, fmt.Sprintf("订单 %s 对账失败: %s", order.ExternalID, exec.ReadyError()))
+			remaining++
+			continue
+		}
+		item, ok := markets[marketKey(orderVenue, order.MarketID)]
 		if !ok {
-			item, err = e.provider.Get(ctx, order.MarketID)
+			source := e.data(orderVenue)
+			if source == nil {
+				errs = append(errs, fmt.Sprintf("订单 %s 读取市场失败: 未注册行情源", order.ExternalID))
+				remaining++
+				continue
+			}
+			item, err = source.Get(ctx, order.MarketID)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("订单 %s 读取市场失败: %v", order.ExternalID, err))
 				remaining++
 				continue
 			}
+			item.Venue = orderVenue
+			if item.Currency == "" {
+				item.Currency = currencyForVenue(orderVenue)
+			}
 		}
-		fill, found, lookupErr := e.live.LookupOrder(ctx, order.ExternalID, item.ConditionID)
+		fill, found, lookupErr := exec.LookupOrder(ctx, order.ExternalID, item.ConditionID)
 		if lookupErr != nil {
 			errs = append(errs, fmt.Sprintf("订单 %s 对账失败: %v", order.ExternalID, lookupErr))
 			remaining++
@@ -1503,10 +2306,10 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 				}
 				continue
 			}
-			// LookupOrder reports gross proceeds; net them against the taker fee
-			// the same way a live sell does.
-			fill.Cost -= fill.Fee
-			updated, _, applyErr := applySellFill(position, fill, "stop", "Polymarket CLOB 止损成交（对账）", time.Now().UTC())
+			// LookupOrder reports the gross proceeds; net the taker fee the same
+			// way the direct sell path does.
+			fill.Cost = math.Max(fill.Cost-fill.Fee, 0)
+			updated, _, applyErr := applySellFill(position, fill, "stop", orderVenue.Label()+" CLOB 止损成交（对账）", time.Now().UTC())
 			if applyErr != nil {
 				errs = append(errs, fmt.Sprintf("订单 %s 对账失败: %v", order.ExternalID, applyErr))
 				remaining++
@@ -1519,7 +2322,8 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 			continue
 		}
 		if fill.Shares > 0 && fill.Cost > 0 {
-			// LookupOrder reports gross notional; a buy pays the taker fee on top.
+			// LookupOrder reports the gross notional; a buy pays the taker fee on
+			// top, exactly as the direct buy path does.
 			fill.Cost += fill.Fee
 			outcome, outcomeOK := item.OutcomeByToken(order.TokenID)
 			if !outcomeOK {
@@ -1536,7 +2340,8 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 				kind = "manual"
 			}
 			position := Position{
-				AccountID: account.ID, MarketID: order.MarketID, ConditionID: item.ConditionID,
+				AccountID: account.ID, Venue: orderVenue, Currency: order.EffectiveCurrency(),
+				MarketID: order.MarketID, ConditionID: item.ConditionID,
 				Question: order.Question, Outcome: order.Outcome, TokenID: order.TokenID,
 				Side: "BUY", Kind: kind, EntryPrice: fill.Price, CurrentPrice: outcome.Price,
 				Shares: fill.Shares, Cost: fill.Cost, Fee: fill.Fee, Status: "open", OpenedAt: openedAt,
@@ -1566,28 +2371,41 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 
 func (e *Engine) rejectOrder(ctx context.Context, accountID int64, opportunity Opportunity, kind string, amount float64, reason, externalID string) error {
 	_, _ = e.repo.CreateOrder(ctx, Order{
-		AccountID: accountID, MarketID: opportunity.MarketID, Question: opportunity.Question,
+		AccountID: accountID, Venue: opportunity.EffectiveVenue(), Currency: opportunity.EffectiveCurrency(),
+		MarketID: opportunity.MarketID, Question: opportunity.Question,
 		Outcome: opportunity.Outcome, TokenID: opportunity.TokenID, Kind: kind, Type: "buy",
 		Amount: amount, Price: opportunity.Price, Status: "rejected", Reason: reason,
 		ExternalID: externalID, CreatedAt: time.Now().UTC(),
 	})
-	if strings.HasPrefix(reason, "实盘未配置") {
-		return fmt.Errorf("%w: %s", ErrLiveUnavailable, reason)
+	if strings.Contains(reason, "实盘未配置") {
+		return &venueError{kind: ErrVenueNotConfigured, message: reason}
+	}
+	if strings.Contains(reason, "只读") || strings.Contains(reason, "禁用") {
+		return fmt.Errorf("%w", ErrVenueReadOnly)
 	}
 	return fmt.Errorf("%w: %s", ErrInvalidOrder, reason)
 }
 
-func (e *Engine) Positions(ctx context.Context, accountID int64, status string) (PositionList, error) {
-	items, err := e.repo.ListPositions(ctx, accountID, status)
-	return PositionList{Items: items, Total: len(items)}, err
+func (e *Engine) Positions(ctx context.Context, accountID int64, status string, v market.Venue) (PositionList, error) {
+	items, err := e.repo.ListPositions(ctx, accountID, status, v)
+	if err != nil {
+		return PositionList{}, err
+	}
+	for i := range items {
+		items[i] = sanitizePosition(items[i])
+	}
+	return PositionList{Items: items, Total: len(items)}, nil
 }
 
-func (e *Engine) Orders(ctx context.Context, accountID int64, status string, limit, offset int) (OrderList, error) {
-	items, err := e.repo.ListOrders(ctx, accountID, status, limit, offset)
+func (e *Engine) Orders(ctx context.Context, accountID int64, status string, limit, offset int, v market.Venue) (OrderList, error) {
+	items, err := e.repo.ListOrders(ctx, accountID, status, limit, offset, v)
 	if err != nil {
 		return OrderList{}, err
 	}
-	total, err := e.repo.CountOrders(ctx, accountID, status)
+	for i := range items {
+		items[i] = sanitizeOrder(items[i])
+	}
+	total, err := e.repo.CountOrders(ctx, accountID, status, v)
 	if err != nil {
 		return OrderList{}, err
 	}
@@ -1599,12 +2417,17 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	if err != nil {
 		return Dashboard{}, err
 	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
+	// Positions are scoped by account, and every account belongs to one venue,
+	// so the sums below can never mix USDC with USDT.
+	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return Dashboard{}, err
 	}
 	settings := e.Settings()
-	metrics := Metrics{Mode: string(account.Mode), InitialBankroll: settings.InitialBankroll}
+	metrics := Metrics{
+		Mode: string(account.Mode), Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
+		InitialBankroll: settings.InitialBankroll,
+	}
 	wins, marketValue := 0, 0.0
 	for _, position := range positions {
 		metrics.FeesPaid += position.Fee
@@ -1651,8 +2474,9 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 		if metrics.InitialBankroll > 0 {
 			metrics.TotalReturn = metrics.TotalPNL / metrics.InitialBankroll
 		}
-		if e.live != nil && e.live.Configured() {
-			snapshot, cashErr := e.live.Collateral(ctx)
+		exec, execErr := e.executor(account.EffectiveVenue())
+		if execErr == nil && exec.Configured() {
+			snapshot, cashErr := exec.Collateral(ctx)
 			if cashErr != nil {
 				metrics.WalletCashStale = true
 				if account.LiveError == "" {
@@ -1670,7 +2494,7 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	if decided > 0 {
 		metrics.WinRate = float64(wins) / float64(decided)
 	}
-	metrics.TotalOrders, err = e.repo.CountOrders(ctx, account.ID, "all")
+	metrics.TotalOrders, err = e.repo.CountOrders(ctx, account.ID, "all", "")
 	if err != nil {
 		return Dashboard{}, err
 	}
@@ -1679,10 +2503,17 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 		return Dashboard{}, err
 	}
 	if len(points) == 0 {
-		points = []EquityPoint{{Time: time.Now().UTC(), Value: metrics.Equity}}
+		points = []EquityPoint{{
+			Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
+			Time: time.Now().UTC(), Value: metrics.Equity,
+		}}
 	}
+	for i := range points {
+		points[i] = sanitizeEquityPoint(points[i])
+	}
+	metrics = sanitizeMetrics(metrics)
 	e.mu.RLock()
-	source := SourceStatus{Name: e.provider.Name(), LastSyncAt: e.lastSyncAt}
+	source := SourceStatus{Name: e.sourceName(), LastSyncAt: e.lastSyncAt}
 	e.mu.RUnlock()
 	return Dashboard{
 		Account: e.decorateAccount(account),
@@ -1694,11 +2525,12 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 }
 
 func (e *Engine) ensureLiveBaseline(ctx context.Context, account Account, openExposure, realized float64) Account {
-	if account.Mode != AccountModeLive || account.BaselineEquity > 0 || e.live == nil || !e.live.Configured() {
+	exec, err := e.executor(account.EffectiveVenue())
+	if account.Mode != AccountModeLive || account.BaselineEquity > 0 || err != nil || !exec.Configured() {
 		return account
 	}
-	snapshot, err := e.live.Collateral(ctx)
-	if err != nil {
+	snapshot, snapshotErr := exec.Collateral(ctx)
+	if snapshotErr != nil {
 		return account
 	}
 	// The wallet balance may already reflect open positions from this app, so
@@ -1725,7 +2557,86 @@ func (e *Engine) snapshot(ctx context.Context, account Account) error {
 	if account.Mode == AccountModeLive && dashboard.Metrics.WalletCashStale && dashboard.Metrics.WalletCash == 0 {
 		return nil
 	}
-	return e.repo.AddSnapshot(ctx, account.ID, EquityPoint{Time: time.Now().UTC(), Value: dashboard.Metrics.Equity})
+	return e.repo.AddSnapshot(ctx, account.ID, EquityPoint{
+		Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
+		Time: time.Now().UTC(), Value: dashboard.Metrics.Equity,
+	})
+}
+
+// moneyPrecision is the number of decimals the API exposes for a venue's
+// amounts. Predict.fun signs 18-decimal integers, but showing that scale back
+// as a float64 leaks representation noise; six decimals is what a human reads
+// and what the Polymarket side already carries.
+const moneyPrecision = 6
+
+// roundForVenue rounds a Predict.fun amount to six visible decimals. A
+// Polymarket value is returned untouched so existing rows and responses stay
+// byte-identical.
+func roundForVenue(v market.Venue, value float64) float64 {
+	if effectiveVenue(v) == market.VenuePolymarket {
+		return value
+	}
+	scale := math.Pow10(moneyPrecision)
+	return math.Round(value*scale) / scale
+}
+
+func sanitizePosition(p Position) Position {
+	if p.EffectiveVenue() == market.VenuePolymarket {
+		return p
+	}
+	v := p.EffectiveVenue()
+	p.EntryPrice = roundForVenue(v, p.EntryPrice)
+	p.CurrentPrice = roundForVenue(v, p.CurrentPrice)
+	p.Shares = roundForVenue(v, p.Shares)
+	p.Cost = roundForVenue(v, p.Cost)
+	p.Fee = roundForVenue(v, p.Fee)
+	p.RealizedPNL = roundForVenue(v, p.RealizedPNL)
+	p.UnrealizedPNL = roundForVenue(v, p.UnrealizedPNL)
+	p.Venue = v
+	p.Currency = p.EffectiveCurrency()
+	return p
+}
+
+func sanitizeOrder(o Order) Order {
+	if o.EffectiveVenue() == market.VenuePolymarket {
+		return o
+	}
+	v := o.EffectiveVenue()
+	o.Amount = roundForVenue(v, o.Amount)
+	o.Price = roundForVenue(v, o.Price)
+	o.Shares = roundForVenue(v, o.Shares)
+	o.Fee = roundForVenue(v, o.Fee)
+	o.Venue = v
+	o.Currency = o.EffectiveCurrency()
+	return o
+}
+
+func sanitizeEquityPoint(p EquityPoint) EquityPoint {
+	p.Venue = effectiveVenue(p.Venue)
+	if p.Currency == "" {
+		p.Currency = currencyForVenue(p.Venue)
+	}
+	p.Value = roundForVenue(p.Venue, p.Value)
+	return p
+}
+
+func sanitizeMetrics(m Metrics) Metrics {
+	m.Venue = effectiveVenue(m.Venue)
+	if m.Currency == "" {
+		m.Currency = currencyForVenue(m.Venue)
+	}
+	v := m.Venue
+	m.InitialBankroll = roundForVenue(v, m.InitialBankroll)
+	m.Cash = roundForVenue(v, m.Cash)
+	m.WalletCash = roundForVenue(v, m.WalletCash)
+	m.Equity = roundForVenue(v, m.Equity)
+	m.RealizedPNL = roundForVenue(v, m.RealizedPNL)
+	m.UnrealizedPNL = roundForVenue(v, m.UnrealizedPNL)
+	m.TotalPNL = roundForVenue(v, m.TotalPNL)
+	m.FeesPaid = roundForVenue(v, m.FeesPaid)
+	m.OpenExposure = roundForVenue(v, m.OpenExposure)
+	m.TotalReturn = roundForVenue(v, m.TotalReturn)
+	return m
 }
 
 func timePointer(value time.Time) *time.Time { return &value }

@@ -12,6 +12,7 @@ import (
 
 	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
+	"pennyharvester/backend/internal/venue"
 )
 
 var (
@@ -22,7 +23,33 @@ var (
 	ErrAccountNotFound = errors.New("账户不存在")
 	ErrAccountConflict = errors.New("账户状态冲突")
 	ErrInvalidSettings = errors.New("系统设置无效")
+	// ErrVenueMismatch means an account was asked to trade a market that
+	// belongs to another venue. Prices and balances are not comparable across
+	// venues, so this is a client error rather than something to route around.
+	ErrVenueMismatch = errors.New("该机会不属于此账户的场所")
+	// ErrVenueReadOnly means the venue is registered for market data but has no
+	// executor, so orders must be refused instead of silently falling back to
+	// another venue's executor.
+	ErrVenueReadOnly = errors.New("该场所当前只读")
+	// ErrNoApproval means the venue needs no on-chain allowance at all (its
+	// orders are signed through a proxy or a custodian), so an approval request
+	// is a client mistake rather than a chain failure.
+	ErrNoApproval = errors.New("该场所无需链上授权")
+	// ErrVenueNotConfigured means the venue has an executor but it is missing
+	// credentials or is not otherwise ready to trade.
+	ErrVenueNotConfigured = errors.New("该场所实盘未配置")
 )
+
+// venueError carries a contract-exact message while still matching a sentinel
+// through errors.Is. The API's error table specifies the user-facing text per
+// scenario, so it cannot use the default "sentinel: detail" formatting.
+type venueError struct {
+	kind    error
+	message string
+}
+
+func (e *venueError) Error() string { return e.message }
+func (e *venueError) Unwrap() error { return e.kind }
 
 type AccountMode string
 
@@ -35,16 +62,22 @@ func (m AccountMode) Valid() bool {
 	return m == AccountModeLive || m == AccountModePaper
 }
 
-// Account is an isolated portfolio. Live accounts route orders to the real
-// Polymarket CLOB; paper accounts only write local simulated positions.
+// Account is an isolated portfolio. Live accounts route orders to their own
+// venue's executor; paper accounts only write local simulated positions. An
+// account belongs to exactly one venue, which is what keeps two collateral
+// currencies from ever being summed.
 type Account struct {
-	ID             int64       `json:"id"`
-	Name           string      `json:"name"`
-	Mode           AccountMode `json:"mode"`
-	IsDefault      bool        `json:"is_default"`
-	AutoTrade      bool        `json:"auto_trade"`
-	BaselineEquity float64     `json:"baseline_equity"`
-	CreatedAt      time.Time   `json:"created_at"`
+	ID   int64       `json:"id"`
+	Name string      `json:"name"`
+	Mode AccountMode `json:"mode"`
+	// Venue is the exchange this account trades on. Empty means Polymarket so
+	// accounts created before multi-venue support keep working.
+	Venue          market.Venue    `json:"venue"`
+	Currency       market.Currency `json:"currency"`
+	IsDefault      bool            `json:"is_default"`
+	AutoTrade      bool            `json:"auto_trade"`
+	BaselineEquity float64         `json:"baseline_equity"`
+	CreatedAt      time.Time       `json:"created_at"`
 
 	// Live* are computed at read time and are not persisted with the account.
 	LiveConfigured bool   `json:"live_configured"`
@@ -54,9 +87,106 @@ type Account struct {
 	LiveError      string `json:"live_error"`
 }
 
+// EffectiveVenue defaults an unset venue to Polymarket. Every account rows that
+// predates multi-venue support was a Polymarket account.
+func (a Account) EffectiveVenue() market.Venue {
+	if a.Venue == "" {
+		return market.VenuePolymarket
+	}
+	return a.Venue
+}
+
+// EffectiveCurrency is the account's collateral asset. It follows the venue so
+// a legacy row without a currency column still reports USDC.
+func (a Account) EffectiveCurrency() market.Currency {
+	if a.Currency != "" {
+		return a.Currency
+	}
+	return currencyForVenue(a.EffectiveVenue())
+}
+
+// currencyForVenue is the only place this build decides which collateral a
+// venue uses. Polymarket is USDC, Predict.fun is USDT on BNB Chain.
+func currencyForVenue(v market.Venue) market.Currency {
+	if v == market.VenuePredictFun {
+		return market.CurrencyUSDT
+	}
+	return market.CurrencyUSDC
+}
+
+// effectiveVenue normalizes the empty-string legacy value without rejecting an
+// unknown venue, which validation must still be able to report.
+func effectiveVenue(v market.Venue) market.Venue {
+	if v == "" {
+		return market.VenuePolymarket
+	}
+	return v
+}
+
 // FeeModelVersion is bumped whenever the default fee accounting changes so a
 // database written by an older build can be upgraded exactly once on load.
 const FeeModelVersion = 2
+
+// VenueSettings are the per-venue overrides an operator can set. A zero value
+// inherits the matching global Settings field, so a payload written before
+// venues existed keeps behaving exactly as before.
+type VenueSettings struct {
+	Enabled     bool    `json:"enabled"`
+	OrderSize   float64 `json:"order_size"`
+	MaxPosition float64 `json:"max_position"`
+	MaxExposure float64 `json:"max_exposure"`
+	FeeBPS      float64 `json:"fee_bps"`
+}
+
+// EffectiveSettings is one venue's settings after inheriting the global values.
+// Scan gates, sizing, exposure caps and the paper fee model all read this type,
+// which is what makes the caps per venue by construction.
+type EffectiveSettings struct {
+	Venue       market.Venue `json:"venue"`
+	Enabled     bool         `json:"enabled"`
+	OrderSize   float64      `json:"order_size"`
+	MaxPosition float64      `json:"max_position"`
+	MaxExposure float64      `json:"max_exposure"`
+	FeeBPS      float64      `json:"fee_bps"`
+}
+
+// defaultVenueEnabled is the upgrade-safe default: an existing installation
+// keeps trading Polymarket, and a venue added later stays off until an operator
+// enables it explicitly. Without this, an upgrade could silently start trading
+// a new exchange with real money.
+func defaultVenueEnabled(v market.Venue) bool {
+	return v != market.VenuePredictFun
+}
+
+// For resolves a venue's effective settings. An absent venue entry inherits
+// every global value plus the venue's default enabled state; a present entry is
+// read literally, so an operator who saves {"enabled": false} really disables
+// the venue.
+func (s Settings) For(v market.Venue) EffectiveSettings {
+	v = effectiveVenue(v)
+	effective := EffectiveSettings{
+		Venue: v, Enabled: defaultVenueEnabled(v),
+		OrderSize: s.OrderSize, MaxPosition: s.MaxPosition, MaxExposure: s.MaxExposure, FeeBPS: s.FeeBPS,
+	}
+	override, ok := s.Venues[v]
+	if !ok {
+		return effective
+	}
+	effective.Enabled = override.Enabled
+	if override.OrderSize > 0 {
+		effective.OrderSize = override.OrderSize
+	}
+	if override.MaxPosition > 0 {
+		effective.MaxPosition = override.MaxPosition
+	}
+	if override.MaxExposure > 0 {
+		effective.MaxExposure = override.MaxExposure
+	}
+	if override.FeeBPS > 0 {
+		effective.FeeBPS = override.FeeBPS
+	}
+	return effective
+}
 
 type Settings struct {
 	MinPrice            float64 `json:"min_price"`
@@ -96,6 +226,9 @@ type Settings struct {
 	StopLossRatio float64 `json:"stop_loss_ratio"`
 	// FeeModelVersion is managed by the server; clients must not set it.
 	FeeModelVersion int `json:"fee_model_version"`
+	// Venues holds per-venue overrides and the per-venue paper fee. Missing
+	// venues fall back to the global values plus their default enabled state.
+	Venues map[market.Venue]VenueSettings `json:"venues,omitempty"`
 }
 
 // MaxEntryWindowMinutes bounds the pre-close entry window. A window longer
@@ -156,6 +289,12 @@ func DefaultSettings() Settings {
 		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5,
 		StopLossEnabled: false, StopLossRatio: DefaultStopLossRatio,
 		FeeModelVersion: FeeModelVersion,
+		// Polymarket stays enabled for existing installations; Predict.fun is
+		// opt-in because it was never traded by this build before.
+		Venues: map[market.Venue]VenueSettings{
+			market.VenuePolymarket: {Enabled: true},
+			market.VenuePredictFun: {Enabled: false},
+		},
 	}
 }
 
@@ -206,6 +345,26 @@ func (s Settings) Validate() error {
 		math.IsNaN(s.StopLossRatio) || math.IsInf(s.StopLossRatio, 0) {
 		return fmt.Errorf("止损比例须为 0–1 之间的小数（例如 0.70 表示入场价的 70%%）")
 	}
+	for v := range s.Venues {
+		if !v.Valid() {
+			return fmt.Errorf("%w: 未知场所 %q", ErrInvalidSettings, v)
+		}
+		effective := s.For(v)
+		label := v.Label()
+		if !finitePositive(effective.OrderSize) {
+			return fmt.Errorf("%w: %s 的单笔金额必须为有限正数", ErrInvalidSettings, label)
+		}
+		if !finitePositive(effective.MaxPosition) || effective.MaxPosition < effective.OrderSize {
+			return fmt.Errorf("%w: %s 的单市场敞口上限不能小于单笔金额", ErrInvalidSettings, label)
+		}
+		if !finitePositive(effective.MaxExposure) || effective.MaxExposure < effective.MaxPosition {
+			return fmt.Errorf("%w: %s 的总敞口上限不能小于单市场敞口上限", ErrInvalidSettings, label)
+		}
+		if effective.FeeBPS < 0 || effective.FeeBPS > 1000 ||
+			math.IsNaN(effective.FeeBPS) || math.IsInf(effective.FeeBPS, 0) {
+			return fmt.Errorf("%w: %s 的费率须为 0–1000 BPS", ErrInvalidSettings, label)
+		}
+	}
 	return nil
 }
 
@@ -218,6 +377,178 @@ type SystemSettings struct {
 	Proxy      netproxy.Config    `json:"proxy"`
 	DataSource DataSourceSettings `json:"data_source"`
 	Live       LiveSettings       `json:"live"`
+	// Venues is the per-venue view of the same settings. The flat fields above
+	// remain the Polymarket view for older frontends and databases: a payload
+	// without venues.polymarket inherits them, and every save writes both.
+	Venues map[market.Venue]VenueSystemSettings `json:"venues,omitempty"`
+}
+
+// VenueSystemSettings is one venue's block inside SystemSettings. The
+// Polymarket block mirrors the flat legacy fields; Predict.fun's live block
+// carries its own BNB-chain credentials.
+type VenueSystemSettings struct {
+	DataSource VenueDataSourceSettings `json:"data_source"`
+	Live       VenueLiveSettings       `json:"live"`
+}
+
+// VenueDataSourceSettings holds the public endpoints one venue can override.
+// Polymarket uses gamma_base_url/clob_base_url; Predict.fun uses base_url.
+type VenueDataSourceSettings struct {
+	GammaBaseURL string `json:"gamma_base_url,omitempty"`
+	CLOBBaseURL  string `json:"clob_base_url,omitempty"`
+	BaseURL      string `json:"base_url,omitempty"`
+}
+
+// VenueLiveSettings is the credential set a venue needs to trade. The embedded
+// LiveSettings keeps the Polymarket shape and its redaction rules; the extra
+// fields are Predict.fun's independent BNB-chain wallet.
+type VenueLiveSettings struct {
+	LiveSettings
+	SmartWallet string `json:"smart_wallet,omitempty"`
+	// Testnet is tri-state on purpose: absent means "inherit the process
+	// environment", an explicit value switches networks. A plain bool would make
+	// saving an unrelated field silently move a testnet deployment to mainnet
+	// (real USDT, mainnet contracts).
+	Testnet *bool `json:"testnet,omitempty"`
+}
+
+func (d VenueDataSourceSettings) Normalize() VenueDataSourceSettings {
+	d.GammaBaseURL = strings.TrimRight(strings.TrimSpace(d.GammaBaseURL), "/")
+	d.CLOBBaseURL = strings.TrimRight(strings.TrimSpace(d.CLOBBaseURL), "/")
+	d.BaseURL = strings.TrimRight(strings.TrimSpace(d.BaseURL), "/")
+	return d
+}
+
+func (d VenueDataSourceSettings) Validate() error {
+	d = d.Normalize()
+	if err := validateBaseURL("Gamma 行情地址", d.GammaBaseURL); err != nil {
+		return err
+	}
+	if err := validateBaseURL("CLOB 交易地址", d.CLOBBaseURL); err != nil {
+		return err
+	}
+	return validateBaseURL("行情地址", d.BaseURL)
+}
+
+func (s VenueLiveSettings) Normalize() VenueLiveSettings {
+	s.LiveSettings = s.LiveSettings.Normalize()
+	s.SmartWallet = normalizeHexPrefix(strings.TrimSpace(s.SmartWallet))
+	// funder is the Polymarket name for the same thing (the address that holds
+	// the money and signs differently). The venue block embeds LiveSettings, so
+	// a client that only knows the Polymarket spelling would otherwise fill a
+	// field this venue never reads and silently lose its maker address.
+	if s.SmartWallet == "" && s.Funder != "" {
+		s.SmartWallet = s.Funder
+	}
+	return s
+}
+
+func (s VenueLiveSettings) Validate(v market.Venue) error {
+	if v == market.VenuePredictFun {
+		// Predict.fun authenticates with x-api-key plus an EOA signature; it has
+		// no L2 secret/passphrase triple and no Polymarket funder model, so the
+		// Polymarket validator would reject a valid Predict.fun credential set.
+		if s.PrivateKey != "" && !validHexValue(s.PrivateKey, 32) {
+			return fmt.Errorf("Predict.fun 私钥必须是 0x 开头的 64 位十六进制字符串")
+		}
+		if s.SmartWallet != "" && !validHexValue(s.SmartWallet, 20) {
+			return fmt.Errorf("Predict.fun 的智能钱包必须是 0x 开头的 40 位十六进制地址")
+		}
+		return nil
+	}
+	if err := s.LiveSettings.Validate(); err != nil {
+		return err
+	}
+	if s.SmartWallet != "" && !validHexValue(s.SmartWallet, 20) {
+		return fmt.Errorf("%s 的智能钱包必须是 0x 开头的 40 位十六进制地址", v.Label())
+	}
+	return nil
+}
+
+func (s VenueLiveSettings) Redacted() VenueLiveSettings {
+	s.LiveSettings = s.LiveSettings.Redacted()
+	return s
+}
+
+func (s VenueLiveSettings) MergeSecret(previous VenueLiveSettings) VenueLiveSettings {
+	s.LiveSettings = s.LiveSettings.MergeSecret(previous.LiveSettings)
+	if s.SmartWallet == "" || s.SmartWallet == netproxy.RedactedSecret {
+		s.SmartWallet = previous.SmartWallet
+	}
+	if s.Testnet == nil {
+		s.Testnet = previous.Testnet
+	}
+	return s.Normalize()
+}
+
+func (s VenueSystemSettings) Normalize() VenueSystemSettings {
+	s.DataSource = s.DataSource.Normalize()
+	s.Live = s.Live.Normalize()
+	return s
+}
+
+func (s VenueSystemSettings) Validate(v market.Venue) error {
+	if !v.Valid() {
+		return fmt.Errorf("未知场所 %q", v)
+	}
+	if err := s.DataSource.Validate(); err != nil {
+		return fmt.Errorf("%s: %w", v.Label(), err)
+	}
+	return s.Live.Validate(v)
+}
+
+func (s VenueSystemSettings) Redacted() VenueSystemSettings {
+	s.Live = s.Live.Redacted()
+	return s
+}
+
+// Merge treats an empty field as "keep the stored value", matching the PUT
+// semantics of the flat fields so a partial venue update cannot wipe another
+// venue's endpoints or credentials.
+func (s VenueSystemSettings) Merge(previous VenueSystemSettings) VenueSystemSettings {
+	if s.DataSource.GammaBaseURL == "" {
+		s.DataSource.GammaBaseURL = previous.DataSource.GammaBaseURL
+	}
+	if s.DataSource.CLOBBaseURL == "" {
+		s.DataSource.CLOBBaseURL = previous.DataSource.CLOBBaseURL
+	}
+	if s.DataSource.BaseURL == "" {
+		s.DataSource.BaseURL = previous.DataSource.BaseURL
+	}
+	// A redacted secret echoed back by a client means "keep the stored value",
+	// exactly like an empty field: storing the placeholder instead would fail
+	// validation and reject an otherwise harmless round-trip.
+	keep := func(value string) bool {
+		return value == "" || value == netproxy.RedactedSecret
+	}
+	if keep(s.Live.PrivateKey) {
+		s.Live.PrivateKey = previous.Live.PrivateKey
+	}
+	if s.Live.Funder == "" {
+		s.Live.Funder = previous.Live.Funder
+	}
+	if s.Live.SignatureType == nil {
+		s.Live.SignatureType = previous.Live.SignatureType
+	}
+	if s.Live.APIKey == "" {
+		s.Live.APIKey = previous.Live.APIKey
+	}
+	if keep(s.Live.APISecret) {
+		s.Live.APISecret = previous.Live.APISecret
+	}
+	if keep(s.Live.APIPassphrase) {
+		s.Live.APIPassphrase = previous.Live.APIPassphrase
+	}
+	if keep(s.Live.SmartWallet) {
+		s.Live.SmartWallet = previous.Live.SmartWallet
+	}
+	// Testnet is three-state: nil means "inherit". Without this a PUT that
+	// touches any unrelated field of the venue block would quietly drop a stored
+	// testnet:true and the next process start would fall back to mainnet.
+	if s.Live.Testnet == nil {
+		s.Live.Testnet = previous.Live.Testnet
+	}
+	return s.Normalize()
 }
 
 // DataSourceSettings overrides the public data and CLOB endpoints. An empty
@@ -369,7 +700,13 @@ func validHexValue(value string, bytes int) bool {
 }
 
 func DefaultSystemSettings() SystemSettings {
-	return SystemSettings{Proxy: netproxy.DefaultConfig()}
+	return SystemSettings{
+		Proxy: netproxy.DefaultConfig(),
+		Venues: map[market.Venue]VenueSystemSettings{
+			market.VenuePolymarket: {},
+			market.VenuePredictFun: {},
+		},
+	}
 }
 
 func (s SystemSettings) Validate() error {
@@ -379,20 +716,84 @@ func (s SystemSettings) Validate() error {
 	if err := s.DataSource.Validate(); err != nil {
 		return err
 	}
-	return s.Live.Validate()
+	if err := s.Live.Validate(); err != nil {
+		return err
+	}
+	for v, entry := range s.Venues {
+		if err := entry.Validate(v); err != nil {
+			return err
+		}
+	}
+	// Predict.fun signs on BNB Chain with its own hot wallet. Reusing the
+	// Polymarket key would put both venues' funds behind one credential.
+	if pf, ok := s.Venues[market.VenuePredictFun]; ok {
+		if pm, ok := s.Venues[market.VenuePolymarket]; ok && pf.Live.PrivateKey != "" &&
+			pf.Live.PrivateKey == pm.Live.PrivateKey {
+			return fmt.Errorf("%s 的实盘私钥不能与 %s 共用", market.VenuePredictFun.Label(), market.VenuePolymarket.Label())
+		}
+	}
+	return nil
 }
 
 func (s SystemSettings) Normalize() SystemSettings {
 	s.Proxy = s.Proxy.Normalize()
 	s.DataSource = s.DataSource.Normalize()
 	s.Live = s.Live.Normalize()
+	venues := make(map[market.Venue]VenueSystemSettings, len(s.Venues)+1)
+	for v, entry := range s.Venues {
+		venues[v] = entry.Normalize()
+	}
+	// Dual read/write for Polymarket, field by field: an absent value inherits
+	// the flat legacy field, a present one wins and is mirrored back. This is
+	// what keeps a payload without venues.polymarket identical to before.
+	pm := venues[market.VenuePolymarket]
+	if pm.DataSource.GammaBaseURL == "" {
+		pm.DataSource.GammaBaseURL = s.DataSource.GammaBaseURL
+	}
+	if pm.DataSource.CLOBBaseURL == "" {
+		pm.DataSource.CLOBBaseURL = s.DataSource.CLOBBaseURL
+	}
+	s.DataSource = DataSourceSettings{GammaBaseURL: pm.DataSource.GammaBaseURL, CLOBBaseURL: pm.DataSource.CLOBBaseURL}
+	if pm.Live.LiveSettings.isZero() {
+		pm.Live.LiveSettings = s.Live
+	} else {
+		s.Live = pm.Live.LiveSettings
+	}
+	venues[market.VenuePolymarket] = pm.Normalize()
+	s.Venues = venues
 	return s
+}
+
+// SyncPolymarketVenue mirrors the flat legacy fields into venues.polymarket.
+// It is the dual-write half of the system-settings contract: the flat fields
+// stay authoritative for the Polymarket runtime, and a reader that only knows
+// the venues shape sees the same values.
+func (s SystemSettings) SyncPolymarketVenue() SystemSettings {
+	s = s.Normalize()
+	pm := s.Venues[market.VenuePolymarket]
+	pm.DataSource.GammaBaseURL = s.DataSource.GammaBaseURL
+	pm.DataSource.CLOBBaseURL = s.DataSource.CLOBBaseURL
+	pm.Live.LiveSettings = s.Live
+	s.Venues[market.VenuePolymarket] = pm.Normalize()
+	return s
+}
+
+// isZero reports whether no credential field is set at all. It decides the
+// dual-read direction for the Polymarket live block.
+func (s LiveSettings) isZero() bool {
+	return s.PrivateKey == "" && s.Funder == "" && s.SignatureType == nil &&
+		s.APIKey == "" && s.APISecret == "" && s.APIPassphrase == ""
 }
 
 func (s SystemSettings) Redacted() SystemSettings {
 	s = s.Normalize()
 	s.Proxy = s.Proxy.Redacted()
 	s.Live = s.Live.Redacted()
+	venues := make(map[market.Venue]VenueSystemSettings, len(s.Venues))
+	for v, entry := range s.Venues {
+		venues[v] = entry.Redacted()
+	}
+	s.Venues = venues
 	return s
 }
 
@@ -401,6 +802,10 @@ func (s SystemSettings) MergeSecret(previous SystemSettings) SystemSettings {
 	previous = previous.Normalize()
 	s.Proxy = s.Proxy.MergeSecret(previous.Proxy)
 	s.Live = s.Live.MergeSecret(previous.Live)
+	for v, entry := range s.Venues {
+		entry.Live = entry.Live.MergeSecret(previous.Venues[v].Live)
+		s.Venues[v] = entry.Normalize()
+	}
 	return s
 }
 
@@ -444,7 +849,9 @@ type RelayerProbe struct {
 }
 
 // SystemRuntime is the effective, read-only view of the runtime settings. It
-// is not persisted; it is assembled from the provider and live executor.
+// is not persisted; it is assembled from the registered market data sources
+// and executors. The flat Gamma/CLOB fields stay the Polymarket view; Venues
+// carries one status per registered venue.
 type SystemRuntime struct {
 	GammaBaseURL    string          `json:"gamma_base_url"`
 	CLOBBaseURL     string          `json:"clob_base_url"`
@@ -454,7 +861,20 @@ type SystemRuntime struct {
 	LiveConfigured  bool            `json:"live_configured"`
 	LiveReady       bool            `json:"live_ready"`
 	LiveError       string          `json:"live_error"`
+	Venues          []VenueRuntime  `json:"venues"`
 	Error           string          `json:"error"`
+}
+
+// VenueRuntime is one venue's executor state. Configured means credentials
+// were supplied at all; Ready means they passed the venue's own checks.
+type VenueRuntime struct {
+	Venue      market.Venue `json:"venue"`
+	Configured bool         `json:"configured"`
+	Ready      bool         `json:"ready"`
+	Signer     string       `json:"signer"`
+	Maker      string       `json:"maker"`
+	Error      string       `json:"error"`
+	Testnet    bool         `json:"testnet"`
 }
 
 // dataSourceRuntime is implemented by market providers that can switch their
@@ -552,6 +972,24 @@ type Opportunity struct {
 	// orders are refused for "v2" because those markets settle through
 	// ExchangeV3 with a different signing domain than this build supports.
 	Version string `json:"version,omitempty"`
+	// Venue and Currency identify which exchange this row belongs to. They are
+	// part of the contract because token ids are only unique per venue.
+	Venue    market.Venue    `json:"venue"`
+	Currency market.Currency `json:"currency"`
+	// FeeRateBPS is the taker rate the venue reported for this market. Zero
+	// means the venue did not report one and the settings default applies.
+	FeeRateBPS float64 `json:"fee_rate_bps,omitempty"`
+}
+
+// EffectiveVenue defaults an unset venue to Polymarket.
+func (o Opportunity) EffectiveVenue() market.Venue { return effectiveVenue(o.Venue) }
+
+// EffectiveCurrency follows the venue when the provider did not set one.
+func (o Opportunity) EffectiveCurrency() market.Currency {
+	if o.Currency != "" {
+		return o.Currency
+	}
+	return currencyForVenue(o.EffectiveVenue())
 }
 
 // IsV2 reports whether the opportunity trades on Polymarket Protocol V2.
@@ -564,10 +1002,12 @@ func (o Opportunity) IsV2() bool {
 // schedule, so NetYield is what a live FAK buy of Amount would return if the
 // outcome resolves in favour. It never signs or submits an order.
 type OpportunityQuote struct {
-	TokenID     string  `json:"token_id"`
-	ConditionID string  `json:"condition_id"`
-	Amount      float64 `json:"amount"`
-	BestAsk     float64 `json:"best_ask"`
+	TokenID     string          `json:"token_id"`
+	ConditionID string          `json:"condition_id"`
+	Venue       market.Venue    `json:"venue"`
+	Currency    market.Currency `json:"currency"`
+	Amount      float64         `json:"amount"`
+	BestAsk     float64         `json:"best_ask"`
 	// LimitPrice is the worst touched level, tick-ceiled. The live order is
 	// rejected when this exceeds the strategy's max_price, even if the average
 	// fill price is lower.
@@ -592,15 +1032,17 @@ type OpportunityQuote struct {
 }
 
 type Position struct {
-	ID          int64  `json:"id"`
-	AccountID   int64  `json:"account_id"`
-	MarketID    string `json:"market_id"`
-	ConditionID string `json:"condition_id"`
-	Question    string `json:"question"`
-	Outcome     string `json:"outcome"`
-	TokenID     string `json:"token_id"`
-	Side        string `json:"side"`
-	Kind        string `json:"kind"`
+	ID          int64           `json:"id"`
+	AccountID   int64           `json:"account_id"`
+	Venue       market.Venue    `json:"venue"`
+	Currency    market.Currency `json:"currency"`
+	MarketID    string          `json:"market_id"`
+	ConditionID string          `json:"condition_id"`
+	Question    string          `json:"question"`
+	Outcome     string          `json:"outcome"`
+	TokenID     string          `json:"token_id"`
+	Side        string          `json:"side"`
+	Kind        string          `json:"kind"`
 	// ExitKind is empty for normal holdings and "stop" for a position closed by
 	// the stop-loss monitor. The status itself stays won/lost/split so the
 	// existing SQLite CHECK constraints (and any older database) remain valid.
@@ -618,16 +1060,29 @@ type Position struct {
 	UnrealizedPNL float64    `json:"unrealized_pnl"`
 }
 
+// EffectiveVenue defaults an unset venue to Polymarket; legacy rows were all
+// Polymarket positions.
+func (p Position) EffectiveVenue() market.Venue { return effectiveVenue(p.Venue) }
+
+func (p Position) EffectiveCurrency() market.Currency {
+	if p.Currency != "" {
+		return p.Currency
+	}
+	return currencyForVenue(p.EffectiveVenue())
+}
+
 type Order struct {
-	ID         int64  `json:"id"`
-	AccountID  int64  `json:"account_id"`
-	PositionID *int64 `json:"position_id"`
-	MarketID   string `json:"market_id"`
-	Question   string `json:"question"`
-	Outcome    string `json:"outcome"`
-	TokenID    string `json:"token_id"`
-	Kind       string `json:"kind"`
-	Type       string `json:"type"`
+	ID         int64           `json:"id"`
+	AccountID  int64           `json:"account_id"`
+	Venue      market.Venue    `json:"venue"`
+	Currency   market.Currency `json:"currency"`
+	PositionID *int64          `json:"position_id"`
+	MarketID   string          `json:"market_id"`
+	Question   string          `json:"question"`
+	Outcome    string          `json:"outcome"`
+	TokenID    string          `json:"token_id"`
+	Kind       string          `json:"kind"`
+	Type       string          `json:"type"`
 	// Action is empty for buys/settlements and "stop" for a stop-loss sell.
 	// Type stays settle so the orders CHECK constraint remains unchanged.
 	Action string  `json:"action"`
@@ -644,21 +1099,35 @@ type Order struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// EffectiveVenue defaults an unset venue to Polymarket.
+func (o Order) EffectiveVenue() market.Venue { return effectiveVenue(o.Venue) }
+
+func (o Order) EffectiveCurrency() market.Currency {
+	if o.Currency != "" {
+		return o.Currency
+	}
+	return currencyForVenue(o.EffectiveVenue())
+}
+
 type EquityPoint struct {
-	Time  time.Time `json:"time"`
-	Value float64   `json:"value"`
+	Venue    market.Venue    `json:"venue"`
+	Currency market.Currency `json:"currency"`
+	Time     time.Time       `json:"time"`
+	Value    float64         `json:"value"`
 }
 
 type Metrics struct {
-	Mode            string  `json:"mode"`
-	InitialBankroll float64 `json:"initial_bankroll"`
-	Cash            float64 `json:"cash"`
-	WalletCash      float64 `json:"wallet_cash"`
-	WalletCashStale bool    `json:"wallet_cash_stale"`
-	Equity          float64 `json:"equity"`
-	RealizedPNL     float64 `json:"realized_pnl"`
-	UnrealizedPNL   float64 `json:"unrealized_pnl"`
-	TotalPNL        float64 `json:"total_pnl"`
+	Mode            string          `json:"mode"`
+	Venue           market.Venue    `json:"venue"`
+	Currency        market.Currency `json:"currency"`
+	InitialBankroll float64         `json:"initial_bankroll"`
+	Cash            float64         `json:"cash"`
+	WalletCash      float64         `json:"wallet_cash"`
+	WalletCashStale bool            `json:"wallet_cash_stale"`
+	Equity          float64         `json:"equity"`
+	RealizedPNL     float64         `json:"realized_pnl"`
+	UnrealizedPNL   float64         `json:"unrealized_pnl"`
+	TotalPNL        float64         `json:"total_pnl"`
 	// FeesPaid is the sum of the buy-side taker fees already booked into the
 	// cost of every position, open or settled.
 	FeesPaid         float64 `json:"fees_paid"`
@@ -700,6 +1169,8 @@ type OpportunityList struct {
 	Total     int           `json:"total"`
 	ScannedAt *time.Time    `json:"scanned_at"`
 	Source    string        `json:"source"`
+	// Venues lists the venues that contributed market data to this scan.
+	Venues []market.Venue `json:"venues"`
 }
 
 // ScanOptions controls one scan pass. Execute enables automatic entries and the
@@ -708,6 +1179,8 @@ type OpportunityList struct {
 type ScanOptions struct {
 	Execute   bool
 	AccountID int64
+	// Venue limits the scan to one venue. Empty means every enabled venue.
+	Venue market.Venue
 	// Manual marks a user-initiated run. It overrides the account's background
 	// AutoTrade switch for this single pass so the radar's "自动下单" choice
 	// takes effect even when background auto trading is disabled.
@@ -741,67 +1214,32 @@ type AccountList struct {
 	Total int       `json:"total"`
 }
 
-// LiveFill is the real exchange execution returned by the live executor.
-// For a buy, Cost is the gross notional plus the taker fee. For a sell, Cost is
-// the gross proceeds minus the taker fee. Price is always the execution price
+// LiveFill is the real exchange execution returned by a venue executor. For a
+// buy, Cost is the gross notional plus the taker fee. For a sell, Cost is the
+// gross proceeds minus the taker fee. Price is always the execution price
 // excluding the fee.
-type LiveFill struct {
-	OrderID string
-	Shares  float64
-	Cost    float64
-	Price   float64
-	Fee     float64
-	Status  string
-}
+//
+// It is an alias of venue.Fill so an executor can implement the interface
+// without importing the engine (the import would be a cycle).
+type LiveFill = venue.Fill
 
-// CashSnapshot is the real pUSD collateral balance and allowance of the live
-// wallet. Both values are denominated in pUSD, the collateral token Polymarket
-// has used since the CLOB V2 cutover (it replaced USDC.e).
-type CashSnapshot struct {
-	Amount    float64
-	Allowance float64
-	At        time.Time
-	Stale     bool
-}
+// CashSnapshot is a venue's collateral balance and allowance. The currency is
+// implied by the executor that produced it (Polymarket USDC, Predict.fun USDT),
+// so no amount is ever added to a snapshot from another venue.
+type CashSnapshot = venue.CashSnapshot
 
-// LiveExecutor is implemented by the Polymarket CLOB adapter. A nil executor
-// means no live credentials are configured; live accounts then refuse orders.
-type LiveExecutor interface {
-	Configured() bool
-	Signer() string
-	Maker() string
-	ReadyError() string
-	// Buy signs an order and invokes onSigned before submitting it. The
-	// callback must persist the order so a crash or timeout cannot lose a
-	// real fill. conditionID is required to load the market's fee schedule.
-	Buy(ctx context.Context, tokenID, conditionID string, amount, maxPrice float64, onSigned func(orderID string) error) (LiveFill, error)
-	// Sell signs and submits a market sell for shares, invoking onSigned before
-	// submitting it. LiveFill.Cost is the net pUSD proceeds (gross proceeds
-	// minus the taker fee) and LiveFill.Price is the gross execution price.
-	Sell(ctx context.Context, tokenID, conditionID string, shares float64, onSigned func(orderID string) error) (LiveFill, error)
-	LookupOrder(ctx context.Context, orderID, conditionID string) (LiveFill, bool, error)
-	EstimateBuyFee(ctx context.Context, conditionID string, amount, price float64) (float64, error)
-	// Quote reads the real ask book and fee schedule without submitting an
-	// order. It must work without wallet credentials.
-	Quote(ctx context.Context, tokenID, conditionID string, amount float64) (LiveQuote, error)
-	Collateral(ctx context.Context) (CashSnapshot, error)
-}
+// LiveExecutor is one venue's trading surface. The identifiers it takes are
+// interpreted by that venue: the same decimal strings mean a CTF token id on
+// Polymarket and a CTF onChainId on Predict.fun, and the executor receiving
+// them is always the one that owns them. A missing executor means the venue is
+// read-only and live accounts on it refuse orders.
+type LiveExecutor = venue.Executor
 
-// LiveQuote is a read-only executable estimate returned by the CLOB adapter.
+// LiveQuote is a read-only executable estimate returned by a venue executor.
 // LimitPrice is the worst ask level a FAK buy would touch (tick-ceiled), the
 // same convention MarketBuyOrder uses when it sizes and signs the real order.
 // FillPrice is the expected average execution price after walking every level.
-type LiveQuote struct {
-	BestAsk           float64
-	LimitPrice        float64
-	FillPrice         float64
-	Shares            float64
-	Notional          float64
-	Fee               float64
-	FeeRate           float64
-	AvailableNotional float64
-	FullyFilled       bool
-}
+type LiveQuote = venue.Quote
 
 type Repository interface {
 	LoadSettings(context.Context) (Settings, error)
@@ -822,9 +1260,9 @@ type Repository interface {
 	CreatePosition(context.Context, Position) (Position, error)
 	CreatePositionWithOrder(context.Context, Position, Order) (Position, Order, error)
 	CreateOrder(context.Context, Order) (Order, error)
-	ListPositions(context.Context, int64, string) ([]Position, error)
-	ListOrders(context.Context, int64, string, int, int) ([]Order, error)
-	CountOrders(context.Context, int64, string) (int64, error)
+	ListPositions(context.Context, int64, string, market.Venue) ([]Position, error)
+	ListOrders(context.Context, int64, string, int, int, market.Venue) ([]Order, error)
+	CountOrders(context.Context, int64, string, market.Venue) (int64, error)
 	ListUnresolvedOrders(context.Context, int64) ([]Order, error)
 	MarkOrderStatus(context.Context, int64, string, string) error
 	FinalizeLiveBuy(context.Context, int64, Position, LiveFill) (Position, error)
@@ -847,7 +1285,8 @@ func opportunityFor(m market.Market, outcome market.Outcome, now time.Time) Oppo
 		Slug: m.Slug, Outcome: outcome.Name, TokenID: outcome.TokenID, Price: outcome.Price,
 		Liquidity: m.Liquidity, Volume: m.Volume, EndDate: m.EndDate, DaysToEnd: days,
 		GrossYield: grossYield, URL: m.URL(), PriceChange24h: m.PriceChange24h,
-		Version: m.Version,
+		Version: m.Version, Venue: m.EffectiveVenue(), Currency: m.EffectiveCurrency(),
+		FeeRateBPS: m.FeeRateBPS,
 	}
 }
 

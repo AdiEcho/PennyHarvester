@@ -91,6 +91,11 @@ func (g *GammaClient) httpClient() *http.Client {
 
 func (g *GammaClient) Name() string { return "Polymarket Gamma" }
 
+// Venue reports which exchange this provider reads. Every market this client
+// returns is a Polymarket market, which is what lets the venue registry route
+// it without a per-call argument.
+func (g *GammaClient) Venue() Venue { return VenuePolymarket }
+
 type gammaMarket struct {
 	ID             string          `json:"id"`
 	ConditionID    string          `json:"conditionId"`
@@ -123,7 +128,12 @@ type gammaMarket struct {
 	// stay active and unclosed while orders are paused, so this is the field to
 	// gate trading on.
 	AcceptingOrders *bool `json:"acceptingOrders"`
-	Events          []struct {
+	// NegRisk and OrderPriceMinTickSize are venue metadata the trading layer
+	// needs: negative-risk markets settle through a different flow, and the
+	// tick size decides how a price must be rounded before signing.
+	NegRisk               bool     `json:"negRisk"`
+	OrderPriceMinTickSize *float64 `json:"orderPriceMinTickSize"`
+	Events                []struct {
 		ID    string `json:"id"`
 		Slug  string `json:"slug"`
 		Title string `json:"title"`
@@ -388,7 +398,19 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 		Liquidity: liquidity, Volume: volume, Active: raw.Active,
 		Closed: raw.Closed, ResolutionStatus: resolutionStatus,
 		Version: strings.ToLower(strings.TrimSpace(raw.Version)), AcceptingOrders: raw.AcceptingOrders,
+		Venue: VenuePolymarket, Currency: CurrencyUSDC, NegRisk: raw.NegRisk,
+		TickSize: gammaTickSize(raw.OrderPriceMinTickSize), MinNotional: 1,
 	}, nil
+}
+
+// gammaTickSize clamps the reported tick to the values the CLOB actually
+// accepts. An unreported or nonsensical tick yields 0 so callers fall back to
+// their own default instead of signing an unreprensentable price.
+func gammaTickSize(raw *float64) float64 {
+	if raw == nil || *raw <= 0 || *raw > 0.1 {
+		return 0
+	}
+	return *raw
 }
 
 // gammaOutcomeIDs resolves the trading identifier Gamma publishes for each

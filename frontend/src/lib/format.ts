@@ -1,38 +1,7 @@
-const usd = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-})
-
-const compactUsd = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  notation: 'compact',
-  maximumFractionDigits: 1,
-})
-
+// Money is formatted by fmtMoney() in lib/venue.ts so the venue currency is
+// always part of the string. There is deliberately no bare USD formatter here:
+// a USDT amount must never be rendered with a dollar sign.
 const number = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 })
-
-export function formatCurrency(value: number, signed = false) {
-  if (!Number.isFinite(value)) return '—'
-  if (signed && value > 0) return `+${usd.format(value)}`
-  return usd.format(value)
-}
-
-export function formatCompactCurrency(value: number) {
-  return Number.isFinite(value) ? compactUsd.format(value) : '—'
-}
-
-export function formatAxisCurrency(value: number) {
-  if (!Number.isFinite(value)) return ''
-  if (Math.abs(value) >= 100000) return compactUsd.format(value)
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 2,
-  }).format(value)
-}
 
 export function formatNumber(value: number, maximumFractionDigits = 2) {
   if (!Number.isFinite(value)) return '—'
@@ -49,9 +18,12 @@ export function formatPercent(ratio: number, digits = 2, signed = false) {
   }).format(ratio)
 }
 
+// A price is a probability per share (0–1), not a currency amount, so it is
+// printed without a currency symbol: the venue chip/currency label supplies the
+// unit and USDC/USDT can never be confused here.
 export function formatPrice(value: number) {
   if (!Number.isFinite(value)) return '—'
-  return `$${value.toFixed(3)}`
+  return value.toFixed(3)
 }
 
 // Gamma reports oneDayPriceChange in probability dollars (0.03 = 3 cents).

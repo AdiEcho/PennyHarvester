@@ -21,6 +21,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"pennyharvester/backend/internal/engine"
+	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
 )
 
@@ -86,6 +87,11 @@ func normalizeKeyPrefix(value string) string {
 	}
 	return value
 }
+
+// Venue reports which exchange this executor trades on. It is what lets the
+// venue registry route an order to the adapter that owns its identifiers;
+// every order signed by this executor is a Polymarket CLOB order.
+func (e *Executor) Venue() market.Venue { return market.VenuePolymarket }
 
 func (e *Executor) Configured() bool {
 	if e == nil {
@@ -1001,8 +1007,10 @@ func applyFee(schedule clobclient.FeeSchedule, fill *engine.LiveFill) error {
 	if err != nil {
 		return fmt.Errorf("计算实盘手续费: %w", err)
 	}
+	// Report the fee without folding it into Cost: venue.Fill.Cost is the gross
+	// notional, and the engine adds or subtracts the fee exactly once when it
+	// books the position or the proceeds.
 	fill.Fee = fee
-	fill.Cost += fee
 	return nil
 }
 

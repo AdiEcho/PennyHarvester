@@ -1,6 +1,25 @@
 import { AlertTriangle, Check, CircleCheck, CircleX, Clock3, FlaskConical, Radio, ShieldAlert, X } from 'lucide-react'
 import type { AccountMode, OrderStatus, PositionStatus } from '@/types'
+import { venueMeta } from '@/lib/venue'
 import { Badge } from '@/components/ui/badge'
+import { cn } from '@/lib/utils'
+
+// Venue chip: every row/number that belongs to a venue carries one, so a USDT
+// amount can never be read as a USDC one. `full` spells the label out for card
+// layouts; tables use the two-letter tag.
+export function VenueChip({ venue, full = false, className }: { venue?: string | null; full?: boolean; className?: string }) {
+  const meta = venueMeta(venue)
+  return (
+    <Badge
+      variant={meta.tone}
+      className={cn('px-2 py-0.5 text-[11px]', className)}
+      title={`${meta.label} · ${meta.currency}`}
+    >
+      {full ? meta.label : meta.short}
+      <span className="sr-only">{meta.label}</span>
+    </Badge>
+  )
+}
 
 export function OrderStatusBadge({ status }: { status: OrderStatus }) {
   if (status === 'filled') return <Badge variant="success"><Check className="h-3 w-3" /> 已成交</Badge>

@@ -104,7 +104,7 @@ func TestExecutorRejectsInvalidBuilderCode(t *testing.T) {
 	}
 }
 
-func TestApplyFeeAddsTakerFeeToCost(t *testing.T) {
+func TestApplyFeeReportsTakerFeeSeparately(t *testing.T) {
 	fill := engine.LiveFill{Shares: 100, Cost: 98, Price: 0.98, Status: "matched"}
 	if err := applyFee(clobclient.FeeSchedule{Rate: "0.07", Exponent: "1", TakerOnly: true}, &fill); err != nil {
 		t.Fatal(err)
@@ -113,8 +113,10 @@ func TestApplyFeeAddsTakerFeeToCost(t *testing.T) {
 	if math.Abs(fill.Fee-wantFee) > 1e-6 {
 		t.Fatalf("unexpected fee: got %f want %f", fill.Fee, wantFee)
 	}
-	if math.Abs(fill.Cost-(98+wantFee)) > 1e-6 {
-		t.Fatalf("fee was not added to cost: %+v", fill)
+	// Cost stays the gross notional: the engine folds the fee in exactly once,
+	// so an executor that also folded it here would double-charge the ledger.
+	if math.Abs(fill.Cost-98) > 1e-6 {
+		t.Fatalf("cost must stay the gross notional: %+v", fill)
 	}
 	// Price must stay the execution price: the fee is carried separately so a
 	// live entry price is comparable to a paper entry price.
@@ -379,7 +381,7 @@ func TestCollateralFallsBackWhenL2ReadFails(t *testing.T) {
 	}
 }
 
-func TestBuyPersistsSignedOrderAndAddsFee(t *testing.T) {
+func TestBuyPersistsSignedOrderAndReportsFee(t *testing.T) {
 	const builderCode = "0x07718b719cce8cdfb015b268d90732d15f7071e9fa845bd16ec058b0ab2226eb"
 	var submittedOrder string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -429,8 +431,10 @@ func TestBuyPersistsSignedOrderAndAddsFee(t *testing.T) {
 	if fill.Shares != 100 || fill.Fee <= 0 {
 		t.Fatalf("unexpected fill: %+v", fill)
 	}
-	if math.Abs(fill.Cost-(98+fill.Fee)) > 1e-9 {
-		t.Fatalf("fee was not included in cost: %+v", fill)
+	// The executor reports the gross cost; the engine adds the fee when it books
+	// the position (see TestLiveBuyBooksFeeOnce).
+	if math.Abs(fill.Cost-98) > 1e-9 {
+		t.Fatalf("cost must stay the gross notional: %+v", fill)
 	}
 	// The builder code must be inside the signed payload, otherwise the matched
 	// trade is not attributed to the builder profile.

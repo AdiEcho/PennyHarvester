@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"pennyharvester/backend/internal/engine"
+	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
 )
 
@@ -161,5 +162,81 @@ func TestSystemSettingsAndAccessHash(t *testing.T) {
 	}
 	if hash, err = repository.LoadAccessHash(ctx); err != nil || hash != "" {
 		t.Fatalf("hash after clearing = %q, err = %v", hash, err)
+	}
+}
+
+func TestSystemSettingsVenueSecretsAreEncryptedAtRest(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "venue-secrets.db")
+	repository, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+
+	polymarketKey := "0x" + strings.Repeat("5", 64)
+	predictFunKey := "0x" + strings.Repeat("6", 64)
+	polymarketSecret := "polymarket-api-secret"
+	predictFunSecret := "predictfun-api-secret"
+	predictFunPassphrase := "predictfun-api-passphrase"
+	smartWallet := "0x" + strings.Repeat("7", 40)
+	settings := engine.SystemSettings{
+		Live: engine.LiveSettings{
+			PrivateKey: polymarketKey, APIKey: "polymarket-api-key",
+			APISecret: polymarketSecret, APIPassphrase: "polymarket-api-passphrase",
+		},
+		Venues: map[market.Venue]engine.VenueSystemSettings{
+			market.VenuePolymarket: {
+				Live: engine.VenueLiveSettings{LiveSettings: engine.LiveSettings{
+					PrivateKey: polymarketKey, APIKey: "polymarket-api-key",
+					APISecret: polymarketSecret, APIPassphrase: "polymarket-api-passphrase",
+				}},
+			},
+			market.VenuePredictFun: {
+				Live: engine.VenueLiveSettings{
+					LiveSettings: engine.LiveSettings{
+						PrivateKey: predictFunKey, APIKey: "predictfun-api-key",
+						APISecret: predictFunSecret, APIPassphrase: predictFunPassphrase,
+					},
+					SmartWallet: smartWallet,
+				},
+			},
+		},
+	}
+	if err := repository.SaveSystemSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	var payload string
+	if err := repository.db.QueryRowContext(ctx, "SELECT payload FROM system_settings WHERE id = 1").Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{polymarketKey, predictFunKey, polymarketSecret, predictFunSecret, predictFunPassphrase} {
+		if strings.Contains(payload, secret) {
+			t.Fatalf("stored venue payload leaks secret %q: %s", secret, payload)
+		}
+	}
+	if strings.Count(payload, "enc:v1:") < 6 {
+		t.Fatalf("venue secrets were not all encrypted: %s", payload)
+	}
+
+	loaded, err := repository.LoadSystemSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Live.PrivateKey != polymarketKey {
+		t.Fatalf("top-level private key = %q", loaded.Live.PrivateKey)
+	}
+	polymarket := loaded.Venues[market.VenuePolymarket]
+	if polymarket.Live.PrivateKey != polymarketKey || polymarket.Live.APISecret != polymarketSecret {
+		t.Fatalf("polymarket venue secrets = %+v", polymarket.Live)
+	}
+	predictFun := loaded.Venues[market.VenuePredictFun]
+	if predictFun.Live.PrivateKey != predictFunKey || predictFun.Live.APISecret != predictFunSecret ||
+		predictFun.Live.APIPassphrase != predictFunPassphrase {
+		t.Fatalf("predictfun venue secrets = %+v", predictFun.Live)
+	}
+	if predictFun.Live.SmartWallet != smartWallet {
+		t.Fatalf("predictfun smart wallet = %q", predictFun.Live.SmartWallet)
 	}
 }

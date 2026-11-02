@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Builder attribution. Every order this deployment signs carries BuilderCode so
@@ -29,6 +30,16 @@ type Config struct {
 	PolymarketAPIKey        string
 	PolymarketAPISecret     string
 	PolymarketAPIPassphrase string
+
+	// Predict.fun (BSC). Enabled is explicit so a half-filled block cannot
+	// switch live trading on by accident.
+	PredictFunEnabled     bool
+	PredictFunAPIKey      string
+	PredictFunPrivateKey  string
+	PredictFunSmartWallet string
+	PredictFunBaseURL     string
+	PredictFunTestnet     bool
+	PredictFunRPC         string
 }
 
 func FromEnv() Config {
@@ -48,7 +59,36 @@ func FromEnv() Config {
 		PolymarketAPIKey:        os.Getenv("POLYMARKET_API_KEY"),
 		PolymarketAPISecret:     os.Getenv("POLYMARKET_API_SECRET"),
 		PolymarketAPIPassphrase: os.Getenv("POLYMARKET_API_PASSPHRASE"),
+
+		PredictFunEnabled:     envBool("PREDICTFUN_ENABLED"),
+		PredictFunAPIKey:      os.Getenv("PREDICTFUN_API_KEY"),
+		PredictFunPrivateKey:  os.Getenv("PREDICTFUN_PRIVATE_KEY"),
+		PredictFunSmartWallet: envAny([]string{"PREDICTFUN_SMART_WALLET", "PREDICTFUN_FUNDER"}, ""),
+		PredictFunTestnet:     envBool("PREDICTFUN_TESTNET"),
+		PredictFunBaseURL:     os.Getenv("PREDICTFUN_BASE_URL"),
+		PredictFunRPC:         env("PREDICTFUN_RPC_URL", "https://bsc-dataseed.bnbchain.org"),
 	}
+}
+
+// PredictFunDefaultBaseURL is the production Predict.fun REST endpoint. The
+// testnet endpoint is a different host, not a path, so the two are never
+// derived from each other.
+const (
+	PredictFunDefaultBaseURL = "https://api.predict.fun"
+	PredictFunTestnetBaseURL = "https://api-testnet.predict.fun"
+)
+
+// ResolvePredictFunBaseURL picks the explicit override when set and otherwise
+// follows the testnet flag, so `PREDICTFUN_TESTNET=true` alone cannot end up
+// talking to production.
+func (c Config) ResolvePredictFunBaseURL() string {
+	if url := trimURL(c.PredictFunBaseURL); url != "" {
+		return url
+	}
+	if c.PredictFunTestnet {
+		return PredictFunTestnetBaseURL
+	}
+	return PredictFunDefaultBaseURL
 }
 
 func env(key, fallback string) string {
@@ -65,6 +105,21 @@ func envAny(keys []string, fallback string) string {
 		}
 	}
 	return fallback
+}
+
+// envBool treats "1", "true", "yes" and "on" (any case) as true. Anything
+// else, including an unset variable, is false: an opt-in flag must never be
+// switched on by a typo.
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+func trimURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
 }
 
 func envInt(key string, fallback int) int {

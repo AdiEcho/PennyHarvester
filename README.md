@@ -6,6 +6,8 @@
 
 后端采用 **Go / Gin** 编写，前端基于 **React / Vite / TypeScript** 与 shadcn 风格组件构建，使用 **SQLite** 在本地持久化账户、持仓、订单流水与净值快照，支持前后端一键打包、单端口运行。
 
+自 **v0.4** 起支持**多场所**：默认只启用 Polymarket，可通过环境变量开启 **Predict.fun**（BNB Chain）作为第二个场所。两个场所共用同一套策略、风控与工作台，但账本、币种、凭据与限额彼此隔离，详见[多场所架构](#多场所架构polymarket--predictfun)。
+
 > **风险提示：价格 0.99 也不代表稳赚不赔。**
 > 系统默认打开**实盘账户**，配置钱包凭据后买单会直接提交至 Polymarket CLOB 并动用真实资金；一旦尾盘事件爆冷反转，可能损失绝大部分本金。建议先用内置的**模拟账户**零成本验证策略思路，再以最小金额测试实盘链路。
 
@@ -21,6 +23,20 @@
   实时同步 Polymarket 公开行情，但使用虚拟资金在本地 SQLite 中记账，按可配置的滑点、手续费与风控规则模拟撮合，不会发出任何真实订单。支持创建多个模拟账户以对比不同参数方案；删除模拟账户时会一并清理其持仓、订单和净值记录。
 - **独立隔离与安全开关**
   不同账户的持仓、订单流水与权益曲线完全隔离。自动交易按账户独立控制；其中实盘自动交易默认关闭，开启时需经过二次确认，且要求实盘钱包与 API 凭据已就绪。
+
+---
+
+## 多场所架构（Polymarket / Predict.fun）
+
+系统内部把「场所（venue）」作为一等概念：一个场所由**能力声明**（币种、小数位、最小下单额、订单类型、是否支持取消/结算、是否测试网、是否只读）、**行情适配器**与**交易执行器**三部分组成，统一注册到 `backend/internal/venue` 的注册表中，引擎按场所遍历而非写死其中一个。
+
+- **默认只启用 Polymarket**。Predict.fun 必须显式开启（`PREDICTFUN_ENABLED=1`，或在「系统设置 → Predict.fun」中启用）：一旦开启，注册表里没有条目的场所既不会被扫描也不会被下单，因此升级本身不会让系统开始交易新场所。
+- **账户绑定场所，创建后不可更改**。每个账户属于一个场所，持仓、订单、净值与指标都带 `venue` + `currency`，接口与界面均支持按场所筛选（`?venue=polymarket|predictfun`）。**不同场所的金额永不求和**：USDC（6 位小数）与 USDT（18 位小数）各自独立展示，跨场所加总只会得到没有意义的数字。
+- **币种与精度分离**。Polymarket 结算币为 USDC（6 位小数），Predict.fun 为 USDT（18 位小数）；Predict.fun 的下单金额在内部以 `big.Int` 按最小单位（wei）计算，绝不经过 `float64`，并根据市场 `decimalPrecision` 向下量化价位。
+- **费用模型按场所分派**。Polymarket 沿用历史口径 `费率 × 名义额`；Predict.fun 按官方公式 `费率 × min(价格, 1 − 价格) × 份额`，因此低价盘口的真实成本远低于名义额比例。
+- **风控按场所独立**。除全局参数外，每个场所可单独设置开关、单笔金额、单账户最大持仓、场所总敞口与费率；留空即继承全局值。
+- **Predict.fun 当前支持**：只读行情与报价（无需任何凭据）、限价/市价买入、持仓与余额查询、按币种计价的手续费与收益测算、测试网（`PREDICTFUN_TESTNET=1`）。**暂不支持**：链上结算/赎回（`supports_settlement=false`，到期市场不会被自动结算，仓位保持未平仓并在「系统设置」运行时提示）、代理钱包签名（当前要求 EOA 私钥与 maker 一致）、自动授权（首次交易前需显式调用授权，见下文）。
+- **合约与签名**：Predict.fun 订单使用 EIP-712（域名为 `predict.fun CTF Exchange`，链 ID 56 / 测试网 97），合约地址由官方 SDK 的 `Constants.ts` 生成到 `backend/internal/predictfun/addresses.go`（**生成文件，请勿手改**）。首次实盘前需要为交易所合约授权 USDT 与 ERC1155（`EnsureApprovals`，当前通过代码/接口触发，不静默自动授权）。
 
 ---
 
@@ -324,6 +340,13 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POLYMARKET_API_KEY` | 空 | 可选，复用已有的 CLOB L2 API Key（**不是** polymarket.com 设置页的 Relayer API Key）；也可在网页中填写 |
 | `POLYMARKET_API_SECRET` | 空 | 可选，复用已有的 CLOB L2 API Secret；也可在网页中加密保存 |
 | `POLYMARKET_API_PASSPHRASE` | 空 | 可选，复用已有的 CLOB L2 API Passphrase；也可在网页中加密保存 |
+| `PREDICTFUN_ENABLED` | `false` | 是否注册 Predict.fun 场所；关闭时该场所完全不出现（不扫描、不下单、列表里没有条目） |
+| `PREDICTFUN_TESTNET` | `false` | 使用 BNB 测试网（链 ID 97）而非主网（56）；可在网页「系统设置」中覆盖 |
+| `PREDICTFUN_BASE_URL` | 空 | 覆盖 Predict.fun REST 地址；留空时按 `PREDICTFUN_TESTNET` 选择 `https://api.predict.fun` 或 `https://api-testnet.predict.fun` |
+| `PREDICTFUN_API_KEY` | 空 | Predict.fun API Key 的可选回退值；只读行情无需填写，实盘下单必需；也可在网页中加密保存 |
+| `PREDICTFUN_PRIVATE_KEY` | 空 | Predict.fun 实盘签名私钥的可选回退值；也可在网页中加密保存（**务必使用专用小额热钱包**） |
+| `PREDICTFUN_SMART_WALLET` | 空 | 代理/智能钱包地址（可选）；当前版本要求签名者与 maker 一致，留空即用签名地址 |
+| `PREDICTFUN_RPC_URL` | `https://bsc-dataseed.bnbchain.org` | BNB Chain 只读 RPC，用于查询 USDT/ERC1155 授权与余额 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 仅当代理模式为「跟随环境变量」（默认）时生效；由 Go 标准库在首次请求时读取并缓存 |
 | `NO_PROXY` | 空 | 仅当代理模式为「跟随环境变量」时生效，逗号分隔的主机/域名列表 |
 
@@ -335,13 +358,14 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 ## HTTP API 概览
 
-所有接口统一使用 `/api/v1` 前缀。除获取账户列表外，与账户相关的接口均支持通过 `?account_id=` 指定目标账户（省略时默认操作当前默认账户）。
+所有接口统一使用 `/api/v1` 前缀。除获取账户列表外，与账户相关的接口均支持通过 `?account_id=` 指定目标账户（省略时默认操作当前默认账户）。机会、持仓、订单、扫描与系统测试接口额外支持 `?venue=polymarket|predictfun` 按场所过滤（省略或 `all` 表示不过滤；未知值返回 `400`）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `GET` | `/venues` | 获取已注册场所的能力声明（`currency`、`quote_decimals`、`min_notional`、`order_types`、`supports_settlement`、`testnet`、`read_only`），前端据此决定币种符号、精度与是否显示结算相关文案 |
 | `GET` | `/health` | 服务健康检查、默认账户模式、实盘配置与就绪状态 |
 | `GET` | `/accounts` | 获取所有账户列表（含实盘就绪状态、`signer` 与 `maker` 地址） |
-| `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper"}` |
+| `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper","venue":"predictfun"}`（`venue` 省略时默认为 `polymarket`，创建后不可更改） |
 | `PATCH` | `/accounts/:id` | 修改账户名称、自动交易开关或设为默认账户 |
 | `DELETE` | `/accounts/:id` | 删除指定模拟账户（级联清除其持仓、订单与净值记录） |
 | `GET` | `/dashboard?account_id=1` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照 |
@@ -350,7 +374,8 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `GET` | `/positions?account_id=1&status=open` | 查询持仓列表，`status` 支持 `all / open / won / lost / split / sold`（`sold` 是止损筛选别名，底层为 `status=lost` + `exit_kind=stop`） |
 | `GET` | `/orders?account_id=1&status=all&limit=100&offset=0` | 查询订单记录，`status` 支持 `all / filled / settled / rejected / pending / unknown / unresolved`；`type` 为 `buy / sell / settle`，止损单的来源 `kind` 为 `stop` |
 | `GET / PUT` | `/settings` | 读取或更新全局策略筛选条件与风控参数 |
-| `GET / PUT` | `/system` | 读取或更新系统设置（Gamma / CLOB 地址、实盘凭据、网络出口代理）；私钥、L2 Secret、Passphrase 与代理密码在响应中自动掩码。请求体支持按分区部分更新：`proxy`、`data_source`、`live` 可单独提交；提交 `live` 时请带上该分区的完整字段，掩码值会自动还原为已保存的密钥 |
+| `GET / PUT` | `/system` | 读取或更新系统设置（各场所数据源地址、实盘凭据、网络出口代理）；私钥、L2 Secret、Passphrase 与代理密码在响应中自动掩码，并额外返回 `*_configured` 布尔值供前端判断「是否已配置」。请求体支持按分区部分更新：`proxy`、`data_source`、`live` 与 `venues.<venue>` 可单独提交；提交时请带上该分区的完整字段，掩码值会自动还原为已保存的密钥。响应中的 `runtime.venues` 给出逐场所的 `configured / ready / signer / maker / error` |
+| `POST` | `/system/live/test?venue=predictfun` | 实盘凭据只读验证。Polymarket：请求体 `live` + `clob_base_url`；Predict.fun：请求体 `venues.predictfun.live`（`api_key` / `private_key` / `smart_wallet` / `testnet`）。测试成功后会把凭据还原为已保存值，不会留下未保存的配置 |
 | `POST` | `/system/proxy/test` | 使用请求体中的代理配置探测 `https://clob.polymarket.com/time`，不保存设置 |
 | `POST` | `/system/live/test` | 用请求体中的实盘凭据（`live` 与 `clob_base_url`，掩码值自动还原）做只读验证：派生 L2 凭据并读取余额/授权，返回 Signer、Maker、掩码 API Key 与耗时；不保存设置、不下单 |
 | `POST` | `/system/relayer/test` | 验证 Relayer API Key：`relayer_api_key` + `relayer_address`（需与私钥地址一致），调用 `GET /relayer/api/keys` 确认密钥有效；不保存、不提交交易 |

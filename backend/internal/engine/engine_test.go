@@ -12,9 +12,12 @@ import (
 	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
 	"pennyharvester/backend/internal/store"
+	"pennyharvester/backend/internal/venue"
 )
 
 type fakeProvider struct {
+	// venue lets a test model a second exchange. Empty means Polymarket.
+	venue     market.Venue
 	markets   map[string]market.Market
 	localized map[string]market.Market
 	eventTags map[string][]market.Tag
@@ -22,6 +25,15 @@ type fakeProvider struct {
 }
 
 func (f *fakeProvider) Name() string { return "test" }
+
+// Venue is required by venue.MarketData; the fakes model Polymarket unless a
+// test builds a venue-specific provider.
+func (f *fakeProvider) Venue() market.Venue {
+	if f.venue == "" {
+		return market.VenuePolymarket
+	}
+	return f.venue
+}
 func (f *fakeProvider) ListOpen(context.Context, int) ([]market.Market, error) {
 	if f.err != nil {
 		return nil, f.err
@@ -151,16 +163,44 @@ func nearClose(item market.Market, remaining time.Duration) market.Market {
 
 func newTestEngine(t *testing.T, provider market.Provider, live engine.LiveExecutor) (*engine.Engine, *store.SQLite) {
 	t.Helper()
+	data, ok := provider.(venue.MarketData)
+	if !ok {
+		t.Fatalf("test provider %T does not implement venue.MarketData", provider)
+	}
+	registry := venue.NewRegistry()
+	if err := registry.Register(testCapabilities(data.Venue()), data, live); err != nil {
+		t.Fatal(err)
+	}
+	return newTestEngineWithRegistry(t, registry)
+}
+
+// newTestEngineWithRegistry builds an engine over an arbitrary venue set. Tests
+// that model two venues use it directly.
+func newTestEngineWithRegistry(t *testing.T, registry *venue.Registry) (*engine.Engine, *store.SQLite) {
+	t.Helper()
 	repository, err := store.Open(context.Background(), ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { repository.Close() })
-	instance, err := engine.New(context.Background(), repository, provider, live, nil)
+	instance, err := engine.New(context.Background(), repository, registry, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return instance, repository
+}
+
+// testCapabilities is the Polymarket-shaped fact sheet the engine needs for
+// settlement and currency decisions.
+func testCapabilities(v market.Venue) venue.Capabilities {
+	currency := market.CurrencyUSDC
+	if v == market.VenuePredictFun {
+		currency = market.CurrencyUSDT
+	}
+	return venue.Capabilities{
+		Venue: v, Label: v.Label(), Currency: currency, QuoteDecimals: 6,
+		OrderTypes: []string{"FAK"}, SupportsSettlement: v == market.VenuePolymarket,
+	}
 }
 
 func accountByMode(t *testing.T, instance *engine.Engine, mode engine.AccountMode) engine.Account {
@@ -219,7 +259,7 @@ func TestQuoteOpportunityUsesRealBookAndFee(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	quote, err := instance.QuoteOpportunity(context.Background(), "eligible-yes", 0)
+	quote, err := instance.QuoteOpportunity(context.Background(), "eligible-yes", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +285,7 @@ func TestQuoteOpportunityUsesRealBookAndFee(t *testing.T) {
 	// live order would be rejected even though the reference price passed.
 	live.quote.FillPrice = 0.995
 	live.quote.LimitPrice = 0.995
-	quote, err = instance.QuoteOpportunity(context.Background(), "eligible-yes", 50)
+	quote, err = instance.QuoteOpportunity(context.Background(), "eligible-yes", 50, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +293,7 @@ func TestQuoteOpportunityUsesRealBookAndFee(t *testing.T) {
 		t.Fatalf("a fill above max_price must be flagged: %+v", quote)
 	}
 
-	if _, err := instance.QuoteOpportunity(context.Background(), "missing-token", 0); !errors.Is(err, engine.ErrInvalidOrder) {
+	if _, err := instance.QuoteOpportunity(context.Background(), "missing-token", 0, ""); !errors.Is(err, engine.ErrInvalidOrder) {
 		t.Fatalf("an unknown token must be rejected, got %v", err)
 	}
 }
@@ -300,7 +340,7 @@ func TestScanFiltersAndSettlesPaperPosition(t *testing.T) {
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err := instance.Positions(context.Background(), paper.ID, "won")
+	positions, err := instance.Positions(context.Background(), paper.ID, "won", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +572,7 @@ func TestPaperStopLossClosesPositionAtRatio(t *testing.T) {
 	if err := instance.Scan(ctx); err != nil {
 		t.Fatal(err)
 	}
-	open, err := instance.Positions(ctx, paper.ID, "open")
+	open, err := instance.Positions(ctx, paper.ID, "open", "")
 	if err != nil || open.Total != 1 {
 		t.Fatalf("stop disabled must keep the position open: %+v err=%v", open, err)
 	}
@@ -546,7 +586,7 @@ func TestPaperStopLossClosesPositionAtRatio(t *testing.T) {
 	if err := instance.Scan(ctx); err != nil {
 		t.Fatal(err)
 	}
-	sold, err := instance.Positions(ctx, paper.ID, "sold")
+	sold, err := instance.Positions(ctx, paper.ID, "sold", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +610,7 @@ func TestPaperStopLossClosesPositionAtRatio(t *testing.T) {
 		t.Fatalf("position fee must include the sell fee: got %v want %v", closed.Fee, position.Fee+wantFee)
 	}
 
-	orders, err := instance.Orders(ctx, paper.ID, "all", 10, 0)
+	orders, err := instance.Orders(ctx, paper.ID, "all", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,7 +638,7 @@ func TestLiveStopLossSellsThroughExecutor(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
 	live := &fakeLive{
 		balance: 10000, allowance: 10000,
-		fill:     engine.LiveFill{Shares: 100, Cost: 98.3, Price: 0.983, Fee: 0.1, Status: "matched"},
+		fill:     engine.LiveFill{Shares: 100, Cost: 98.2, Price: 0.982, Fee: 0.1, Status: "matched"},
 		sellFill: engine.LiveFill{Shares: 100, Cost: 74.9, Price: 0.75, Fee: 0.1, Status: "matched"},
 	}
 	instance, _ := newTestEngine(t, provider, live)
@@ -623,14 +663,14 @@ func TestLiveStopLossSellsThroughExecutor(t *testing.T) {
 	if err := instance.Scan(ctx); err != nil {
 		t.Fatal(err)
 	}
-	sold, err := instance.Positions(ctx, account.ID, "sold")
+	sold, err := instance.Positions(ctx, account.ID, "sold", "")
 	if err != nil || sold.Total != 1 {
 		t.Fatalf("live stop-loss did not close the position: %+v err=%v", sold, err)
 	}
 	if sold.Items[0].ID != position.ID || sold.Items[0].RealizedPNL >= 0 {
 		t.Fatalf("unexpected live stopped position: %+v", sold.Items[0])
 	}
-	orders, err := instance.Orders(ctx, account.ID, "all", 10, 0)
+	orders, err := instance.Orders(ctx, account.ID, "all", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -643,6 +683,15 @@ func TestLiveStopLossSellsThroughExecutor(t *testing.T) {
 	if liveSell == nil || liveSell.Status != "filled" || liveSell.ExternalID != "fake-sell" {
 		t.Fatalf("live stop-loss order was not finalized: %+v", orders.Items)
 	}
+	// The executor reports the gross notional (98.2 buy, 74.9 sell) and the
+	// taker fee separately; the engine must fold it in exactly once, otherwise
+	// the two booking paths (direct fill vs reconciliation) disagree by a fee.
+	if math.Abs(position.Cost-98.3) > 1e-9 {
+		t.Fatalf("live entry basis must include the fee once: %+v", position)
+	}
+	if math.Abs(liveSell.Amount-74.8) > 1e-9 {
+		t.Fatalf("live exit proceeds must net the fee once: %+v", liveSell)
+	}
 }
 
 func TestUnknownLiveStopLossIsReconciled(t *testing.T) {
@@ -650,13 +699,13 @@ func TestUnknownLiveStopLossIsReconciled(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
 	live := &fakeLive{
 		balance: 10000, allowance: 10000,
-		fill:     engine.LiveFill{Shares: 100, Cost: 98.3, Price: 0.983, Fee: 0.1, Status: "matched"},
+		fill:     engine.LiveFill{Shares: 100, Cost: 98.2, Price: 0.982, Fee: 0.1, Status: "matched"},
 		sellFill: engine.LiveFill{OrderID: "pending-sell", Status: "unknown"},
 		sellErr:  errors.New("timeout"),
 	}
 	instance, _ := newTestEngine(t, provider, live)
 	account := accountByMode(t, instance, engine.AccountModeLive)
-	if _, err := instance.UpdateAccount(ctx, account.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(ctx, account.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := instance.PlaceOrder(ctx, account.ID, engine.OrderRequest{
@@ -677,7 +726,7 @@ func TestUnknownLiveStopLossIsReconciled(t *testing.T) {
 	if err := instance.Scan(ctx); err != nil {
 		t.Fatal(err)
 	}
-	unresolved, err := instance.Orders(ctx, account.ID, "unresolved", 10, 0)
+	unresolved, err := instance.Orders(ctx, account.ID, "unresolved", 10, 0, "")
 	if err != nil || unresolved.Total != 1 || unresolved.Items[0].Action != "stop" {
 		t.Fatalf("unknown sell was not persisted: %+v err=%v", unresolved, err)
 	}
@@ -689,11 +738,11 @@ func TestUnknownLiveStopLossIsReconciled(t *testing.T) {
 	if err := instance.ScanOnly(ctx); err != nil {
 		t.Fatal(err)
 	}
-	sold, err := instance.Positions(ctx, account.ID, "sold")
+	sold, err := instance.Positions(ctx, account.ID, "sold", "")
 	if err != nil || sold.Total != 1 {
 		t.Fatalf("reconciliation did not close the position: %+v err=%v", sold, err)
 	}
-	orders, err := instance.Orders(ctx, account.ID, "all", 10, 0)
+	orders, err := instance.Orders(ctx, account.ID, "all", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,6 +754,63 @@ func TestUnknownLiveStopLossIsReconciled(t *testing.T) {
 	}
 	if sell == nil || sell.Status != "filled" || math.Abs(sell.Amount-(74.9-0.1)) > 1e-9 {
 		t.Fatalf("sell reconciliation did not net the fee: %+v", orders.Items)
+	}
+}
+
+func TestScopedScanKeepsOtherVenueRows(t *testing.T) {
+	ctx := context.Background()
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{
+		"pm": binary("pm", 0.97, 20000, 3),
+	}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+		venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": binary("pf", 0.96, 20000, 2)},
+	}, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	// Widen the default 0.95–0.99 window so both fixtures are candidates.
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	full := instance.Opportunities()
+	if full.Total != 2 {
+		t.Fatalf("a full scan must hold both venues: %+v", full.Items)
+	}
+
+	// A venue-scoped scan (the radar chip, a per-venue scan button) must not
+	// empty the other venue's rows: that is exactly the table the operator is
+	// looking at when they click the chip.
+	if _, err := instance.ManualScan(ctx, 0, false, market.VenuePredictFun); err != nil {
+		t.Fatal(err)
+	}
+	scoped := instance.Opportunities()
+	if scoped.Total != 2 {
+		t.Fatalf("a scoped scan dropped rows from other venues: %+v", scoped.Items)
+	}
+	seen := map[market.Venue]bool{}
+	for _, item := range scoped.Items {
+		seen[item.EffectiveVenue()] = true
+	}
+	if !seen[market.VenuePolymarket] || !seen[market.VenuePredictFun] {
+		t.Fatalf("scoped radar must still report both venues: %+v", scoped.Items)
+	}
+	if len(scoped.Venues) != 2 {
+		t.Fatalf("radar must report every venue it holds, got %v", scoped.Venues)
+	}
+
+	// A full scan replaces the radar outright.
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := instance.Opportunities(); got.Total != 2 {
+		t.Fatalf("a full scan must replace the radar: %+v", got.Items)
 	}
 }
 
@@ -732,7 +838,7 @@ func TestPaperBuyBooksFeeAndReportsIt(t *testing.T) {
 	if math.Abs(position.EntryPrice-0.98196) > 1e-9 {
 		t.Fatalf("entry price must stay the execution price: %+v", position)
 	}
-	orders, err := instance.Orders(context.Background(), paper.ID, "all", 10, 0)
+	orders, err := instance.Orders(context.Background(), paper.ID, "all", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,7 +886,7 @@ func TestPaperOrderRiskAndSlippageRejection(t *testing.T) {
 	if !errors.Is(err, engine.ErrInvalidOrder) {
 		t.Fatalf("expected slippage rejection, got %v", err)
 	}
-	orders, err := instance.Orders(context.Background(), paper.ID, "all", 10, 0)
+	orders, err := instance.Orders(context.Background(), paper.ID, "all", 10, 0, "")
 	if err != nil || orders.Total != 1 || orders.Items[0].Status != "rejected" {
 		t.Fatalf("rejection was not logged: %+v, %v", orders, err)
 	}
@@ -793,10 +899,13 @@ func TestAutoPaperTradeHonorsExposureAndDoesNotDuplicate(t *testing.T) {
 	}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	settings := instance.Settings()
+	// The caps are ordered (single market must not exceed the total), so both
+	// have to move for the total cap to be the binding one.
+	settings.MaxPosition = 140
 	settings.MaxExposure = 150
 	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
 		t.Fatal(err)
@@ -806,7 +915,7 @@ func TestAutoPaperTradeHonorsExposureAndDoesNotDuplicate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	positions, err := instance.Positions(context.Background(), paper.ID, "open")
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,7 +931,7 @@ func TestAutoTradeWithInsufficientCashSkipsWithoutSpam(t *testing.T) {
 	}}
 	instance, repository := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := repository.UpdateAccountBaseline(context.Background(), paper.ID, 50); err != nil {
@@ -838,11 +947,11 @@ func TestAutoTradeWithInsufficientCashSkipsWithoutSpam(t *testing.T) {
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatalf("insufficient cash must not fail the scan: %v", err)
 	}
-	positions, _ := instance.Positions(context.Background(), paper.ID, "open")
+	positions, _ := instance.Positions(context.Background(), paper.ID, "open", "")
 	if positions.Total != 0 {
 		t.Fatalf("expected no positions without cash, got %+v", positions.Items)
 	}
-	orders, _ := instance.Orders(context.Background(), paper.ID, "all", 10, 0)
+	orders, _ := instance.Orders(context.Background(), paper.ID, "all", 10, 0, "")
 	if orders.Total != 0 {
 		t.Fatalf("automatic cash rejection should be skipped before logging: %+v", orders.Items)
 	}
@@ -854,13 +963,13 @@ func TestAutoTradeWaitsForEntryWindow(t *testing.T) {
 	}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err := instance.Positions(context.Background(), paper.ID, "open")
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,7 +983,7 @@ func TestAutoTradeWaitsForEntryWindow(t *testing.T) {
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err = instance.Positions(context.Background(), paper.ID, "open")
+	positions, err = instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -889,13 +998,13 @@ func TestAutoTradeUsesShorterSportsEntryWindow(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"sports-future": item}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err := instance.Positions(context.Background(), paper.ID, "open")
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +1017,7 @@ func TestAutoTradeUsesShorterSportsEntryWindow(t *testing.T) {
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err = instance.Positions(context.Background(), paper.ID, "open")
+	positions, err = instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -925,7 +1034,7 @@ func TestAutoTradeMarksMarketAsOrdered(t *testing.T) {
 	}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	settings := instance.Settings()
@@ -939,14 +1048,14 @@ func TestAutoTradeMarksMarketAsOrdered(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	positions, err := instance.Positions(context.Background(), paper.ID, "all")
+	positions, err := instance.Positions(context.Background(), paper.ID, "all", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if positions.Total != 1 {
 		t.Fatalf("a market must only be auto-ordered once: %+v", positions.Items)
 	}
-	orders, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0)
+	orders, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -961,7 +1070,7 @@ func TestAutoTradeDoesNotReenterSettledMarket(t *testing.T) {
 	}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := instance.Scan(context.Background()); err != nil {
@@ -992,21 +1101,21 @@ func TestAutoTradeDoesNotReenterSettledMarket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	open, err := instance.Positions(context.Background(), paper.ID, "open")
+	open, err := instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if open.Total != 0 {
 		t.Fatalf("a settled market must not be re-entered: %+v", open.Items)
 	}
-	won, err := instance.Positions(context.Background(), paper.ID, "won")
+	won, err := instance.Positions(context.Background(), paper.ID, "won", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if won.Total != 1 {
 		t.Fatalf("expected the original settled position to remain: %+v", won.Items)
 	}
-	filled, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0)
+	filled, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1027,7 +1136,7 @@ func TestUpstreamFailureKeepsPositionsOpen(t *testing.T) {
 	if err := instance.Scan(context.Background()); !errors.Is(err, engine.ErrUpstream) {
 		t.Fatalf("expected upstream error, got %v", err)
 	}
-	positions, _ := instance.Positions(context.Background(), paper.ID, "open")
+	positions, _ := instance.Positions(context.Background(), paper.ID, "open", "")
 	if positions.Total != 1 {
 		t.Fatal("an upstream failure must not close positions")
 	}
@@ -1042,10 +1151,10 @@ func TestLiveOrderRefusedWithoutCredentials(t *testing.T) {
 	_, err := instance.PlaceOrder(context.Background(), liveAccount.ID, engine.OrderRequest{
 		MarketID: "one", Outcome: "Yes", TokenID: "one-yes", Amount: 100,
 	})
-	if !errors.Is(err, engine.ErrLiveUnavailable) {
-		t.Fatalf("expected live unavailable, got %v", err)
+	if !errors.Is(err, engine.ErrVenueReadOnly) && !errors.Is(err, engine.ErrVenueNotConfigured) {
+		t.Fatalf("expected the venue to refuse live orders, got %v", err)
 	}
-	orders, err := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0)
+	orders, err := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0, "")
 	if err != nil || orders.Total != 1 || orders.Items[0].Status != "rejected" {
 		t.Fatalf("live rejection was not logged: %+v, %v", orders, err)
 	}
@@ -1072,7 +1181,7 @@ func TestLiveOrderRecordsExchangeFill(t *testing.T) {
 	if position.AccountID != liveAccount.ID || math.Abs(position.Shares-101.5) > 1e-9 {
 		t.Fatalf("unexpected live position: %+v", position)
 	}
-	orders, err := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0)
+	orders, err := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0, "")
 	if err != nil || orders.Total != 1 || orders.Items[0].ExternalID != "clob-order-1" {
 		t.Fatalf("live fill was not logged: %+v, %v", orders, err)
 	}
@@ -1105,7 +1214,7 @@ func TestLiveOrderRefusesProtocolV2Market(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Protocol V2") {
 		t.Fatalf("a Protocol V2 market must be refused before signing: %v", err)
 	}
-	orders, orderErr := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0)
+	orders, orderErr := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0, "")
 	if orderErr != nil || orders.Total != 1 || orders.Items[0].Status != "rejected" {
 		t.Fatalf("the refusal must be recorded as a rejected order: %+v, %v", orders, orderErr)
 	}
@@ -1178,7 +1287,7 @@ func TestSplitSettlementUsesSplitStatusAndManualKind(t *testing.T) {
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err := instance.Positions(context.Background(), paper.ID, "all")
+	positions, err := instance.Positions(context.Background(), paper.ID, "all", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1192,7 +1301,7 @@ func TestSplitSettlementUsesSplitStatusAndManualKind(t *testing.T) {
 	if dashboard.Metrics.SplitPositions != 1 || dashboard.Metrics.SettledPositions != 1 || dashboard.Metrics.WinRate != 0 {
 		t.Fatalf("unexpected split metrics: %+v", dashboard.Metrics)
 	}
-	orders, err := instance.Orders(context.Background(), paper.ID, "settled", 10, 0)
+	orders, err := instance.Orders(context.Background(), paper.ID, "settled", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1205,13 +1314,13 @@ func TestScanOnlyDoesNotAutoTrade(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"one": nearClose(binary("one", 0.98, 20000, 2), 10*time.Minute)}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := instance.ScanOnly(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err := instance.Positions(context.Background(), paper.ID, "open")
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1221,7 +1330,7 @@ func TestScanOnlyDoesNotAutoTrade(t *testing.T) {
 	if err := instance.Scan(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err = instance.Positions(context.Background(), paper.ID, "open")
+	positions, err = instance.Positions(context.Background(), paper.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1237,7 +1346,7 @@ func TestManualScanAutoTradesSelectedAccountAndSkipsHeld(t *testing.T) {
 	}}
 	instance, _ := newTestEngine(t, provider, nil)
 	focused := accountByMode(t, instance, engine.AccountModePaper)
-	other, err := instance.CreateAccount(context.Background(), "other paper", engine.AccountModePaper)
+	other, err := instance.CreateAccount(context.Background(), "other paper", engine.AccountModePaper, market.VenuePolymarket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1249,21 +1358,21 @@ func TestManualScanAutoTradesSelectedAccountAndSkipsHeld(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	summary, err := instance.ManualScan(context.Background(), focused.ID, true)
+	summary, err := instance.ManualScan(context.Background(), focused.ID, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if summary.AccountID != focused.ID || !summary.Execute || summary.OrdersPlaced != 1 || summary.SkippedHeld != 1 {
 		t.Fatalf("unexpected manual scan summary: %+v", summary)
 	}
-	positions, err := instance.Positions(context.Background(), focused.ID, "all")
+	positions, err := instance.Positions(context.Background(), focused.ID, "all", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if positions.Total != 2 {
 		t.Fatalf("manual scan should add exactly one position: %+v", positions.Items)
 	}
-	otherPositions, err := instance.Positions(context.Background(), other.ID, "open")
+	otherPositions, err := instance.Positions(context.Background(), other.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1271,7 +1380,7 @@ func TestManualScanAutoTradesSelectedAccountAndSkipsHeld(t *testing.T) {
 		t.Fatalf("manual scan leaked into another account: %+v", otherPositions.Items)
 	}
 	// Re-running must skip both markets instead of stacking another entry.
-	summary, err = instance.ManualScan(context.Background(), focused.ID, true)
+	summary, err = instance.ManualScan(context.Background(), focused.ID, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1291,21 +1400,21 @@ func TestOrdersTotalAndStatusFilter(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	orders, err := instance.Orders(context.Background(), paper.ID, "all", 2, 0)
+	orders, err := instance.Orders(context.Background(), paper.ID, "all", 2, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if orders.Total != 3 || len(orders.Items) != 2 {
 		t.Fatalf("expected total 3 and two rows, got total=%d rows=%d", orders.Total, len(orders.Items))
 	}
-	filled, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0)
+	filled, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if filled.Total != 3 {
 		t.Fatalf("expected 3 filled orders, got %d", filled.Total)
 	}
-	rejected, err := instance.Orders(context.Background(), paper.ID, "rejected", 10, 0)
+	rejected, err := instance.Orders(context.Background(), paper.ID, "rejected", 10, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1328,7 +1437,7 @@ func TestLiveAllowanceIsCheckedBeforeSubmit(t *testing.T) {
 	if !errors.Is(err, engine.ErrInvalidOrder) {
 		t.Fatalf("expected allowance rejection, got %v", err)
 	}
-	orders, err := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0)
+	orders, err := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0, "")
 	if err != nil || orders.Total != 1 || orders.Items[0].Status != "rejected" {
 		t.Fatalf("allowance rejection was not logged: %+v, %v", orders, err)
 	}
@@ -1352,7 +1461,7 @@ func TestUnknownLiveOrderIsReconciled(t *testing.T) {
 	if !errors.Is(err, engine.ErrUpstream) {
 		t.Fatalf("expected upstream error for an unknown live order, got %v", err)
 	}
-	orders, err := instance.Orders(context.Background(), liveAccount.ID, "unresolved", 10, 0)
+	orders, err := instance.Orders(context.Background(), liveAccount.ID, "unresolved", 10, 0, "")
 	if err != nil || orders.Total != 1 || orders.Items[0].Status != "unknown" {
 		t.Fatalf("unknown order was not persisted: %+v, %v", orders, err)
 	}
@@ -1362,14 +1471,14 @@ func TestUnknownLiveOrderIsReconciled(t *testing.T) {
 	if err := instance.ScanOnly(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	positions, err := instance.Positions(context.Background(), liveAccount.ID, "open")
+	positions, err := instance.Positions(context.Background(), liveAccount.ID, "open", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if positions.Total != 1 || math.Abs(positions.Items[0].Shares-100) > 1e-9 {
 		t.Fatalf("reconciliation did not create the position: %+v", positions.Items)
 	}
-	orders, err = instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0)
+	orders, err = instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0, "")
 	if err != nil || orders.Total != 1 || orders.Items[0].Status != "filled" || orders.Items[0].ExternalID != "pending-1" {
 		t.Fatalf("reconciliation did not finalize the order: %+v, %v", orders, err)
 	}
@@ -1428,6 +1537,7 @@ func (p *runtimeProvider) SetBaseURL(value string) error {
 
 func (p *runtimeProvider) BaseURL() string        { return p.baseURL }
 func (p *runtimeProvider) DefaultBaseURL() string { return p.defaultURL }
+func (p *runtimeProvider) Venue() market.Venue    { return market.VenuePolymarket }
 
 type runtimeLive struct {
 	*fakeLive
@@ -1579,9 +1689,8 @@ func TestDiscoverWalletUsesStoredSigner(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	discovery, err := instance.DiscoverWallet(ctx, instance.SystemSettings().Live.Redacted(), engine.WalletEndpoints{
-		CLOB: "https://clob.example.com",
-	})
+	discovery, err := instance.DiscoverWallet(ctx, market.VenuePolymarket, instance.SystemSettings().Live.Redacted(), engine.WalletEndpoints{
+		CLOB: "https://clob.example.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1614,7 +1723,7 @@ func TestProbeLiveRestoresStoredSecrets(t *testing.T) {
 	// The browser only ever sees masked secrets; echoing them back must not
 	// wipe the stored values before the probe runs.
 	masked := stored.Live.Redacted()
-	probe, err := instance.ProbeLive(ctx, masked, "https://clob.example.com")
+	probe, err := instance.ProbeLive(ctx, market.VenuePolymarket, masked, "https://clob.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1632,7 +1741,7 @@ func TestProbeLiveRestoresStoredSecrets(t *testing.T) {
 func TestProbeLiveRejectsPartialCredentials(t *testing.T) {
 	live := &runtimeLive{fakeLive: &fakeLive{}}
 	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, live)
-	_, err := instance.ProbeLive(context.Background(), engine.LiveSettings{APIKey: "only-key"}, "")
+	_, err := instance.ProbeLive(context.Background(), market.VenuePolymarket, engine.LiveSettings{APIKey: "only-key"}, "")
 	if err == nil || !errors.Is(err, engine.ErrInvalidSettings) {
 		t.Fatalf("partial credentials must be rejected as invalid settings: %v", err)
 	}
@@ -1649,7 +1758,7 @@ func TestProbeRelayerUsesStoredSignerSettings(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	probe, err := instance.ProbeRelayer(ctx, instance.SystemSettings().Live.Redacted(), "https://clob.example.com", "relayer-key", "0x0000000000000000000000000000000000000001")
+	probe, err := instance.ProbeRelayer(ctx, market.VenuePolymarket, instance.SystemSettings().Live.Redacted(), "https://clob.example.com", "relayer-key", "0x0000000000000000000000000000000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1658,5 +1767,400 @@ func TestProbeRelayerUsesStoredSignerSettings(t *testing.T) {
 	}
 	if live.settings.PrivateKey != key {
 		t.Fatalf("stored private key was not restored: %+v", live.settings)
+	}
+}
+
+// addVenue registers one fake venue with the engine's test capabilities.
+func addVenue(t *testing.T, registry *venue.Registry, v market.Venue, data venue.MarketData, live engine.LiveExecutor) {
+	t.Helper()
+	if err := registry.Register(testCapabilities(v), data, live); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// enableVenue turns a venue on and applies the given overrides. The map is
+// rebuilt so a test never mutates the engine's stored settings in place.
+func enableVenue(t *testing.T, instance *engine.Engine, v market.Venue, override engine.VenueSettings) {
+	t.Helper()
+	settings := instance.Settings()
+	venues := make(map[market.Venue]engine.VenueSettings, len(settings.Venues)+1)
+	for key, entry := range settings.Venues {
+		venues[key] = entry
+	}
+	override.Enabled = true
+	venues[v] = override
+	settings.Venues = venues
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPaperFeeIsVenueAware(t *testing.T) {
+	ctx := context.Background()
+	t.Run("polymarket keeps the historical notional rate", func(t *testing.T) {
+		provider := &fakeProvider{markets: map[string]market.Market{"pm": binary("pm", 0.98, 20000, 2)}}
+		instance, _ := newTestEngine(t, provider, nil)
+		paper := accountByMode(t, instance, engine.AccountModePaper)
+		settings := instance.Settings()
+		position, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+			MarketID: "pm", Outcome: "Yes", TokenID: "pm-yes", Amount: 100,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantFee := 100 * settings.FeeBPS / 10000
+		if math.Abs(position.Fee-wantFee) > 1e-9 {
+			t.Fatalf("polymarket paper fee changed: got %v want %v", position.Fee, wantFee)
+		}
+		if math.Abs(position.Cost-(100+wantFee)) > 1e-9 {
+			t.Fatalf("polymarket paper cost changed: %+v", position)
+		}
+	})
+
+	t.Run("predictfun charges rate times min(p, 1-p)", func(t *testing.T) {
+		pfMarket := binary("pf", 0.40, 20000, 2)
+		pfMarket.FeeRateBPS = 200
+		registry := venue.NewRegistry()
+		addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{}}, nil)
+		addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+			venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": pfMarket},
+		}, nil)
+		instance, _ := newTestEngineWithRegistry(t, registry)
+		settings := instance.Settings()
+		settings.MinPrice = 0.10
+		settings.MaxPrice = 0.99
+		if err := instance.UpdateSettings(ctx, settings); err != nil {
+			t.Fatal(err)
+		}
+		enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+		pfPaper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+		if err != nil {
+			t.Fatal(err)
+		}
+		position, err := instance.PlaceOrder(ctx, pfPaper.ID, engine.OrderRequest{
+			MarketID: "pf", Outcome: "Yes", TokenID: "pf-yes", Amount: 100,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantFee := 0.02 * math.Min(position.EntryPrice, 1-position.EntryPrice) * position.Shares
+		if math.Abs(position.Fee-wantFee) > 1e-9 {
+			t.Fatalf("predictfun paper fee = %v, want rate*min(p,1-p)*shares = %v", position.Fee, wantFee)
+		}
+		if position.Venue != market.VenuePredictFun || position.Currency != market.CurrencyUSDT {
+			t.Fatalf("predictfun position must carry its own venue/currency: %+v", position)
+		}
+		orders, err := instance.Orders(ctx, pfPaper.ID, "all", 10, 0, "")
+		if err != nil || orders.Total != 1 {
+			t.Fatalf("unexpected orders: %+v err=%v", orders, err)
+		}
+		if orders.Items[0].Venue != market.VenuePredictFun || orders.Items[0].Currency != market.CurrencyUSDT {
+			t.Fatalf("predictfun order must carry its own venue/currency: %+v", orders.Items[0])
+		}
+	})
+}
+
+func TestExposureCapsAreVenueScoped(t *testing.T) {
+	ctx := context.Background()
+	pfMarket := binary("pf-a", 0.40, 20000, 2)
+	pfMarket.FeeRateBPS = 200
+	pfMarket2 := binary("pf-b", 0.40, 20000, 2)
+	pfMarket2.FeeRateBPS = 200
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{
+		"pm": binary("pm", 0.98, 20000, 2),
+	}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+		venue:   market.VenuePredictFun,
+		markets: map[string]market.Market{"pf-a": pfMarket, "pf-b": pfMarket2},
+	}, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	// Predict.fun is capped at 120 total while Polymarket keeps the generous
+	// global 1000. A Predict.fun order must not consume the Polymarket bucket.
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{
+		OrderSize: 100, MaxPosition: 110, MaxExposure: 120,
+	})
+	pfPaper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(ctx, pfPaper.ID, engine.OrderRequest{
+		MarketID: "pf-a", Outcome: "Yes", TokenID: "pf-a-yes", Amount: 100,
+	}); err != nil {
+		t.Fatalf("first predictfun order must fit the per-venue cap: %v", err)
+	}
+	if _, err := instance.PlaceOrder(ctx, pfPaper.ID, engine.OrderRequest{
+		MarketID: "pf-b", Outcome: "Yes", TokenID: "pf-b-yes", Amount: 100,
+	}); !errors.Is(err, engine.ErrInvalidOrder) {
+		t.Fatalf("second predictfun order should breach the venue cap, got %v", err)
+	}
+	pmPaper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.PlaceOrder(ctx, pmPaper.ID, engine.OrderRequest{
+		MarketID: "pm", Outcome: "Yes", TokenID: "pm-yes", Amount: 100,
+	}); err != nil {
+		t.Fatalf("polymarket must keep its own exposure bucket: %v", err)
+	}
+}
+
+func TestScanErrorIsolationKeepsOtherVenueOpportunities(t *testing.T) {
+	ctx := context.Background()
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{
+		"pm": binary("pm", 0.98, 20000, 2),
+	}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+		venue: market.VenuePredictFun, err: errors.New("predictfun is down"),
+	}, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatalf("one degraded venue must not fail the whole scan: %v", err)
+	}
+	opportunities := instance.Opportunities()
+	if opportunities.Total != 1 || opportunities.Items[0].Venue != market.VenuePolymarket {
+		t.Fatalf("polymarket opportunities must survive: %+v", opportunities.Items)
+	}
+	if len(opportunities.Venues) != 1 || opportunities.Venues[0] != market.VenuePolymarket {
+		t.Fatalf("only the successful venue should be reported as contributing: %v", opportunities.Venues)
+	}
+	status := instance.Status()
+	if !strings.Contains(status.LastError, "Predict.fun") {
+		t.Fatalf("last error must name the failing venue, got %q", status.LastError)
+	}
+}
+
+func TestVenueAndTokenIdentityAreNamespaced(t *testing.T) {
+	ctx := context.Background()
+	// Both venues use the same decimal ids; the engine must keep them apart.
+	pmMarket := binary("shared", 0.98, 20000, 2)
+	pfMarket := binary("shared", 0.40, 20000, 2)
+	pfMarket.FeeRateBPS = 200
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{"shared": pmMarket}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+		venue: market.VenuePredictFun, markets: map[string]market.Market{"shared": pfMarket},
+	}, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	opportunities := instance.Opportunities()
+	byVenue := map[market.Venue]engine.Opportunity{}
+	for _, item := range opportunities.Items {
+		if item.TokenID != "shared-yes" {
+			continue
+		}
+		byVenue[item.Venue] = item
+	}
+	pm, pmOK := byVenue[market.VenuePolymarket]
+	pf, pfOK := byVenue[market.VenuePredictFun]
+	if !pmOK || !pfOK || pm.Price == pf.Price {
+		t.Fatalf("same token id from two venues was not kept apart: %+v", opportunities.Items)
+	}
+	if pm.TokenID != pf.TokenID || pm.Venue == pf.Venue {
+		t.Fatalf("unexpected venue identity: pm=%+v pf=%+v", pm, pf)
+	}
+	if len(opportunities.Venues) != 2 {
+		t.Fatalf("both venues contributed: %v", opportunities.Venues)
+	}
+	if caps := instance.VenueCapabilities(); len(caps) != 2 || caps[0].Venue != market.VenuePolymarket ||
+		caps[1].Venue != market.VenuePredictFun || caps[1].Currency != market.CurrencyUSDT {
+		t.Fatalf("unexpected capabilities: %+v", caps)
+	}
+	if venues := instance.Venues(); len(venues) != 2 || venues[0] != market.VenuePolymarket || venues[1] != market.VenuePredictFun {
+		t.Fatalf("unexpected venue order: %v", venues)
+	}
+}
+
+func TestLiveAccountIsUniquePerVenue(t *testing.T) {
+	ctx := context.Background()
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+		venue: market.VenuePredictFun, markets: map[string]market.Market{},
+	}, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	if _, err := instance.CreateAccount(ctx, "another PM live", engine.AccountModeLive, market.VenuePolymarket); !errors.Is(err, engine.ErrAccountConflict) {
+		t.Fatalf("a second Polymarket live account must conflict, got %v", err)
+	}
+	pfLive, err := instance.CreateAccount(ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
+	if err != nil {
+		t.Fatalf("a Predict.fun live account may coexist: %v", err)
+	}
+	if pfLive.Venue != market.VenuePredictFun || pfLive.Currency != market.CurrencyUSDT {
+		t.Fatalf("unexpected predictfun account: %+v", pfLive)
+	}
+	if _, err := instance.CreateAccount(ctx, "second PF live", engine.AccountModeLive, market.VenuePredictFun); !errors.Is(err, engine.ErrAccountConflict) {
+		t.Fatalf("a second Predict.fun live account must conflict, got %v", err)
+	}
+	pmVenue := market.VenuePolymarket
+	if _, err := instance.UpdateAccount(ctx, pfLive.ID, nil, nil, nil, &pmVenue); !errors.Is(err, engine.ErrInvalidOrder) {
+		t.Fatalf("changing an account's venue must be rejected, got %v", err)
+	}
+}
+
+func TestSettlementIsSkippedForVenuesWithoutSupport(t *testing.T) {
+	ctx := context.Background()
+	pfMarket := binary("pf", 0.40, 20000, 2)
+	pfMarket.FeeRateBPS = 200
+	pf := &fakeProvider{venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": pfMarket}}
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, pf, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+	paper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+		MarketID: "pf", Outcome: "Yes", TokenID: "pf-yes", Amount: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The market resolves according to reference data, but Predict.fun has no
+	// settler in this build: the position must stay open and no fabricated
+	// settlement order may be written.
+	pfMarket.Closed = true
+	pfMarket.Active = false
+	pfMarket.ResolutionStatus = "resolved"
+	pfMarket.Outcomes[0].Price = 1
+	pfMarket.Outcomes[1].Price = 0
+	pf.markets["pf"] = pfMarket
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	open, err := instance.Positions(ctx, paper.ID, "open", "")
+	if err != nil || open.Total != 1 || open.Items[0].Status != "open" {
+		t.Fatalf("predictfun position must stay open: %+v err=%v", open, err)
+	}
+	settled, err := instance.Orders(ctx, paper.ID, "settled", 10, 0, "")
+	if err != nil || settled.Total != 0 {
+		t.Fatalf("no settlement order may be fabricated: %+v err=%v", settled, err)
+	}
+	runtime := instance.SystemRuntime()
+	if !strings.Contains(runtime.Error, "暂不支持自动结算") || !strings.Contains(runtime.Error, "Predict.fun") {
+		t.Fatalf("runtime must surface the missing settler: %q", runtime.Error)
+	}
+}
+
+func TestSettingsVenueDefaultsAndValidation(t *testing.T) {
+	settings := engine.DefaultSettings()
+	settings.Venues = nil
+	if !settings.For(market.VenuePolymarket).Enabled {
+		t.Fatal("polymarket must be enabled when the venue map is absent")
+	}
+	if settings.For(market.VenuePredictFun).Enabled {
+		t.Fatal("predictfun must be disabled when the venue map is absent")
+	}
+	settings.Venues = map[market.Venue]engine.VenueSettings{
+		market.VenuePredictFun: {OrderSize: 3, MaxPosition: 15, MaxExposure: 45, FeeBPS: 200},
+	}
+	pf := settings.For(market.VenuePredictFun)
+	if pf.Enabled {
+		t.Fatal("an entry without enabled=true must not start trading")
+	}
+	if pf.OrderSize != 3 || pf.MaxPosition != 15 || pf.MaxExposure != 45 || pf.FeeBPS != 200 {
+		t.Fatalf("venue overrides were not applied: %+v", pf)
+	}
+	if settings.For(market.VenuePolymarket).OrderSize != settings.OrderSize {
+		t.Fatal("an absent venue must inherit the global order size")
+	}
+	if err := settings.Validate(); err != nil {
+		t.Fatalf("valid venue overrides were rejected: %v", err)
+	}
+
+	invalid := settings
+	invalid.Venues = map[market.Venue]engine.VenueSettings{
+		market.VenuePredictFun: {Enabled: true, OrderSize: 10, MaxPosition: 5, MaxExposure: 20},
+	}
+	if err := invalid.Validate(); !errors.Is(err, engine.ErrInvalidSettings) || !strings.Contains(err.Error(), "Predict.fun") {
+		t.Fatalf("invalid venue caps must name the venue: %v", err)
+	}
+	unknown := settings
+	unknown.Venues = map[market.Venue]engine.VenueSettings{"binance": {Enabled: true}}
+	if err := unknown.Validate(); !errors.Is(err, engine.ErrInvalidSettings) {
+		t.Fatalf("an unknown venue key must be rejected: %v", err)
+	}
+}
+
+func TestPredictFunAmountsAreRoundedForAPI(t *testing.T) {
+	ctx := context.Background()
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+		venue: market.VenuePredictFun, markets: map[string]market.Market{},
+	}, nil)
+	instance, repository := newTestEngineWithRegistry(t, registry)
+	pfPaper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	noisy := 1.0000000000000002
+	if _, err := repository.CreatePosition(ctx, engine.Position{
+		AccountID: pfPaper.ID, Venue: market.VenuePredictFun, Currency: market.CurrencyUSDT,
+		MarketID: "pf", ConditionID: "c-pf", Question: "q", Outcome: "Yes", TokenID: "t-pf",
+		Side: "BUY", Kind: "manual", EntryPrice: 0.4, CurrentPrice: 0.4,
+		Shares: 10 * noisy, Cost: noisy, Fee: noisy / 10, Status: "open",
+		OpenedAt: now, EndDate: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := instance.Positions(ctx, pfPaper.ID, "all", "")
+	if err != nil || list.Total != 1 {
+		t.Fatalf("unexpected positions: %+v err=%v", list, err)
+	}
+	position := list.Items[0]
+	if position.Cost != 1 || position.Fee != 0.1 || position.Shares != 10 {
+		t.Fatalf("predictfun amounts must be rounded to 6 decimals for the API: %+v", position)
+	}
+	dashboard, err := instance.Dashboard(ctx, pfPaper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.Metrics.Venue != market.VenuePredictFun || dashboard.Metrics.Currency != market.CurrencyUSDT {
+		t.Fatalf("metrics must be scoped to the account venue: %+v", dashboard.Metrics)
+	}
+	pmPaper := accountByMode(t, instance, engine.AccountModePaper)
+	pmDashboard, err := instance.Dashboard(ctx, pmPaper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pmDashboard.Metrics.Venue != market.VenuePolymarket || pmDashboard.Metrics.Currency != market.CurrencyUSDC {
+		t.Fatalf("polymarket metrics must stay on their own venue: %+v", pmDashboard.Metrics)
+	}
+}
+
+func TestSystemSettingsRejectSharedVenuePrivateKey(t *testing.T) {
+	key := "0x" + strings.Repeat("5", 64)
+	settings := engine.DefaultSystemSettings()
+	settings.Live = engine.LiveSettings{PrivateKey: key}
+	settings.Venues[market.VenuePredictFun] = engine.VenueSystemSettings{
+		Live: engine.VenueLiveSettings{LiveSettings: engine.LiveSettings{PrivateKey: key, APIKey: "pf-key"}},
+	}
+	settings = settings.SyncPolymarketVenue()
+	err := settings.Validate()
+	if err == nil || !strings.Contains(err.Error(), "不能与") {
+		t.Fatalf("reusing the Polymarket private key for Predict.fun must be rejected: %v", err)
 	}
 }

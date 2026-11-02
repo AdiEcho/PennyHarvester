@@ -208,5 +208,9 @@ func normalizeTag(value string) string {
 }
 
 func marketText(m Market) string {
-	return strings.ToLower(strings.Join([]string{m.Question, m.GroupItemTitle, m.EventTitle, m.Slug}, " "))
+	// Category is the venue's own label (Predict.fun publishes a category slug
+	// per market). Including it lets a venue that names its category classify
+	// correctly without teaching the heuristics every venue's vocabulary;
+	// Polymarket leaves the field empty, so its behaviour is unchanged.
+	return strings.ToLower(strings.Join([]string{m.Question, m.GroupItemTitle, m.EventTitle, m.Slug, m.Category}, " "))
 }

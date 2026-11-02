@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"pennyharvester/backend/internal/engine"
+	"pennyharvester/backend/internal/market"
 
 	"github.com/gin-gonic/gin"
 )
@@ -33,6 +35,7 @@ func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Auth
 	protected.Use(authenticator.Middleware())
 	{
 		protected.GET("/health", h.health)
+		protected.GET("/venues", h.venues)
 		protected.POST("/auth/logout", h.logout)
 		protected.POST("/auth/password", h.updatePassword)
 		protected.POST("/auth/password/disable", h.disablePassword)
@@ -52,6 +55,8 @@ func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Auth
 		protected.PUT("/system", h.updateSystemSettings)
 		protected.POST("/system/proxy/test", h.testProxy)
 		protected.POST("/system/live/test", h.testLive)
+		protected.GET("/system/live/approval", h.venueApproval)
+		protected.POST("/system/live/approve", h.approveVenue)
 		protected.POST("/system/relayer/test", h.testRelayer)
 		protected.POST("/system/live/funder", h.discoverFunder)
 		protected.POST("/engine/toggle", h.toggleEngine)
@@ -108,14 +113,15 @@ func (h *Handler) accounts(c *gin.Context) {
 
 func (h *Handler) createAccount(c *gin.Context) {
 	var request struct {
-		Name string             `json:"name" binding:"required"`
-		Mode engine.AccountMode `json:"mode" binding:"required"`
+		Name  string             `json:"name" binding:"required"`
+		Mode  engine.AccountMode `json:"mode" binding:"required"`
+		Venue market.Venue       `json:"venue"`
 	}
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账户字段无效: " + err.Error()})
 		return
 	}
-	account, err := h.engine.CreateAccount(c.Request.Context(), request.Name, request.Mode)
+	account, err := h.engine.CreateAccount(c.Request.Context(), request.Name, request.Mode, request.Venue)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -129,15 +135,16 @@ func (h *Handler) updateAccount(c *gin.Context) {
 		return
 	}
 	var request struct {
-		Name      *string `json:"name"`
-		AutoTrade *bool   `json:"auto_trade"`
-		IsDefault *bool   `json:"is_default"`
+		Name      *string       `json:"name"`
+		AutoTrade *bool         `json:"auto_trade"`
+		IsDefault *bool         `json:"is_default"`
+		Venue     *market.Venue `json:"venue"`
 	}
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账户更新字段无效: " + err.Error()})
 		return
 	}
-	account, err := h.engine.UpdateAccount(c.Request.Context(), id, request.Name, request.AutoTrade, request.IsDefault)
+	account, err := h.engine.UpdateAccount(c.Request.Context(), id, request.Name, request.AutoTrade, request.IsDefault, request.Venue)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -170,22 +177,49 @@ func (h *Handler) dashboard(c *gin.Context) {
 	c.JSON(http.StatusOK, dashboard)
 }
 
-func (h *Handler) opportunities(c *gin.Context) {
-	c.JSON(http.StatusOK, h.engine.Opportunities())
+// venues returns every registered venue's fact sheet. The API contract calls
+// this the single source of truth for labels, currencies and capabilities.
+func (h *Handler) venues(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"venues": h.engine.VenueCapabilities()})
 }
 
-// quoteOpportunity returns a real ask-book + fee-schedule estimate for one
-// radar row. It is read-only and never places an order.
+func (h *Handler) opportunities(c *gin.Context) {
+	v, ok := venueFromQuery(c)
+	if !ok {
+		return
+	}
+	list := h.engine.Opportunities()
+	if v != "" {
+		list.Items = filterOpportunities(list.Items, v)
+		list.Total = len(list.Items)
+	}
+	c.JSON(http.StatusOK, list)
+}
+
+// quoteOpportunity returns a real ask-book + fee estimate for one radar row.
+// It is read-only and never places an order.
 func (h *Handler) quoteOpportunity(c *gin.Context) {
 	var request struct {
-		TokenID string  `json:"token_id" binding:"required"`
-		Amount  float64 `json:"amount"`
+		TokenID string       `json:"token_id" binding:"required"`
+		Amount  float64      `json:"amount"`
+		Venue   market.Venue `json:"venue"`
 	}
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "报价字段无效: " + err.Error()})
 		return
 	}
-	quote, err := h.engine.QuoteOpportunity(c.Request.Context(), request.TokenID, request.Amount)
+	v, ok := venueFromQuery(c)
+	if !ok {
+		return
+	}
+	if v == "" && request.Venue != "" {
+		if !request.Venue.Valid() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "未知场所"})
+			return
+		}
+		v = request.Venue
+	}
+	quote, err := h.engine.QuoteOpportunity(c.Request.Context(), request.TokenID, request.Amount, v)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -203,22 +237,35 @@ func (h *Handler) scan(c *gin.Context) {
 		}
 		execute = parsed
 	}
+	v, ok := venueFromQuery(c)
+	if !ok {
+		return
+	}
 	accountID, ok := accountIDFromQuery(c)
 	if !ok {
 		return
 	}
-	summary, err := h.engine.ManualScan(c.Request.Context(), accountID, execute)
+	summary, err := h.engine.ManualScan(c.Request.Context(), accountID, execute, v)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
+	list := h.engine.Opportunities()
+	if v != "" {
+		list.Items = filterOpportunities(list.Items, v)
+		list.Total = len(list.Items)
+	}
 	c.JSON(http.StatusOK, struct {
 		engine.OpportunityList
 		AutoTrade engine.ScanSummary `json:"auto_trade"`
-	}{OpportunityList: h.engine.Opportunities(), AutoTrade: summary})
+	}{OpportunityList: list, AutoTrade: summary})
 }
 
 func (h *Handler) positions(c *gin.Context) {
+	v, ok := venueFromQuery(c)
+	if !ok {
+		return
+	}
 	accountID, ok := accountIDFromQuery(c)
 	if !ok {
 		return
@@ -228,7 +275,7 @@ func (h *Handler) positions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "status 仅支持 open、won、lost、split、sold 或 all"})
 		return
 	}
-	positions, err := h.engine.Positions(c.Request.Context(), accountID, status)
+	positions, err := h.engine.Positions(c.Request.Context(), accountID, status, v)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -237,6 +284,10 @@ func (h *Handler) positions(c *gin.Context) {
 }
 
 func (h *Handler) orders(c *gin.Context) {
+	v, ok := venueFromQuery(c)
+	if !ok {
+		return
+	}
 	accountID, ok := accountIDFromQuery(c)
 	if !ok {
 		return
@@ -266,7 +317,7 @@ func (h *Handler) orders(c *gin.Context) {
 		}
 		offset = parsed
 	}
-	orders, err := h.engine.Orders(c.Request.Context(), accountID, status, limit, offset)
+	orders, err := h.engine.Orders(c.Request.Context(), accountID, status, limit, offset, v)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -325,28 +376,33 @@ func (h *Handler) placeOrder(c *gin.Context) {
 }
 
 // paperOrderCompat keeps the pre-account endpoint usable by resolving the
-// first paper account. New clients should use /accounts/:id/orders.
+// first paper account. New clients should use /accounts/:id/orders. A venue in
+// the request selects that venue's paper account when one exists.
 func (h *Handler) paperOrderCompat(c *gin.Context) {
+	var request engine.OrderRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "订单字段无效: " + err.Error()})
+		return
+	}
 	accounts, err := h.engine.Accounts(c.Request.Context())
 	if err != nil {
 		respondError(c, err)
 		return
 	}
 	for _, account := range accounts.Items {
-		if account.Mode == engine.AccountModePaper {
-			var request engine.OrderRequest
-			if bindErr := c.ShouldBindJSON(&request); bindErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "订单字段无效: " + bindErr.Error()})
-				return
-			}
-			position, placeErr := h.engine.PlaceOrder(c.Request.Context(), account.ID, request)
-			if placeErr != nil {
-				respondError(c, placeErr)
-				return
-			}
-			c.JSON(http.StatusCreated, position)
+		if account.Mode != engine.AccountModePaper {
+			continue
+		}
+		if request.Venue != "" && account.EffectiveVenue() != request.Venue {
+			continue
+		}
+		position, placeErr := h.engine.PlaceOrder(c.Request.Context(), account.ID, request)
+		if placeErr != nil {
+			respondError(c, placeErr)
 			return
 		}
+		c.JSON(http.StatusCreated, position)
+		return
 	}
 	c.JSON(http.StatusNotFound, gin.H{"error": "没有可用的模拟账户"})
 }
@@ -373,17 +429,43 @@ func accountIDFromQuery(c *gin.Context) (int64, bool) {
 	return id, true
 }
 
+func venueFromQuery(c *gin.Context) (market.Venue, bool) {
+	raw := strings.TrimSpace(c.Query("venue"))
+	if raw == "" || strings.EqualFold(raw, "all") {
+		return "", true
+	}
+	v := market.Venue(raw)
+	if !v.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "未知场所"})
+		return "", false
+	}
+	return v, true
+}
+
+func filterOpportunities(items []engine.Opportunity, v market.Venue) []engine.Opportunity {
+	filtered := make([]engine.Opportunity, 0, len(items))
+	for _, item := range items {
+		if item.EffectiveVenue() == v {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
 func respondError(c *gin.Context, err error) {
 	status := http.StatusInternalServerError
 	switch {
-	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrNotFound), errors.Is(err, engine.ErrInvalidSettings):
+	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrNotFound),
+		errors.Is(err, engine.ErrInvalidSettings), errors.Is(err, engine.ErrNoApproval):
+		status = http.StatusBadRequest
+	case errors.Is(err, engine.ErrVenueMismatch):
 		status = http.StatusBadRequest
 	case errors.Is(err, engine.ErrAccountNotFound):
 		status = http.StatusNotFound
 	case errors.Is(err, engine.ErrAccountConflict):
 		status = http.StatusConflict
-	case errors.Is(err, engine.ErrLiveUnavailable):
-		status = http.StatusServiceUnavailable
+	case errors.Is(err, engine.ErrVenueReadOnly), errors.Is(err, engine.ErrVenueNotConfigured), errors.Is(err, engine.ErrLiveUnavailable):
+		status = http.StatusConflict
 	case errors.Is(err, engine.ErrUpstream):
 		status = http.StatusBadGateway
 	}

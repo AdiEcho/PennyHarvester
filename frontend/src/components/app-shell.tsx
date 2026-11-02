@@ -19,6 +19,7 @@ import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import { cn } from '@/lib/utils'
+import { venueLabel, venueMeta, venueOf, venueShort } from '@/lib/venue'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -55,7 +56,7 @@ function Brand() {
       </div>
       <div>
         <div className="text-[15px] font-semibold tracking-[-0.02em] text-white">PennyHarvester</div>
-        <div className="mt-0.5 text-[11px] tracking-wide text-slate-400">Polymarket 尾盘策略工作台</div>
+        <div className="mt-0.5 text-[11px] tracking-wide text-slate-400">多场所尾盘策略工作台</div>
       </div>
     </div>
   )
@@ -98,7 +99,7 @@ function Navigation({ view, onNavigate }: { view: View; onNavigate: (view: View)
             <span className="text-xs font-semibold">{isLive ? '实盘交易模式' : '模拟演练模式'}</span>
           </div>
           <p className="mt-2 text-[11px] leading-5 text-slate-400">
-            {isLive ? <>直接连接 Polymarket 真实盘口<br />使用真实 pUSD 下单交易</> : <>同步 Polymarket 实时公开行情<br />使用虚拟资金，不会真实下单</>}
+            {isLive ? <>直接连接 {venueLabel(venueOf(account))} 真实盘口<br />使用真实 {venueMeta(venueOf(account)).collateral} 下单交易</> : <>同步 {venueLabel(venueOf(account))} 实时公开行情<br />使用虚拟资金，不会真实下单</>}
           </p>
           <div className="mt-3 flex items-center gap-1.5 text-[10px] text-slate-500">
             {isLive ? <ShieldAlert className="h-3.5 w-3.5" /> : <ShieldCheck className="h-3.5 w-3.5" />}
@@ -131,7 +132,7 @@ function AccountSwitcher() {
           <SelectItem value="none" disabled>无账户</SelectItem>
         ) : accounts.map((item) => (
           <SelectItem key={item.id} value={String(item.id)}>
-            {item.name} · {item.mode === 'live' ? '实盘' : '模拟'}
+            {item.name} · {venueShort(item.venue)} · {item.mode === 'live' ? '实盘' : '模拟'}
           </SelectItem>
         ))}
       </SelectContent>
@@ -203,7 +204,7 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
               <div>
                 <p className="font-semibold">{account.live_configured ? '实盘账户还差一步即可就绪' : '实盘账户尚未配置钱包私钥'}</p>
                 <p className="mt-1 text-xs leading-5 text-rose-700">
-                  {account.live_configured ? <>{account.live_error || '请检查代理钱包地址（POLYMARKET_FUNDER）、API 凭据以及 Polymarket 上的 pUSD 授权状态。'}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1 py-0.5">POLYMARKET_PRIVATE_KEY</code> 后重启服务。你也可以先在右上角切换到「模拟账户」体验策略。</>}
+                  {account.live_configured ? <>{account.live_error || `请检查 ${venueLabel(venueOf(account))} 的钱包地址、API 凭据以及 ${venueMeta(venueOf(account)).collateral} 授权状态。`}</> : <>尚未配置实盘私钥。可在「系统设置 → 实盘交易凭据」中填写，或设置 <code className="rounded bg-rose-100 px-1 py-0.5">{venueMeta(venueOf(account)).envHint}</code> 后重启服务。你也可以先在右上角切换到「模拟账户」体验策略。</>}
                 </p>
               </div>
             </div>
@@ -212,7 +213,7 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
           <footer className="mt-8 border-t border-slate-200/70 pt-5">
             <RiskNotice />
             <div className="mt-4 flex flex-col gap-1 text-[11px] text-slate-400 sm:flex-row sm:items-center sm:justify-between">
-              <span>{isLive ? 'PennyHarvester · Polymarket 实盘交易模式' : 'PennyHarvester · Polymarket 模拟演练模式'}</span>
+              <span>{isLive ? `PennyHarvester · ${venueLabel(venueOf(account))} 实盘交易模式` : `PennyHarvester · ${venueLabel(venueOf(account))} 模拟演练模式`}</span>
               <span className="flex items-center gap-1.5"><Activity className="h-3 w-3" /> 页面开启时每 20 秒自动同步最新数据</span>
             </div>
           </footer>

@@ -19,6 +19,7 @@ import {
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/toast'
+import { useVenues } from '@/hooks/useVenues'
 import type {
   DataSourceSettings,
   FunderDiscoveryResult,
@@ -30,8 +31,13 @@ import type {
   ProxyTestResult,
   RelayerProbeResult,
   SystemSettings,
+  SystemVenueRuntime,
+  Venue,
+  VenueApproval,
+  VenueLiveSettings,
+  VenueSystemPatch,
 } from '@/types'
-import { formatCurrency } from '@/lib/format'
+import { fmtMoney, VENUES, venueLabel, venueMeta } from '@/lib/venue'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -39,7 +45,10 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/compone
 import { ErrorState, Skeleton } from '@/components/ui/feedback'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
+import { TabBar, type TabItem } from '@/components/ui/tab-bar'
 import { PageHeader } from '@/components/page-header'
+import { VenueChip } from '@/components/status-badges'
 
 const modeLabels: Record<ProxyMode, string> = {
   environment: '跟随环境变量',
@@ -53,8 +62,75 @@ const walletSourceLabels: Record<string, string> = {
   'create2-derivation': '链上 CREATE2 推导',
   'clob-proxy-wallets': 'CLOB 关联钱包接口',
 }
-const PUBLIC_GAMMA_URL = 'https://gamma-api.polymarket.com'
-const PUBLIC_CLOB_URL = 'https://clob.polymarket.com'
+
+// Save keys double as the concurrency control for the per-venue cards: saving
+// Predict.fun credentials must not reset the Polymarket draft.
+type SaveKey = 'proxy' | `data:${Venue}` | `live:${Venue}`
+
+// One PUT body shape for every card; omitted sections keep their stored value.
+interface SystemPatch {
+  proxy?: ProxyConfig
+  data_source?: DataSourceSettings
+  live?: LiveSettings
+  venues?: VenueSystemPatch
+}
+
+interface PredictFunDraft {
+  base_url: string
+  // Three-state, mirroring the API: undefined means "inherit the deployment
+  // environment" and must not be sent. Collapsing it to false would move a
+  // PREDICTFUN_TESTNET=1 deployment onto BNB mainnet on the next save.
+  testnet?: boolean
+  api_key: string
+  private_key: string
+  smart_wallet: string
+  // Secrets are write-only: GET returns "" plus a configured flag, never a value.
+  api_key_configured: boolean
+  private_key_configured: boolean
+  smart_wallet_configured: boolean
+}
+
+function toPredictFunDraft(system: SystemSettings): PredictFunDraft {
+  const loaded = system.venues?.predictfun
+  return {
+    base_url: loaded?.data_source?.base_url || venueMeta('predictfun').defaults.baseURL || '',
+    testnet: loaded?.live?.testnet ?? loaded?.data_source?.testnet,
+    api_key: '',
+    private_key: '',
+    smart_wallet: '',
+    // Flags live on the venue entry; the live-level keys are tolerated too.
+    api_key_configured: Boolean(loaded?.api_key_configured || loaded?.live?.api_key_configured || loaded?.live?.api_key),
+    private_key_configured: Boolean(loaded?.private_key_configured || loaded?.live?.private_key_configured || loaded?.live?.private_key),
+    smart_wallet_configured: Boolean(loaded?.smart_wallet_configured || loaded?.live?.smart_wallet_configured || loaded?.live?.smart_wallet),
+  }
+}
+
+// Falls back to the flat runtime fields (which always describe Polymarket) when
+// the backend has not shipped runtime.venues[] yet.
+function venueRuntime(system: SystemSettings, venue: Venue): SystemVenueRuntime {
+  const fromApi = system.runtime.venues?.find((item) => item.venue === venue)
+  if (fromApi) return fromApi
+  if (venue === 'polymarket') {
+    return {
+      venue,
+      configured: system.runtime.live_configured,
+      ready: system.runtime.live_ready,
+      signer: '',
+      maker: system.runtime.live_environment?.funder || '',
+      error: system.runtime.live_error,
+      testnet: false,
+    }
+  }
+  return {
+    venue,
+    configured: false,
+    ready: false,
+    signer: '',
+    maker: '',
+    error: '',
+    testnet: Boolean(system.venues?.predictfun?.live?.testnet),
+  }
+}
 
 function Section({ icon: Icon, title, description, children, actions }: {
   icon: typeof Network
@@ -146,12 +222,13 @@ function EndpointSection({ system, draft, dirty, saving, busy, onChange, onDisca
   onSave: () => void
 }) {
   const runtime = system.runtime
+  const defaults = venueMeta('polymarket').defaults
   return (
     <Section
       icon={Database}
-      title="行情与交易接口"
+      title="Polymarket 行情与交易接口"
       description="覆盖 Polymarket 的公开行情（Gamma）与实盘交易（CLOB）地址。留空表示继续使用启动环境变量或官方默认地址。"
-      actions={<Badge variant="success">已生效</Badge>}
+      actions={<div className="flex items-center gap-2"><VenueChip venue="polymarket" full /><Badge variant="success">已生效</Badge></div>}
     >
       <div className="grid gap-5 lg:grid-cols-2">
         <div>
@@ -161,12 +238,12 @@ function EndpointSection({ system, draft, dirty, saving, busy, onChange, onDisca
             id="gamma-base-url"
             value={draft.gamma_base_url}
             onChange={(event) => onChange({ gamma_base_url: event.target.value })}
-            placeholder={runtime.gamma_default || PUBLIC_GAMMA_URL}
+            placeholder={runtime.gamma_default || defaults.gammaBaseURL}
             spellCheck={false}
             autoComplete="off"
             className="mt-2 font-mono text-xs"
           />
-          <p className="mt-1.5 text-[11px] leading-4 text-slate-400">当前生效：<code className="break-all rounded bg-slate-100 px-1">{runtime.gamma_base_url || runtime.gamma_default || PUBLIC_GAMMA_URL}</code></p>
+          <p className="mt-1.5 text-[11px] leading-4 text-slate-400">当前生效：<code className="break-all rounded bg-slate-100 px-1">{runtime.gamma_base_url || runtime.gamma_default || defaults.gammaBaseURL}</code></p>
         </div>
         <div>
           <label htmlFor="clob-base-url" className="text-sm font-medium text-slate-700">CLOB 交易地址</label>
@@ -175,12 +252,12 @@ function EndpointSection({ system, draft, dirty, saving, busy, onChange, onDisca
             id="clob-base-url"
             value={draft.clob_base_url}
             onChange={(event) => onChange({ clob_base_url: event.target.value })}
-            placeholder={runtime.clob_default || PUBLIC_CLOB_URL}
+            placeholder={runtime.clob_default || defaults.clobBaseURL}
             spellCheck={false}
             autoComplete="off"
             className="mt-2 font-mono text-xs"
           />
-          <p className="mt-1.5 text-[11px] leading-4 text-slate-400">当前生效：<code className="break-all rounded bg-slate-100 px-1">{runtime.clob_base_url || runtime.clob_default || PUBLIC_CLOB_URL}</code></p>
+          <p className="mt-1.5 text-[11px] leading-4 text-slate-400">当前生效：<code className="break-all rounded bg-slate-100 px-1">{runtime.clob_base_url || runtime.clob_default || defaults.clobBaseURL}</code></p>
         </div>
       </div>
 
@@ -326,7 +403,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
     setRelayerTesting(true)
     setRelayerProbe(null)
     try {
-      const result = await api.testRelayer(draft, clobBaseURL, relayerKey.trim(), relayerAddress.trim())
+      const result = await api.testRelayer(draft, clobBaseURL, relayerKey.trim(), relayerAddress.trim(), 'polymarket')
       setRelayerProbe(result)
       toast({
         title: result.ok ? 'Relayer 密钥有效' : 'Relayer 密钥检测失败',
@@ -351,12 +428,12 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
     setTesting(true)
     setProbe(null)
     try {
-      const result = await api.testLive(draft, clobBaseURL)
+      const result = await api.testLive(draft, clobBaseURL, 'polymarket')
       setProbe(result)
       toast({
         title: result.ok ? '实盘凭据可用' : '实盘凭据检测失败',
         description: result.ok
-          ? `Signer ${result.signer} · 抵押余额 ${formatCurrency(result.cash ?? 0)}`
+          ? `Signer ${result.signer} · 抵押余额 ${fmtMoney(result.cash ?? 0, 'polymarket')}`
           : result.error || '请检查私钥、Funder、签名类型与网络出口。',
         variant: result.ok ? 'success' : 'error',
       })
@@ -370,9 +447,9 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
   return (
     <Section
       icon={Wallet}
-      title="实盘交易凭据"
+      title="Polymarket 实盘交易凭据"
       description="可直接在网页中填写钱包私钥、Funder 与 L2 API 凭据。留空表示沿用启动环境变量；私钥与 Secret 在数据库中加密保存，读取时只返回掩码。"
-      actions={<Badge variant={statusVariant}>{statusLabel}</Badge>}
+      actions={<div className="flex items-center gap-2"><VenueChip venue="polymarket" full /><Badge variant={statusVariant}>{statusLabel}</Badge></div>}
     >
       <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
         <div className="flex flex-wrap items-center gap-2">
@@ -615,7 +692,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-3">
             <Button variant="secondary" size="sm" onClick={() => void testRelayer()} loading={relayerTesting} disabled={busy || !relayerKey.trim() || !relayerAddress.trim()}>验证 Relayer 密钥</Button>
-            <p className="text-xs leading-5 text-slate-400">地址必须等于私钥地址（Signer）；填成 Funder 会返回 401。</p>
+            <p className="text-xs leading-5 text-slate-400">地址必须等于私钥地址（Signer）；填成 Funder 会返回 401。检测会带上 venue=polymarket。</p>
           </div>
           {relayerProbe && (
             <div className={cn('mt-3 rounded-xl border px-4 py-3 text-xs leading-5', relayerProbe.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-rose-200 bg-rose-50 text-rose-700')} role="status">
@@ -637,7 +714,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
               <p className="break-all font-mono">Signer {probe.signer}</p>
               <p className="break-all font-mono">Maker {probe.maker}</p>
               {probe.mode === 'proxy' && <p>代理钱包模式下 Maker 应等于你填写的 Funder；若不等，说明代理钱包类型或 Funder 填错。</p>}
-              <p>API Key {probe.api_key || '—'} · 抵押余额 {formatCurrency(probe.cash ?? 0)} · 授权额度 {formatCurrency(probe.allowance ?? 0)}</p>
+              <p>API Key {probe.api_key || '—'} · 抵押余额 {fmtMoney(probe.cash ?? 0, 'polymarket')} · 授权额度 {fmtMoney(probe.allowance ?? 0, 'polymarket')}</p>
               {(probe.cash ?? 0) <= 0 && <p className="text-amber-700">抵押余额为 0：请确认 Funder 是该账户真实钱包地址，或该钱包尚未存入 pUSD（余额不足时下单会被拒绝）。</p>}
             </div>
           ) : (
@@ -664,20 +741,347 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
   )
 }
 
+function PredictFunEndpointSection({ draft, dirty, saving, busy, runtime, onChange, onDiscard, onSave }: {
+  draft: PredictFunDraft
+  dirty: boolean
+  saving: boolean
+  busy: boolean
+  runtime: SystemVenueRuntime
+  onChange: (patch: Partial<PredictFunDraft>) => void
+  onDiscard: () => void
+  onSave: () => void
+}) {
+  const meta = venueMeta('predictfun')
+  return (
+    <Section
+      icon={Database}
+      title="Predict.fun 行情与交易接口"
+      description="Predict.fun 的行情与交易共用同一个 API 主机。留空表示使用官方默认地址；自建代理时填写完整 http(s) 地址。"
+      actions={<div className="flex items-center gap-2"><VenueChip venue="predictfun" full />{runtime.testnet && <Badge variant="warning">测试网</Badge>}</div>}
+    >
+      <div className="grid gap-5 lg:grid-cols-2">
+        <div>
+          <label htmlFor="predictfun-base-url" className="text-sm font-medium text-slate-700">Base URL</label>
+          <p className="mt-1 min-h-8 text-xs leading-4 text-slate-400">用于 {meta.label} 的市场列表、盘口与下单。</p>
+          <Input
+            id="predictfun-base-url"
+            value={draft.base_url}
+            onChange={(event) => onChange({ base_url: event.target.value })}
+            placeholder={meta.defaults.baseURL}
+            spellCheck={false}
+            autoComplete="off"
+            className="mt-2 font-mono text-xs"
+          />
+          <p className="mt-1.5 text-[11px] leading-4 text-slate-400">当前生效：<code className="break-all rounded bg-slate-100 px-1">{draft.base_url || meta.defaults.baseURL}</code></p>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 text-xs leading-5 text-slate-500">
+          <p className="font-medium text-slate-700">与 Polymarket 的差异</p>
+          <ul className="mt-2 list-disc space-y-1 pl-4">
+            <li>计价币为 {meta.currency}（{meta.quoteDecimals} 位精度），不与 USDC 相加或换算。</li>
+            <li>订单类型为 {meta.orderTypes.join(' / ')}，没有 FOK/FAK。</li>
+            <li>引擎不支持该场所的自动结算：到期持仓保持「持有中」，需自行赎回。</li>
+            <li>实盘私钥是独立的 EVM 私钥，不可与 Polymarket 私钥复用。</li>
+          </ul>
+        </div>
+      </div>
+
+      <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+        <p className="flex-1 text-xs leading-5 text-slate-400">保存后新的请求立即使用新地址，无需重启。留空保存会保持已保存的地址；要回到官方默认地址，请直接填入上面的默认值。</p>
+        <Button variant="secondary" onClick={onDiscard} disabled={!dirty || busy}><RotateCcw className="h-4 w-4" />放弃更改</Button>
+        <Button variant="primary" onClick={onSave} loading={saving} disabled={!dirty || busy}><Save className="h-4 w-4" />保存接口设置</Button>
+      </div>
+    </Section>
+  )
+}
+
+function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, settlementSupported, onChange, onReset, onSave }: {
+  draft: PredictFunDraft
+  dirty: boolean
+  saving: boolean
+  busy: boolean
+  runtime: SystemVenueRuntime
+  baseURL: string
+  settlementSupported: boolean
+  onChange: (patch: Partial<PredictFunDraft>) => void
+  onReset: () => void
+  onSave: () => void
+}) {
+  const { toast } = useToast()
+  const meta = venueMeta('predictfun')
+  const [testing, setTesting] = useState(false)
+  const [probe, setProbe] = useState<LiveProbeResult | null>(null)
+  const [approval, setApproval] = useState<VenueApproval | null>(null)
+  const [approving, setApproving] = useState(false)
+  // Any edit invalidates the previous result.
+  useEffect(() => { setProbe(null) }, [draft])
+
+  // Allowances live on chain, not in the saved settings, so they are read on
+  // mount. A venue that is not configured has nothing to report and the card
+  // stays hidden; the read is skipped entirely in that case.
+  useEffect(() => {
+    if (!runtime.configured) { setApproval(null); return }
+    let alive = true
+    api.getVenueApproval('predictfun')
+      .then((result) => { if (alive) setApproval(result.approval) })
+      .catch(() => { if (alive) setApproval(null) })
+    return () => { alive = false }
+  }, [runtime.configured])
+
+  const grantApprovals = async () => {
+    setApproving(true)
+    try {
+      const result = await api.approveVenue('predictfun')
+      setApproval(result.approval)
+      toast({
+        title: result.approval.ready ? '链上授权完成' : '授权已提交',
+        description: result.approval.ready
+          ? '现在可以在 Predict.fun 实盘下单。'
+          : result.approval.missing || '交易已发出，等待确认后重新读取。',
+        variant: result.approval.ready ? 'success' : 'info',
+      })
+    } catch (caught) {
+      toast({ title: '链上授权失败', description: caught instanceof Error ? caught.message : '请检查 RPC、私钥与 BNB 余额。', variant: 'error' })
+    } finally {
+      setApproving(false)
+    }
+  }
+  const statusVariant = runtime.ready ? 'success' : runtime.configured ? 'warning' : 'default'
+  const statusLabel = runtime.ready ? '凭据本地校验通过' : runtime.configured ? '已配置但未就绪' : '未配置实盘凭据'
+  // Effective network: the explicit choice when the operator made one, otherwise
+  // whatever the deployment env resolved to.
+  const testnet = draft.testnet ?? runtime.testnet
+
+  const testCredentials = async () => {
+    const key = draft.private_key.trim()
+    if (key && !/^0x[0-9a-fA-F]{64}$/.test(key)) {
+      toast({ title: '无法检测', description: '私钥必须是 0x 开头的 64 位十六进制字符串。', variant: 'error' })
+      return
+    }
+    setTesting(true)
+    setProbe(null)
+    try {
+      // Empty secrets mean "keep the stored value", exactly like the PUT body.
+      const live: VenueLiveSettings = {
+        private_key: draft.private_key,
+        api_key: draft.api_key,
+        smart_wallet: draft.smart_wallet,
+        ...(draft.testnet === undefined ? {} : { testnet: draft.testnet }),
+      }
+      const result = await api.testLive(live, baseURL, 'predictfun')
+      setProbe(result)
+      toast({
+        title: result.ok ? 'Predict.fun 凭据可用' : 'Predict.fun 凭据检测失败',
+        description: result.ok
+          ? `Signer ${result.signer || '—'} · 余额 ${fmtMoney(result.cash ?? 0, 'predictfun')}`
+          : result.error || '请检查私钥、API Key、Smart Wallet 与网络出口。',
+        variant: result.ok ? 'success' : 'error',
+      })
+    } catch (caught) {
+      toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <Section
+      icon={Wallet}
+      title="Predict.fun 实盘交易凭据"
+      description={`Predict.fun 使用独立的 EVM 私钥与 x-api-key 鉴权，资金在 Smart Wallet（BNB Chain 上的 ${venueMeta('predictfun').currency}）。密钥字段为只写：读取时不回显，留空表示保持已保存值。`}
+      actions={<div className="flex items-center gap-2"><VenueChip venue="predictfun" full /><Badge variant={statusVariant}>{statusLabel}</Badge>{testnet && <Badge variant="warning">测试网</Badge>}</div>}
+    >
+      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold text-slate-800">运行状态</span>
+          <Badge variant={statusVariant}>{statusLabel}</Badge>
+          {runtime.testnet && <Badge variant="warning">测试网 TESTNET</Badge>}
+          {!settlementSupported && <Badge variant="default">不自动结算</Badge>}
+        </div>
+        {runtime.error && <p className="mt-2 break-words text-xs leading-5 text-rose-600">{runtime.error}</p>}
+        <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+          <div className="flex justify-between gap-3 sm:block"><dt className="text-slate-500">Signer</dt><dd className="break-all font-mono text-[11px] text-slate-700">{runtime.signer || '—'}</dd></div>
+          <div className="flex justify-between gap-3 sm:block"><dt className="text-slate-500">Maker / Smart Wallet</dt><dd className="break-all font-mono text-[11px] text-slate-700">{runtime.maker || '—'}</dd></div>
+        </dl>
+        {!settlementSupported && <p className="mt-3 text-xs leading-5 text-amber-700">该场所暂不支持引擎结算（supports_settlement: false）：持仓到期后保持「持有中」，不要期待自动结算或自动赎回。</p>}
+      </div>
+
+      <div className="mt-5 grid gap-x-5 gap-y-5 lg:grid-cols-2">
+        <div>
+          <label htmlFor="predictfun-api-key" className="text-sm font-medium text-slate-700">API Key</label>
+          <p className="mt-1 text-xs leading-4 text-slate-400">随请求以 x-api-key 头发送。{draft.api_key_configured ? '已配置，输入新值会覆盖。' : '尚未配置。'}</p>
+          <div className="mt-2 flex items-center gap-2">
+            <Input
+              id="predictfun-api-key"
+              type="password"
+              value={draft.api_key}
+              onChange={(event) => onChange({ api_key: event.target.value })}
+              placeholder={draft.api_key_configured ? '已配置（留空保持不变）' : '尚未配置'}
+              spellCheck={false}
+              autoComplete="off"
+              className="font-mono text-xs"
+            />
+            {draft.api_key_configured && <Badge variant="success">已配置</Badge>}
+          </div>
+        </div>
+        <div>
+          <label htmlFor="predictfun-smart-wallet" className="text-sm font-medium text-slate-700">Smart Wallet</label>
+          <p className="mt-1 text-xs leading-4 text-slate-400">持有资金的账户地址；EOA 模式下留空（资金就在私钥地址上）。{draft.smart_wallet_configured ? '已配置。' : ''}</p>
+          <div className="mt-2 flex items-center gap-2">
+            <Input
+              id="predictfun-smart-wallet"
+              value={draft.smart_wallet}
+              onChange={(event) => onChange({ smart_wallet: event.target.value })}
+              placeholder={draft.smart_wallet_configured ? '已配置（留空保持不变）' : runtime.maker || '0x...'}
+              spellCheck={false}
+              autoComplete="off"
+              className="font-mono text-xs"
+            />
+            {draft.smart_wallet_configured && <Badge variant="success">已配置</Badge>}
+          </div>
+        </div>
+        <div className="lg:col-span-2">
+          <label htmlFor="predictfun-private-key" className="text-sm font-medium text-slate-700">钱包私钥（独立 EVM 私钥）</label>
+          <p className="mt-1 text-xs leading-4 text-slate-400">不要复用 Polymarket 的私钥。私钥只用于签名，建议使用专用小额热钱包。{draft.private_key_configured ? '已配置，输入新值会覆盖。' : '尚未配置。'}</p>
+          <div className="mt-2 flex items-center gap-2">
+            <Input
+              id="predictfun-private-key"
+              type="password"
+              value={draft.private_key}
+              onChange={(event) => onChange({ private_key: event.target.value })}
+              placeholder={draft.private_key_configured ? '已配置（留空保持不变）' : '0x...'}
+              spellCheck={false}
+              autoComplete="off"
+              className="font-mono text-xs"
+            />
+            {draft.private_key_configured && <Badge variant="success">已配置</Badge>}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-6 flex flex-col gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-3">
+          <div className={cn('rounded-xl p-2.5', testnet ? 'bg-amber-50 text-amber-600' : 'bg-surface text-slate-400')}><Network className="h-5 w-5" /></div>
+          <div>
+            <p className="flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-800">测试网（Testnet）{testnet && <Badge variant="warning">测试网</Badge>}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-500">开启后请求发往 Predict.fun 测试网，余额与持仓都是测试资产；关闭后为 BNB Chain 主网真实资金。切换后请重新检测凭据。</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">{draft.testnet === undefined ? `当前跟随部署环境（${runtime.testnet ? '测试网' : '主网'}）；开关一次即可固定为显式设置。` : '已显式指定网络，保存后对下一次下单生效。'}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 sm:flex-col sm:items-end">
+          <Switch checked={testnet} onCheckedChange={(checked) => onChange({ testnet: checked })} aria-label="切换 Predict.fun 测试网" />
+          <span className="text-xs text-slate-400">{testnet ? '测试网' : '主网'}</span>
+        </div>
+      </div>
+
+      {probe && (
+        <div className={cn('mt-4 rounded-xl border px-4 py-3 text-xs leading-5', probe.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-rose-200 bg-rose-50 text-rose-700')} role="status">
+          {probe.ok ? (
+            <div className="space-y-1">
+              <p className="font-medium">凭据检测通过 · {probe.testnet ? '测试网' : '主网'} · 耗时 {Math.round(probe.latency_ms ?? 0)} ms</p>
+              <p className="break-all font-mono">Signer {probe.signer || '—'}</p>
+              <p className="break-all font-mono">Maker {probe.maker || '—'}</p>
+              <p>API Key {probe.api_key || '—'} · 余额 {fmtMoney(probe.cash ?? 0, 'predictfun', { digits: 4 })}</p>
+              {(probe.cash ?? 0) <= 0 && <p className="text-amber-700">余额为 0：请确认 Smart Wallet 地址正确，且钱包内有 {meta.currency} 与 BNB 手续费。</p>}
+            </div>
+          ) : (
+            <p className="break-words">{probe.error || '检测失败，请检查私钥、API Key、Smart Wallet 与网络出口。'}</p>
+          )}
+        </div>
+      )}
+
+      <div className="mt-5 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <span>密钥写入本机 SQLite（AES-GCM 加密），读取时只返回「已配置」标记，绝不回显。Predict.fun 的私钥与 Polymarket 私钥互相独立，泄漏任意一个都会导致对应账户资金被盗。</span>
+      </div>
+
+      <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+      {approval && (
+        <div className={cn('mt-4 rounded-xl border px-4 py-3 text-xs leading-5', approval.ready ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-900')} role="status">
+          <p className="font-medium">
+            链上授权 · {approval.ready ? '已就绪' : '未完成'}
+          </p>
+          <p className="mt-1">
+            余额 {fmtMoney(approval.balance, 'predictfun', { digits: 4 })} · 已授权 {fmtMoney(approval.allowance, 'predictfun', { digits: 4 })} · 结果份额划转 {approval.shares_ready ? '已授权' : '未授权'}
+          </p>
+          {!approval.ready && (
+            <p className="mt-1 text-amber-800">
+              {approval.missing || '需要授权 USDT 与结果份额后才能实盘交易。'}授权是一个真实的链上交易，钱包需要 BNB 支付 gas。
+            </p>
+          )}
+        </div>
+      )}
+
+        <p className="flex-1 text-xs leading-5 text-slate-400">「检测凭据」只做只读验证（读取余额与账户状态），不会保存设置也不会下单；请求会带上 venue=predictfun。</p>
+        {approval && !approval.ready && (
+          <Button variant="secondary" onClick={() => void grantApprovals()} loading={approving} disabled={busy}>
+            <ShieldCheck className="h-4 w-4" />链上授权
+          </Button>
+        )}
+        <Button variant="secondary" onClick={() => void testCredentials()} loading={testing} disabled={busy}>检测凭据</Button>
+        <Button variant="secondary" onClick={onReset} disabled={!dirty || busy}><RotateCcw className="h-4 w-4" />放弃更改</Button>
+        <Button variant="primary" onClick={onSave} loading={saving} disabled={!dirty || busy}><Save className="h-4 w-4" />保存实盘设置</Button>
+      </div>
+    </Section>
+  )
+}
+
+function VenueRuntimeCard({ system, capabilityOf }: { system: SystemSettings; capabilityOf: ReturnType<typeof useVenues>['capabilityOf'] }) {
+  return (
+    <Section icon={Network} title="场所运行状态" description="逐场所读取后端 runtime.venues[]：凭据是否就绪、结算能力与测试网状态。一个场所异常不影响另一个。">
+      <div className="grid gap-3 lg:grid-cols-2">
+        {VENUES.map((venue) => {
+          const runtime = venueRuntime(system, venue)
+          const meta = venueMeta(venue)
+          const capability = capabilityOf(venue)
+          const testnet = runtime.testnet || Boolean(capability?.testnet)
+          const settlement = capability?.supports_settlement ?? meta.supportsSettlement
+          const readOnly = capability?.read_only ?? false
+          return (
+            <div key={venue} className="rounded-xl border border-slate-200 p-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <VenueChip venue={venue} full />
+                <Badge variant={runtime.ready ? 'success' : runtime.configured ? 'warning' : 'default'}>
+                  {runtime.ready ? '已就绪' : runtime.configured ? '配置待完善' : '未配置'}
+                </Badge>
+                {testnet && <Badge variant="warning">测试网</Badge>}
+                {readOnly && <Badge variant="danger">只读</Badge>}
+                {!settlement && <Badge variant="default">不自动结算</Badge>}
+                {capability?.order_types?.length ? <Badge variant="info">{capability.order_types.join(' / ')}</Badge> : <Badge variant="info">{meta.orderTypes.join(' / ')}</Badge>}
+              </div>
+              <dl className="mt-3 space-y-1.5 text-xs">
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">收付币种</dt><dd className="font-medium text-slate-700">{meta.currency} · {meta.quoteDecimals} 位精度</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">Signer</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-600" title={runtime.signer}>{runtime.signer || '—'}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">Maker</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-600" title={runtime.maker}>{runtime.maker || '—'}</dd></div>
+                <div className="flex justify-between gap-3"><dt className="text-slate-500">结算能力</dt><dd className="text-slate-700">{settlement ? '引擎可自动结算' : '保持持有中，需自行赎回'}</dd></div>
+                {capability && <div className="flex justify-between gap-3"><dt className="text-slate-500">最小下单额</dt><dd className="text-slate-700">{fmtMoney(capability.min_notional, venue)}</dd></div>}
+              </dl>
+              {runtime.error && <p className="mt-2 break-words text-xs leading-5 text-rose-600">{runtime.error}</p>}
+            </div>
+          )
+        })}
+      </div>
+    </Section>
+  )
+}
+
 export function SystemView() {
   const { toast } = useToast()
+  const [tab, setTab] = useState<Venue>('polymarket')
   const [system, setSystem] = useState<SystemSettings | null>(null)
   const [proxyDraft, setProxyDraft] = useState<ProxyConfig | null>(null)
   const [proxyDirty, setProxyDirty] = useState(false)
-  const [dataDraft, setDataDraft] = useState<DataSourceSettings | null>(null)
-  const [dataDirty, setDataDirty] = useState(false)
-  const [liveDraft, setLiveDraft] = useState<LiveSettings | null>(null)
-  const [liveDirty, setLiveDirty] = useState(false)
+  const [pmData, setPmData] = useState<DataSourceSettings | null>(null)
+  const [pmLive, setPmLive] = useState<LiveSettings | null>(null)
+  const [pfDraft, setPfDraft] = useState<PredictFunDraft | null>(null)
+  // Dirty flags are per card so saving one venue never resets the other's draft.
+  const [dataDirty, setDataDirty] = useState<Record<Venue, boolean>>({ polymarket: false, predictfun: false })
+  const [liveDirty, setLiveDirty] = useState<Record<Venue, boolean>>({ polymarket: false, predictfun: false })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [savingSection, setSavingSection] = useState<'proxy' | 'data' | 'live' | null>(null)
+  const [savingSection, setSavingSection] = useState<SaveKey | null>(null)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<ProxyTestResult | null>(null)
+  const { capabilityOf } = useVenues()
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -685,8 +1089,9 @@ export function SystemView() {
       const next = await api.system()
       setSystem(next)
       setProxyDraft((current) => (current && proxyDirty ? current : next.proxy))
-      setDataDraft((current) => (current && dataDirty ? current : next.data_source))
-      setLiveDraft((current) => (current && liveDirty ? current : next.live))
+      setPmData((current) => (current && dataDirty.polymarket ? current : next.data_source))
+      setPmLive((current) => (current && liveDirty.polymarket ? current : next.live))
+      setPfDraft((current) => (current && (dataDirty.predictfun || liveDirty.predictfun) ? current : toPredictFunDraft(next)))
       setError('')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '系统设置加载失败。')
@@ -701,26 +1106,50 @@ export function SystemView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const applySaved = (saved: SystemSettings, section: 'proxy' | 'data' | 'live') => {
+  const applySaved = (saved: SystemSettings, key: SaveKey) => {
     setSystem(saved)
-    if (section === 'proxy' || !proxyDirty) setProxyDraft(saved.proxy)
-    if (section === 'data' || !dataDirty) setDataDraft(saved.data_source)
-    if (section === 'live' || !liveDirty) setLiveDraft(saved.live)
-    if (section === 'proxy') setProxyDirty(false)
-    if (section === 'data') setDataDirty(false)
-    if (section === 'live') setLiveDirty(false)
+    if (key === 'proxy') {
+      setProxyDraft(saved.proxy)
+      setProxyDirty(false)
+      return
+    }
+    if (key === 'data:polymarket') {
+      setPmData(saved.data_source)
+      setDataDirty((current) => ({ ...current, polymarket: false }))
+      return
+    }
+    if (key === 'live:polymarket') {
+      setPmLive(saved.live)
+      setLiveDirty((current) => ({ ...current, polymarket: false }))
+      return
+    }
+    const savedVenue = saved.venues?.predictfun
+    setPfDraft((current) => {
+      if (!current) return current
+      if (key === 'data:predictfun') {
+        return { ...current, base_url: savedVenue?.data_source?.base_url ?? current.base_url }
+      }
+      // Secrets are write-only: clear the inputs and rely on the configured flags.
+      return {
+        ...current,
+        testnet: savedVenue?.live?.testnet ?? current.testnet,
+        api_key: '',
+        private_key: '',
+        smart_wallet: '',
+        api_key_configured: Boolean(savedVenue?.api_key_configured || savedVenue?.live?.api_key_configured) || current.api_key_configured || Boolean(current.api_key),
+        private_key_configured: Boolean(savedVenue?.private_key_configured || savedVenue?.live?.private_key_configured) || current.private_key_configured || Boolean(current.private_key),
+        smart_wallet_configured: Boolean(savedVenue?.smart_wallet_configured || savedVenue?.live?.smart_wallet_configured) || current.smart_wallet_configured || Boolean(current.smart_wallet),
+      }
+    })
+    if (key === 'data:predictfun') setDataDirty((current) => ({ ...current, predictfun: false }))
+    else setLiveDirty((current) => ({ ...current, predictfun: false }))
   }
 
-  const saveSection = async (
-    section: 'proxy' | 'data' | 'live',
-    body: { proxy?: ProxyConfig; data_source?: DataSourceSettings; live?: LiveSettings },
-    successTitle: string,
-    successDescription: string,
-  ) => {
-    setSavingSection(section)
+  const saveSection = async (key: SaveKey, body: SystemPatch, successTitle: string, successDescription: string) => {
+    setSavingSection(key)
     try {
       const saved = await api.updateSystem(body)
-      applySaved(saved, section)
+      applySaved(saved, key)
       toast({ title: successTitle, description: successDescription, variant: 'success' })
     } catch (caught) {
       toast({
@@ -741,7 +1170,7 @@ export function SystemView() {
 
   const saveProxy = () => {
     if (!proxyDraft) return
-    void saveSection('proxy', { proxy: proxyDraft }, '代理设置已保存', '新的网络出口已立即应用到行情与实盘请求。')
+    void saveSection('proxy', { proxy: proxyDraft }, '代理设置已保存', '新的网络出口已立即应用到各场所的行情与实盘请求。')
   }
 
   const resetProxy = () => {
@@ -752,55 +1181,132 @@ export function SystemView() {
   }
 
   const updateData = (patch: Partial<DataSourceSettings>) => {
-    setDataDraft((current) => (current ? { ...current, ...patch } : current))
-    setDataDirty(true)
+    setPmData((current) => (current ? { ...current, ...patch } : current))
+    setDataDirty((current) => ({ ...current, polymarket: true }))
   }
 
   const saveData = () => {
-    if (!dataDraft) return
-    const gammaError = urlError(dataDraft.gamma_base_url)
+    if (!pmData) return
+    const gammaError = urlError(pmData.gamma_base_url)
     if (gammaError) {
       toast({ title: '接口设置未保存', description: `Gamma 行情地址：${gammaError}`, variant: 'error' })
       return
     }
-    const clobError = urlError(dataDraft.clob_base_url)
+    const clobError = urlError(pmData.clob_base_url)
     if (clobError) {
       toast({ title: '接口设置未保存', description: `CLOB 交易地址：${clobError}`, variant: 'error' })
       return
     }
-    void saveSection('data', { data_source: dataDraft }, '接口设置已保存', '新的 Gamma / CLOB 地址已立即生效。')
+    // Polymarket stays on the flat fields: they are the contract's authoritative
+    // view and the backend mirrors them into venues.polymarket. Sending the venue
+    // entry too would make an emptied field merge back to its previous value.
+    void saveSection('data:polymarket', { data_source: pmData }, '接口设置已保存', '新的 Gamma / CLOB 地址已立即生效。')
   }
 
   const resetData = () => {
     if (!system) return
-    setDataDraft(system.data_source)
-    setDataDirty(false)
+    setPmData(system.data_source)
+    setDataDirty((current) => ({ ...current, polymarket: false }))
   }
 
   const clearData = () => {
-    setDataDraft({ gamma_base_url: '', clob_base_url: '' })
-    setDataDirty(true)
+    setPmData({ gamma_base_url: '', clob_base_url: '' })
+    setDataDirty((current) => ({ ...current, polymarket: true }))
   }
 
   const updateLive = (patch: Partial<LiveSettings>) => {
-    setLiveDraft((current) => (current ? { ...current, ...patch } : current))
-    setLiveDirty(true)
+    setPmLive((current) => (current ? { ...current, ...patch } : current))
+    setLiveDirty((current) => ({ ...current, polymarket: true }))
   }
 
   const saveLive = () => {
-    if (!liveDraft || !system) return
-    const validation = liveValidation(liveDraft, system.runtime.live_environment)
+    if (!pmLive || !system) return
+    const validation = liveValidation(pmLive, system.runtime.live_environment)
     if (validation) {
       toast({ title: '实盘设置未保存', description: validation, variant: 'error' })
       return
     }
-    void saveSection('live', { live: liveDraft }, '实盘设置已保存', 'CLOB 客户端已按新凭据重建。若状态未就绪，请查看上方错误提示。')
+    // Flat `live` only, for the same reason as the endpoint card: clearing a
+    // credential has to clear it, and the backend dual-writes the venue entry.
+    void saveSection('live:polymarket', { live: pmLive }, '实盘设置已保存', 'Polymarket CLOB 客户端已按新凭据重建。若状态未就绪，请查看上方错误提示。')
   }
 
   const resetLive = () => {
     if (!system) return
-    setLiveDraft(system.live)
-    setLiveDirty(false)
+    setPmLive(system.live)
+    setLiveDirty((current) => ({ ...current, polymarket: false }))
+  }
+
+  const updatePfData = (patch: Partial<PredictFunDraft>) => {
+    setPfDraft((current) => (current ? { ...current, ...patch } : current))
+    setDataDirty((current) => ({ ...current, predictfun: true }))
+  }
+
+  const updatePfLive = (patch: Partial<PredictFunDraft>) => {
+    setPfDraft((current) => (current ? { ...current, ...patch } : current))
+    setLiveDirty((current) => ({ ...current, predictfun: true }))
+  }
+
+  const savePfData = () => {
+    if (!pfDraft) return
+    const baseError = urlError(pfDraft.base_url)
+    if (baseError) {
+      toast({ title: '接口设置未保存', description: `Base URL：${baseError}`, variant: 'error' })
+      return
+    }
+    void saveSection('data:predictfun', { venues: { predictfun: { data_source: { base_url: pfDraft.base_url } } } }, 'Predict.fun 接口已保存', '新的 API 地址已立即生效。')
+  }
+
+  const resetPfData = () => {
+    if (!system) return
+    const loaded = toPredictFunDraft(system)
+    setPfDraft((current) => (current ? { ...current, base_url: loaded.base_url } : current))
+    setDataDirty((current) => ({ ...current, predictfun: false }))
+  }
+
+  const resetPfLive = () => {
+    if (!system) return
+    const loaded = toPredictFunDraft(system)
+    setPfDraft((current) => (current ? {
+      ...current,
+      testnet: loaded.testnet,
+      api_key: '',
+      private_key: '',
+      smart_wallet: '',
+      api_key_configured: loaded.api_key_configured,
+      private_key_configured: loaded.private_key_configured,
+      smart_wallet_configured: loaded.smart_wallet_configured,
+    } : current))
+    setLiveDirty((current) => ({ ...current, predictfun: false }))
+  }
+
+  const savePfLive = () => {
+    if (!pfDraft) return
+    const key = pfDraft.private_key.trim()
+    if (key && !/^0x[0-9a-fA-F]{64}$/.test(key)) {
+      toast({ title: '实盘设置未保存', description: '私钥必须是 0x 开头的 64 位十六进制字符串。', variant: 'error' })
+      return
+    }
+    const wallet = pfDraft.smart_wallet.trim()
+    if (wallet && !/^0x[0-9a-fA-F]{40}$/.test(wallet)) {
+      toast({ title: '实盘设置未保存', description: 'Smart Wallet 必须是有效的 0x 地址（EOA 模式请留空）。', variant: 'error' })
+      return
+    }
+    // Empty strings keep the stored secret (MergeSecret semantics).
+    void saveSection('live:predictfun', {
+      venues: {
+        predictfun: {
+          live: {
+            api_key: pfDraft.api_key,
+            private_key: pfDraft.private_key,
+            smart_wallet: pfDraft.smart_wallet,
+            // Omitted when inherited, so saving an unrelated field cannot flip
+            // the deployment onto another chain.
+            ...(pfDraft.testnet === undefined ? {} : { testnet: pfDraft.testnet }),
+          },
+        },
+      },
+    }, '实盘设置已保存', 'Predict.fun 客户端已按新凭据重建。若状态未就绪，请查看运行状态中的错误提示。')
   }
 
   const testProxy = async () => {
@@ -823,13 +1329,19 @@ export function SystemView() {
   }
 
   const custom = proxyDraft?.mode === 'custom'
+  const tabs: TabItem<Venue>[] = VENUES.map((venue) => ({
+    value: venue,
+    label: venueLabel(venue),
+    hint: venueMeta(venue).currency,
+  }))
+  const pfCapability = capabilityOf('predictfun')
 
   return (
     <>
       <PageHeader
         eyebrow="SYSTEM & SECURITY"
         title="系统设置"
-        description="集中配置 Polymarket 接口地址、实盘交易凭据、网络出口代理与网页访问密码。大多数设置保存在本机 SQLite，修改后立即生效，无需重启服务。"
+        description="集中配置各场所的接口地址与实盘交易凭据、网络出口代理与网页访问密码。大多数设置保存在本机 SQLite，修改后立即生效，无需重启服务。"
         actions={<Button variant="secondary" size="sm" onClick={() => void load()} disabled={loading}><RotateCcw className="h-3.5 w-3.5" />重新读取</Button>}
       />
 
@@ -840,40 +1352,79 @@ export function SystemView() {
       ) : (
         <div className="space-y-4">
           {error && <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">重新读取失败，当前显示的是上一次数据：{error}</div>}
-          {system?.runtime.error && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-700"><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /><span>启动时应用已保存的系统设置失败：{system.runtime.error}。请检查接口、代理或实盘凭据后重新保存。</span></div>}
+          {system?.runtime.error && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-700"><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /><span>后端运行时提示：{system.runtime.error}。若这是启动设置错误，请检查接口、代理或实盘凭据后重新保存。</span></div>}
 
-          {system && dataDraft && (
-            <EndpointSection
-              system={system}
-              draft={dataDraft}
-              dirty={dataDirty}
-              saving={savingSection === 'data'}
-              busy={savingSection !== null}
-              onChange={updateData}
-              onDiscard={resetData}
-              onClear={clearData}
-              onSave={saveData}
-            />
-          )}
+          {system && <VenueRuntimeCard system={system} capabilityOf={capabilityOf} />}
 
-          {system && liveDraft && (
-            <LiveTradingSection
-              system={system}
-              draft={liveDraft}
-              dirty={liveDirty}
-              saving={savingSection === 'live'}
-              busy={savingSection !== null}
-              clobBaseURL={dataDraft?.clob_base_url ?? ''}
-              onChange={updateLive}
-              onReset={resetLive}
-              onSave={saveLive}
-            />
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <TabBar items={tabs} value={tab} onChange={setTab} label="场所" />
+            <p className="text-xs text-slate-500">接口地址与实盘凭据按场所分别保存；代理与访问密码为全局设置。</p>
+          </div>
+
+          <div role="tabpanel" aria-label={venueLabel(tab)} className="space-y-4">
+          {tab === 'polymarket' ? (
+            <>
+              {system && pmData && (
+                <EndpointSection
+                  system={system}
+                  draft={pmData}
+                  dirty={dataDirty.polymarket}
+                  saving={savingSection === 'data:polymarket'}
+                  busy={savingSection !== null}
+                  onChange={updateData}
+                  onDiscard={resetData}
+                  onClear={clearData}
+                  onSave={saveData}
+                />
+              )}
+              {system && pmLive && (
+                <LiveTradingSection
+                  system={system}
+                  draft={pmLive}
+                  dirty={liveDirty.polymarket}
+                  saving={savingSection === 'live:polymarket'}
+                  busy={savingSection !== null}
+                  clobBaseURL={pmData?.clob_base_url ?? ''}
+                  onChange={updateLive}
+                  onReset={resetLive}
+                  onSave={saveLive}
+                />
+              )}
+            </>
+          ) : (
+            system && pfDraft && (
+              <>
+                <PredictFunEndpointSection
+                  draft={pfDraft}
+                  dirty={dataDirty.predictfun}
+                  saving={savingSection === 'data:predictfun'}
+                  busy={savingSection !== null}
+                  runtime={venueRuntime(system, 'predictfun')}
+                  onChange={updatePfData}
+                  onDiscard={resetPfData}
+                  onSave={savePfData}
+                />
+                <PredictFunLiveSection
+                  draft={pfDraft}
+                  dirty={liveDirty.predictfun}
+                  saving={savingSection === 'live:predictfun'}
+                  busy={savingSection !== null}
+                  runtime={venueRuntime(system, 'predictfun')}
+                  baseURL={pfDraft.base_url}
+                  settlementSupported={pfCapability?.supports_settlement ?? false}
+                  onChange={updatePfLive}
+                  onReset={resetPfLive}
+                  onSave={savePfLive}
+                />
+              </>
+            )
           )}
+          </div>
 
           <Section
             icon={Globe2}
             title="网络出口代理"
-            description="行情（Gamma）与实盘（CLOB）请求共用同一出口。修改后新的请求立即使用新代理。"
+            description="所有场所的行情与交易请求共用同一出口。修改后新的请求立即使用新代理。"
             actions={<Badge variant={custom ? 'info' : proxyDraft?.mode === 'off' ? 'warning' : 'default'}>{proxyDraft ? modeLabels[proxyDraft.mode] : '—'}</Badge>}
           >
             {proxyDraft && (
@@ -949,7 +1500,7 @@ export function SystemView() {
                           {testResult ? (testResult.ok ? `连接正常 · ${testResult.latency_ms.toFixed(0)} ms · HTTP ${testResult.status_code ?? '—'}` : '连接失败') : '连接测试'}
                         </p>
                         <p className="mt-0.5 break-words">
-                          {testResult ? (testResult.error || `已通过代理访问 ${testResult.target}`) : `使用当前表单中的配置访问 ${system?.proxy_probe_url || 'Polymarket CLOB'}，不会保存设置。`}
+                          {testResult ? (testResult.error || `已通过代理访问 ${testResult.target}`) : `使用当前表单中的配置访问 ${system?.proxy_probe_url || '行情接口'}（所有场所共用该出口），不会保存设置。`}
                         </p>
                       </div>
                     </div>
@@ -975,7 +1526,7 @@ export function SystemView() {
 
           <div className="flex items-start gap-2 text-xs leading-5 text-slate-400">
             <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <p>访问密码只保护网页与 API；实盘私钥与 L2 Secret 以 AES-GCM 加密保存在本机 SQLite，读取时只返回掩码。监听地址、数据库路径与前端静态目录仍属于启动参数，修改后需要重启服务。</p>
+            <p>访问密码只保护网页与 API；各场所的实盘私钥与密钥以 AES-GCM 加密保存在本机 SQLite，读取时只返回掩码或「已配置」标记。监听地址、数据库路径与前端静态目录仍属于启动参数，修改后需要重启服务。</p>
           </div>
         </div>
       )}

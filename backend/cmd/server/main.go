@@ -17,7 +17,9 @@ import (
 	"pennyharvester/backend/internal/live"
 	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
+	"pennyharvester/backend/internal/predictfun"
 	"pennyharvester/backend/internal/store"
+	"pennyharvester/backend/internal/venue"
 )
 
 func main() {
@@ -67,7 +69,7 @@ func run() error {
 		BuilderCode:   config.BuilderCode,
 		Proxy:         proxyManager,
 	})
-	strategyEngine, err := engine.New(ctx, repository, provider, liveExecutor, proxyManager)
+	strategyEngine, err := engine.New(ctx, repository, buildVenues(cfg, proxyManager, provider, liveExecutor), proxyManager)
 	if err != nil {
 		return err
 	}
@@ -94,11 +96,45 @@ func run() error {
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
-	log.Printf("PennyHarvester listening on http://%s | source=%s | proxy=%s | access_password=%t | default=LIVE | live_configured=%t",
-		cfg.Addr, cfg.GammaBaseURL, proxyManager.Config().Mode, passwordProtected, liveExecutor.Configured())
+	log.Printf("PennyHarvester listening on http://%s | source=%s | venues=%d | proxy=%s | access_password=%t | default=LIVE | live_configured=%t pf_enabled=%t",
+		cfg.Addr, cfg.GammaBaseURL, len(strategyEngine.Venues()), proxyManager.Config().Mode, passwordProtected, liveExecutor.Configured(), cfg.PredictFunEnabled)
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
+}
+
+// buildVenues registers every venue this process can serve. Polymarket is
+// always registered: its paper accounts must keep working without credentials,
+// and its live executor reports itself as unconfigured when it is. Predict.fun
+// is opt-in, so a half-filled BSC block can never start trading by accident.
+func buildVenues(cfg config.Config, proxyManager *netproxy.Manager, provider *market.GammaClient, liveExecutor *live.Executor) *venue.Registry {
+	registry := venue.NewRegistry()
+	if err := registry.Register(venue.PolymarketCapabilities(), provider, liveExecutor); err != nil {
+		log.Printf("跳过 Polymarket 场所注册: %v", err)
+	}
+	if !cfg.PredictFunEnabled {
+		return registry
+	}
+	pfConfig := predictfun.Config{
+		BaseURL:    cfg.PredictFunBaseURL,
+		APIKey:     cfg.PredictFunAPIKey,
+		PrivateKey: cfg.PredictFunPrivateKey,
+		Maker:      cfg.PredictFunSmartWallet,
+		Testnet:    cfg.PredictFunTestnet,
+		Proxy:      proxyManager,
+		RPCURL:     cfg.PredictFunRPC,
+	}
+	pfProvider, pfExecutor, err := predictfun.New(pfConfig)
+	if err != nil {
+		// A bad key or endpoint must not take the whole process down; the
+		// system page surfaces the venue as missing until it is fixed.
+		log.Printf("Predict.fun 场所初始化失败，已跳过: %v", err)
+		return registry
+	}
+	if err := registry.Register(predictfun.Capabilities(pfConfig), pfProvider, pfExecutor); err != nil {
+		log.Printf("跳过 Predict.fun 场所注册: %v", err)
+	}
+	return registry
 }

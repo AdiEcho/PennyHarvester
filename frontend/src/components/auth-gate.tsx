@@ -81,7 +81,7 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
           </div>
           <div>
             <div className="text-[15px] font-semibold tracking-[-0.02em] text-white">PennyHarvester</div>
-            <div className="mt-0.5 text-[11px] tracking-wide text-slate-400">Polymarket 尾盘策略工作台</div>
+            <div className="mt-0.5 text-[11px] tracking-wide text-slate-400">多场所尾盘策略工作台</div>
           </div>
         </div>
 
