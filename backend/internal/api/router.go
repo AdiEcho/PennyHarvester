@@ -57,6 +57,7 @@ func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Auth
 		protected.POST("/system/live/test", h.testLive)
 		protected.GET("/system/live/approval", h.venueApproval)
 		protected.POST("/system/live/approve", h.approveVenue)
+		protected.POST("/accounts/:id/positions/:positionId/redeem", h.redeemPosition)
 		protected.POST("/system/relayer/test", h.testRelayer)
 		protected.POST("/system/live/funder", h.discoverFunder)
 		protected.POST("/engine/toggle", h.toggleEngine)

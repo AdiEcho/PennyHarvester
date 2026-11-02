@@ -15,12 +15,23 @@ export interface VenueCapabilities {
   max_slippage_bps: number
   supports_cancel: boolean
   supports_settlement: boolean
+  // supports_redeem is true when settled shares can be burned back into
+  // collateral on chain. Polymarket claims through its own UI, so it is false.
+  supports_redeem: boolean
   read_only: boolean
   testnet: boolean
 }
 
 export interface VenuesResponse {
   venues: VenueCapabilities[]
+}
+
+// VenueRedemption is the response of POST /accounts/:id/positions/:positionId/redeem.
+// tx_hash is the only durable handle: the transaction is already on chain.
+export interface VenueRedemption {
+  venue: Venue
+  tx_hash: string
+  method: string
 }
 
 export interface Account {
@@ -255,6 +266,8 @@ export interface OrdersResponse {
 // nor traded.
 export interface VenueSettings {
   enabled: boolean
+  /** 0 / omitted = inherit the global min_liquidity. */
+  min_liquidity: number
   order_size: number
   max_position: number
   max_exposure: number

@@ -138,8 +138,10 @@ func (e *Engine) capabilities(v market.Venue) (venue.Capabilities, bool) {
 }
 
 // supportsSettlement reports whether the engine may settle this venue's
-// positions from reference data. Predict.fun has no resolution feed this build
-// understands, so its positions must stay open instead of being guessed closed.
+// positions from reference data. Polymarket resolves through its own API;
+// Predict.fun publishes the winning outcome, which the provider maps onto a 1/0
+// payout. A venue without such a feed keeps its positions open instead of being
+// guessed closed from another exchange's prices.
 func (e *Engine) supportsSettlement(v market.Venue) bool {
 	caps, ok := e.capabilities(v)
 	if !ok {
@@ -407,6 +409,118 @@ func (e *Engine) ApproveVenue(ctx context.Context, v market.Venue) (venue.Approv
 		return venue.Approval{}, fmt.Errorf("%w: %s 链上授权失败: %v", ErrUpstream, label, err)
 	}
 	return approval, nil
+}
+
+// RedeemPosition burns a settled position's shares back into collateral. The
+// engine records the attempt before the transaction is sent, so a crash between
+// signing and the receipt still leaves an auditable order row, and it refuses a
+// second redemption of the same position: the transaction costs gas and a
+// duplicate would revert on chain after being paid for.
+func (e *Engine) RedeemPosition(ctx context.Context, accountID, positionID int64) (venue.RedeemResult, error) {
+	account, err := e.repo.AccountByID(ctx, accountID)
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	// A simulated position exists only in this database; there are no on-chain
+	// shares to burn, so a redemption would cost gas to burn nothing.
+	if account.Mode != AccountModeLive {
+		return venue.RedeemResult{}, fmt.Errorf("%w: 模拟账户的仓位没有链上份额，无需赎回", ErrInvalidOrder)
+	}
+	positions, err := e.repo.ListPositions(ctx, accountID, "", "")
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	var position Position
+	found := false
+	for _, candidate := range positions {
+		if candidate.ID == positionID {
+			position, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		return venue.RedeemResult{}, fmt.Errorf("%w: 仓位 %d 不存在", ErrNotFound, positionID)
+	}
+	switch position.Status {
+	case "won", "lost", "split":
+	default:
+		return venue.RedeemResult{}, fmt.Errorf("%w: 只有已结算的仓位可以赎回（当前状态 %s）", ErrInvalidOrder, position.Status)
+	}
+	v := position.EffectiveVenue()
+	label := v.Label()
+	caps, ok := e.capabilities(v)
+	if !ok || !caps.SupportsRedeem {
+		return venue.RedeemResult{}, fmt.Errorf("%w: %s 不支持链上赎回", ErrVenueReadOnly, label)
+	}
+	exec, err := e.executor(v)
+	if err != nil {
+		return venue.RedeemResult{}, fmt.Errorf("%w: %s 只读运行，无法赎回", ErrVenueReadOnly, label)
+	}
+	redeemer, ok := exec.(venue.Redeemer)
+	if !ok || redeemer == nil {
+		return venue.RedeemResult{}, fmt.Errorf("%w: %s 不支持链上赎回", ErrVenueReadOnly, label)
+	}
+	if !exec.Configured() {
+		return venue.RedeemResult{}, fmt.Errorf("%w: %s 未配置实盘凭据，无法赎回", ErrVenueNotConfigured, label)
+	}
+	// A redemption already on its way must not be re-sent: the second
+	// transaction would burn nothing and still cost gas. This scans the account's
+	// recent order book for the venue; the chain stays the real authority, since
+	// redeeming burned shares is a no-op rather than a double payment.
+	orders, err := e.repo.ListOrders(ctx, accountID, "", 500, 0, v)
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	for _, order := range orders {
+		// The orders table checks type in ('buy','settle'); a redemption is
+		// bookkeeping on a settled position, so it is stored as a settle action
+		// named "redeem" rather than as a new row type that would force a table
+		// rebuild on every existing database.
+		if order.Type != "settle" || order.Action != "redeem" || order.PositionID == nil || *order.PositionID != position.ID {
+			continue
+		}
+		if order.Status == "pending" || order.Status == "filled" {
+			return venue.RedeemResult{}, fmt.Errorf("%w: 该仓位已经提交过赎回（工单 %d）", ErrInvalidOrder, order.ID)
+		}
+	}
+	intent, err := e.repo.CreateOrder(ctx, Order{
+		AccountID: accountID, Venue: v, Currency: position.EffectiveCurrency(),
+		PositionID: &position.ID, MarketID: position.MarketID,
+		Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
+		Kind: position.Kind, Type: "settle", Action: "redeem",
+		Price: position.CurrentPrice, Shares: position.Shares, Amount: position.Shares,
+		Status: "pending", Reason: "链上赎回已提交，等待交易回执",
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	// Approving and ordering both mutate chain state for the same wallet, so a
+	// redemption takes the same lock as an order.
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	result, err := redeemer.Redeem(ctx, venue.RedeemRequest{
+		ConditionID: position.ConditionID,
+		TokenID:     position.TokenID,
+		Shares:      position.Shares,
+	})
+	if err != nil {
+		_ = e.repo.MarkOrderStatus(ctx, intent.ID, "rejected", clampReason(err.Error()))
+		return venue.RedeemResult{}, fmt.Errorf("%w: %s 赎回失败: %v", ErrUpstream, label, err)
+	}
+	_ = e.repo.MarkOrderStatus(ctx, intent.ID, "filled", "链上赎回交易已提交 "+result.TxHash)
+	return result, nil
+}
+
+// clampReason bounds an error string before it becomes an order reason. The
+// order table renders reasons inline, and an RPC dump would make the row
+// unreadable; the full error is returned to the caller either way.
+func clampReason(reason string) string {
+	const limit = 300
+	if len(reason) <= limit {
+		return reason
+	}
+	return reason[:limit] + "…"
 }
 
 // approver resolves the venue's approval capability, explaining the two cases in

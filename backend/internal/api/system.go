@@ -269,6 +269,50 @@ func (h *Handler) approveVenue(c *gin.Context) {
 // approvalErrorStatus maps the engine's sentinel errors onto HTTP statuses: a
 // read-only venue or a proxy-traded one is a client error, everything else came
 // from the chain.
+// redeemPosition burns a settled position's shares back into collateral. It is
+// the only endpoint that sends a transaction whose purpose is to receive money,
+// so it waits for the receipt inside the request instead of answering early.
+func (h *Handler) redeemPosition(c *gin.Context) {
+	accountID, ok := parseID(c, "id")
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "账户 ID 无效"})
+		return
+	}
+	positionID, ok := parseID(c, "positionId")
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "仓位 ID 无效"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	defer cancel()
+	result, err := h.engine.RedeemPosition(ctx, accountID, positionID)
+	if err != nil {
+		c.JSON(redeemErrorStatus(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"venue":   effectiveVenueLabel(result.Venue),
+		"tx_hash": result.TxHash,
+		"method":  result.Method,
+	})
+}
+
+// redeemErrorStatus separates "this cannot work" (400/409) from "the chain or
+// the RPC failed" (502), so a retry decision can be made from the status alone.
+func redeemErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, engine.ErrAccountNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrNotFound):
+		return http.StatusBadRequest
+	case errors.Is(err, engine.ErrVenueReadOnly), errors.Is(err, engine.ErrNoApproval),
+		errors.Is(err, engine.ErrVenueNotConfigured), errors.Is(err, engine.ErrInvalidSettings):
+		return http.StatusConflict
+	default:
+		return http.StatusBadGateway
+	}
+}
+
 func approvalErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, engine.ErrVenueReadOnly), errors.Is(err, engine.ErrNoApproval),

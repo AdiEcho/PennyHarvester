@@ -35,7 +35,8 @@
 - **币种与精度分离**。Polymarket 结算币为 USDC（6 位小数），Predict.fun 为 USDT（18 位小数）；Predict.fun 的下单金额在内部以 `big.Int` 按最小单位（wei）计算，绝不经过 `float64`，并根据市场 `decimalPrecision` 向下量化价位。
 - **费用模型按场所分派**。Polymarket 沿用历史口径 `费率 × 名义额`；Predict.fun 按官方公式 `费率 × min(价格, 1 − 价格) × 份额`，因此低价盘口的真实成本远低于名义额比例。
 - **风控按场所独立**。除全局参数外，每个场所可单独设置开关、单笔金额、单账户最大持仓、场所总敞口与费率；留空即继承全局值。
-- **Predict.fun 当前支持**：只读行情与报价（无需任何凭据）、限价/市价买入、持仓与余额查询、按币种计价的手续费与收益测算、测试网（`PREDICTFUN_TESTNET=1`）。**暂不支持**：链上结算/赎回（`supports_settlement=false`，到期市场不会被自动结算，仓位保持未平仓并在「系统设置」运行时提示）、代理钱包签名（当前要求 EOA 私钥与 maker 一致）、自动授权（首次交易前需显式调用授权，见下文）。
+- **Predict.fun 当前支持**：只读行情与报价（无需任何凭据）、限价/市价买入、持仓与余额查询、按币种计价的手续费与收益测算、**自动结算**（Predict.fun 公布获胜结果后，引擎把胜方记 1.00、负方记 0.00、平局记 0.50 并关账）、**链上赎回**（对已结算仓位提交 `redeemPositions` 交易取回 USDT，见下文）、测试网（`PREDICTFUN_TESTNET=1`）。
+- **Predict.fun 暂不支持**：代理钱包签名（当前要求 EOA 私钥与 maker 一致；Kernel 域包装的签名格式已有调研记录但未实现）、链上合并/转换（`merge`/`convert`）、WebSocket 盘口订阅（走轮询）。赎回由本系统**代发交易**，签名地址必须有 BNB 支付 gas；neg-risk 市场的赎回还需要先在「系统设置 → Predict.fun」执行一次链上授权（授权 NegRiskAdapter 划转结果份额）。
 - **合约与签名**：Predict.fun 订单使用 EIP-712（域名为 `predict.fun CTF Exchange`，链 ID 56 / 测试网 97），合约地址由官方 SDK 的 `Constants.ts` 生成到 `backend/internal/predictfun/addresses.go`（**生成文件，请勿手改**）。首次实盘前需要为交易所合约授权 USDT 与 ERC1155（`EnsureApprovals`，当前通过代码/接口触发，不静默自动授权）。
 
 ---
@@ -362,7 +363,8 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/venues` | 获取已注册场所的能力声明（`currency`、`quote_decimals`、`min_notional`、`order_types`、`supports_settlement`、`testnet`、`read_only`），前端据此决定币种符号、精度与是否显示结算相关文案 |
+| `GET` | `/venues` | 获取已注册场所的能力声明（`currency`、`quote_decimals`、`min_notional`、`order_types`、`supports_settlement`、`supports_redeem`、`testnet`、`read_only`），前端据此决定币种符号、精度与是否显示结算/赎回相关文案 |
+| `POST` | `/accounts/:id/positions/:positionId/redeem` | 对已结算仓位提交链上赎回交易（当前仅 Predict.fun），返回 `{venue, tx_hash, method}` |
 | `GET` | `/health` | 服务健康检查、默认账户模式、实盘配置与就绪状态 |
 | `GET` | `/accounts` | 获取所有账户列表（含实盘就绪状态、`signer` 与 `maker` 地址） |
 | `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper","venue":"predictfun"}`（`venue` 省略时默认为 `polymarket`，创建后不可更改） |

@@ -84,6 +84,11 @@ type ApprovalState struct {
 	ExchangeApproved bool
 	// NegRiskApproved is ConditionalTokens.isApprovedForAll(signer, NegRiskExchange).
 	NegRiskApproved bool
+	// AdapterApproved is ConditionalTokens.isApprovedForAll(signer, NegRiskAdapter).
+	// A neg-risk redemption is executed by the adapter, which burns the signer's
+	// shares and therefore needs this operator approval. It gates redemption
+	// only: trading works without it, so Ready (the trading check) ignores it.
+	AdapterApproved bool
 }
 
 // CollateralAllowance returns the larger of the two USDT allowances. The two
@@ -110,6 +115,13 @@ func (s ApprovalState) CollateralAllowance() *big.Int {
 // reach the exchange and fail there.
 func (s ApprovalState) SharesApproved() bool {
 	return s.ExchangeApproved && s.NegRiskApproved
+}
+
+// RedemptionApproved reports whether a neg-risk redemption may be attempted. The
+// plain CTF path needs no approval at all, so a false value only blocks the
+// markets the adapter settles.
+func (s ApprovalState) RedemptionApproved() bool {
+	return s.NegRiskApproved && s.AdapterApproved
 }
 
 // Ready reports whether the state can support an order needing at least
@@ -244,6 +256,15 @@ func (o *OnChain) Allowance(ctx context.Context) (ApprovalState, error) {
 		return state, fmt.Errorf("读取 ConditionalTokens 授权状态失败: %w", err)
 	}
 
+	data, err = encodeApprovedForAll(signer, common.HexToAddress(o.settings.addr.NegRiskAdapter))
+	if err != nil {
+		return state, fmt.Errorf("读取 ConditionalTokens 授权状态失败: %w", err)
+	}
+	state.AdapterApproved, err = readBool(ctx, client, conditionalTokens, data)
+	if err != nil {
+		return state, fmt.Errorf("读取 ConditionalTokens 授权状态失败: %w", err)
+	}
+
 	return state, nil
 }
 
@@ -275,18 +296,29 @@ func (o *OnChain) EnsureApprovals(ctx context.Context) error {
 		address   common.Address
 		allowance *big.Int
 		approved  bool
+		// collateral marks the operators that pull USDT for an order. The
+		// neg-risk adapter only burns shares during a redemption, so granting it
+		// a USDT allowance would widen the approval surface for nothing.
+		collateral bool
 	}{
 		{
-			name:      "Exchange",
-			address:   common.HexToAddress(o.settings.addr.Exchange),
-			allowance: state.ExchangeAllowance,
-			approved:  state.ExchangeApproved,
+			name:       "Exchange",
+			address:    common.HexToAddress(o.settings.addr.Exchange),
+			allowance:  state.ExchangeAllowance,
+			approved:   state.ExchangeApproved,
+			collateral: true,
 		},
 		{
-			name:      "NegRiskExchange",
-			address:   common.HexToAddress(o.settings.addr.NegRiskExchange),
-			allowance: state.NegRiskAllowance,
-			approved:  state.NegRiskApproved,
+			name:       "NegRiskExchange",
+			address:    common.HexToAddress(o.settings.addr.NegRiskExchange),
+			allowance:  state.NegRiskAllowance,
+			approved:   state.NegRiskApproved,
+			collateral: true,
+		},
+		{
+			name:     "NegRiskAdapter",
+			address:  common.HexToAddress(o.settings.addr.NegRiskAdapter),
+			approved: state.AdapterApproved,
 		},
 	}
 
@@ -296,7 +328,7 @@ func (o *OnChain) EnsureApprovals(ctx context.Context) error {
 		if allowance == nil {
 			allowance = new(big.Int)
 		}
-		if allowance.Cmp(minimumAllowance) < 0 {
+		if operator.collateral && allowance.Cmp(minimumAllowance) < 0 {
 			data, encodeErr := encodeApprove(operator.address, maxUint256)
 			if encodeErr != nil {
 				return encodeErr
@@ -370,14 +402,27 @@ type approvalCall struct {
 	to     common.Address
 	data   []byte
 	action string
+	// gasLimitFallback replaces approvalGasLimitFallback for calls whose gas
+	// use differs from an approval (a CTF redemption costs several times more).
+	gasLimitFallback uint64
 }
 
 // sendApproval estimates, signs, sends and waits for one approval transaction.
-// It never logs or returns the private key; the transaction hash is safe to
-// report and is included in receipt failures.
 func (o *OnChain) sendApproval(ctx context.Context, client *ethclient.Client, nonce uint64, gasPrice *big.Int, call approvalCall) error {
+	_, err := o.sendCall(ctx, client, nonce, gasPrice, call)
+	return err
+}
+
+// sendCall estimates, signs, sends and waits for one transaction, returning its
+// hash. It never logs or returns the private key; the transaction hash is safe to
+// report and is included in receipt failures.
+func (o *OnChain) sendCall(ctx context.Context, client *ethclient.Client, nonce uint64, gasPrice *big.Int, call approvalCall) (common.Hash, error) {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("发送 %s 交易已取消: %w", call.action, err)
+		return common.Hash{}, fmt.Errorf("发送 %s 交易已取消: %w", call.action, err)
+	}
+	fallback := call.gasLimitFallback
+	if fallback == 0 {
+		fallback = approvalGasLimitFallback
 	}
 
 	to := call.to
@@ -388,7 +433,7 @@ func (o *OnChain) sendApproval(ctx context.Context, client *ethclient.Client, no
 		Value: new(big.Int),
 	})
 	if err != nil || gasLimit == 0 {
-		gasLimit = approvalGasLimitFallback
+		gasLimit = fallback
 	} else {
 		// 20% headroom absorbs a small state change between estimate and
 		// inclusion (for example a cold allowance slot).
@@ -405,12 +450,15 @@ func (o *OnChain) sendApproval(ctx context.Context, client *ethclient.Client, no
 	})
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(o.settings.chainID)), o.settings.key)
 	if err != nil {
-		return fmt.Errorf("签名 %s 交易失败: %w", call.action, err)
+		return common.Hash{}, fmt.Errorf("签名 %s 交易失败: %w", call.action, err)
 	}
 	if err := client.SendTransaction(ctx, signed); err != nil {
-		return fmt.Errorf("发送 %s 交易失败: %w", call.action, err)
+		return common.Hash{}, fmt.Errorf("发送 %s 交易失败: %w", call.action, err)
 	}
-	return o.waitForReceipt(ctx, client, signed.Hash())
+	if err := o.waitForReceipt(ctx, client, signed.Hash()); err != nil {
+		return signed.Hash(), err
+	}
+	return signed.Hash(), nil
 }
 
 // waitForReceipt polls for a receipt every two seconds for at most three

@@ -392,6 +392,39 @@ func (p *Provider) mapMarket(ctx context.Context, raw Market, now time.Time, max
 		// so Slug and LinkURL stay empty rather than inventing a URL.
 	}
 
+	// Settlement. The engine closes a position only when the market snapshot
+	// reports a terminal market *and* a price it can trust, so the mapping has
+	// to be explicit: overwrite the indicative mids with the published payout
+	// when a winner is known, and refuse to look resolved when it is not.
+	if winner, draw, ok := winningOutcome(raw); ok {
+		for i := range item.Outcomes {
+			item.Outcomes[i].Price = 0
+		}
+		switch {
+		case draw:
+			// A draw pays 0.50 per share (both outcomes tagged WON on chain with
+			// payoutDenominator 2). Treating the first WON as "the winner" would
+			// book a full 1.00 payout for one side and 0.00 for the other.
+			for i := range item.Outcomes {
+				item.Outcomes[i].Price = 0.5
+			}
+		case winner < len(item.Outcomes):
+			item.Outcomes[winner].Price = 1
+		}
+		item.Active = false
+		item.Closed = true
+		item.ResolutionStatus = resolutionResolved
+	} else if item.Closed || raw.Resolution != nil {
+		// Closed but no published winner (or a resolution lifecycle the venue has
+		// not finished): keep the market out of the radar but never let the
+		// engine settle on stale trade prices.
+		item.Active = false
+		item.Closed = true
+		if item.ResolutionStatus == "" {
+			item.ResolutionStatus = resolutionPending
+		}
+	}
+
 	meta := marketMeta{
 		MarketID:     item.ID,
 		ConditionID:  item.ConditionID,
@@ -692,4 +725,72 @@ func humanizeCategory(slug string) string {
 		words[index] = strings.ToUpper(string(runes[0])) + string(runes[1:])
 	}
 	return strings.Join(words, " ")
+}
+
+// resolutionResolved and resolutionPending are the two terminal states this
+// build reports. market.Market.finalResolutionData accepts only an empty status
+// or "resolved", so "pending" is what keeps a closed-but-unsettled market from
+// being settled on its last trade price.
+const (
+	resolutionResolved = "resolved"
+	resolutionPending  = "pending"
+	// outcomeWon / outcomeLost are the per-outcome verdicts the API publishes
+	// once a market settles.
+	outcomeWon  = "WON"
+	outcomeLost = "LOST"
+)
+
+// winningOutcome returns the index of the outcome the venue declared the winner.
+// The verdict is read from `resolution` and cross-checked against the per-outcome
+// status tags; when neither is present the market is not settled yet and a caller
+// must not guess from prices.
+// winningOutcome resolves the venue's verdict. draw is true when more than one
+// outcome is tagged WON, which is how a 50/50 draw is published (market 1388:
+// payoutDenominator 2, payoutNumerators [1,1]).
+//
+// The resolution object repeats the winning outcome verbatim, so matching by
+// index set is exact. Fall back to the token id, then to the WON tags: a settled
+// market that reports its verdict in only one of the three shapes must still
+// settle.
+func winningOutcome(raw Market) (index int, draw bool, ok bool) {
+	if raw.Resolution != nil {
+		if want, err := raw.Resolution.IndexSet.Int64(); err == nil && want > 0 {
+			for i, outcome := range raw.Outcomes {
+				if indexSet, err := outcome.IndexSet.Int64(); err == nil && indexSet == want {
+					return i, countWinners(raw.Outcomes) > 1, true
+				}
+			}
+		}
+		if winner := strings.TrimSpace(raw.Resolution.OnChainID); winner != "" {
+			for i, outcome := range raw.Outcomes {
+				if strings.TrimSpace(outcome.OnChainID) == winner {
+					return i, countWinners(raw.Outcomes) > 1, true
+				}
+			}
+		}
+	}
+	winners := countWinners(raw.Outcomes)
+	switch {
+	case winners == 0:
+		return 0, false, false
+	case winners > 1:
+		return 0, true, true
+	}
+	for i, outcome := range raw.Outcomes {
+		if strings.EqualFold(strings.TrimSpace(outcome.Status), outcomeWon) {
+			return i, false, true
+		}
+	}
+	return 0, false, false
+}
+
+// countWinners counts the outcomes tagged WON.
+func countWinners(outcomes []MarketOutcome) int {
+	winners := 0
+	for _, outcome := range outcomes {
+		if strings.EqualFold(strings.TrimSpace(outcome.Status), outcomeWon) {
+			winners++
+		}
+	}
+	return winners
 }

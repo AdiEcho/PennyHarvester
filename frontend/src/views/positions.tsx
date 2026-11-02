@@ -8,6 +8,7 @@ import type { Position, PositionStatus } from '@/types'
 import { formatDate, formatFullDate, formatNumber, formatPrice, pnlClass } from '@/lib/format'
 import { fmtMoney, settlementHintOf, venueMeta, venueOf } from '@/lib/venue'
 import { cn } from '@/lib/utils'
+import { useToast } from '@/components/toast'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { EmptyState, ErrorState, LoadingBlock } from '@/components/ui/feedback'
@@ -28,14 +29,27 @@ function positionPnl(position: Position) {
   return position.status === 'open' ? position.unrealized_pnl : position.realized_pnl
 }
 
-function PositionCard({ position, isLive }: { position: Position; isLive: boolean }) {
+function PositionCard({
+  position,
+  isLive,
+  canRedeem,
+  redeeming,
+  onRedeem,
+}: {
+  position: Position
+  isLive: boolean
+  canRedeem: boolean
+  redeeming: boolean
+  onRedeem: (position: Position) => void
+}) {
   const pnl = positionPnl(position)
   const venue = venueOf(position)
+  const redeemable = canRedeem && (position.status === 'won' || position.status === 'lost' || position.status === 'split')
   return (
     <Card className="p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0"><p className="flex flex-wrap items-center gap-1.5 text-xs text-slate-400"><VenueChip venue={venue} />{venueMeta(venue).label} {isLive ? '实盘头寸' : '模拟头寸'} #{position.id}</p><h3 className="mt-1.5 text-sm font-medium leading-6 text-slate-900">{position.question}</h3></div>
-        <PositionStatusBadge status={position.status} exitKind={position.exit_kind} />
+        <div className="flex shrink-0 flex-col items-end gap-2"><PositionStatusBadge status={position.status} exitKind={position.exit_kind} />{redeemable && <Button variant="secondary" onClick={() => onRedeem(position)} disabled={redeeming}>{redeeming ? '赎回中…' : '赎回'}</Button>}</div>
       </div>
       <div className="mt-3 flex items-center gap-2 text-xs text-slate-500"><span className="rounded-md bg-blue-50 px-2 py-1 font-medium text-blue-700">{position.outcome}</span><span>{formatNumber(position.shares, 4)} 份</span><span>·</span><span>投入 {fmtMoney(position.cost, venue)}</span></div>
       <div className="mt-4 grid grid-cols-3 gap-3 border-t border-slate-100 pt-4">
@@ -56,7 +70,7 @@ export function PositionsView() {
   const { account, accountId, isLoading: accountLoading } = useAccount()
   const isLive = account?.mode === 'live'
   const accountVenue = venueOf(account)
-  const { venues } = useVenues()
+  const { venues, capabilityOf } = useVenues()
   const { scope, scopeRef, setScope } = useVenueScope(venues)
   // Stable fetcher (see usePolling): the venue lives in a ref, the scope change
   // triggers refresh() so the table keeps showing rows while the filtered page
@@ -66,6 +80,34 @@ export function PositionsView() {
     [accountId, status, scopeRef],
   )
   const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchPositions, { enabled: Boolean(accountId) })
+  const { toast } = useToast()
+  const [redeeming, setRedeeming] = useState<number | null>(null)
+  // Redemption is a live, on-chain action: a simulated position has no shares to
+  // burn, and each venue advertises whether it implements claiming at all.
+  const canRedeemVenue = useCallback(
+    (venue: ReturnType<typeof venueOf>) => Boolean(capabilityOf(venue)?.supports_redeem),
+    [capabilityOf],
+  )
+  const handleRedeem = useCallback(
+    async (position: Position) => {
+      if (!accountId) return
+      setRedeeming(position.id)
+      try {
+        const result = await api.redeemPosition(accountId, position.id)
+        toast({
+          title: '赎回交易已提交',
+          description: `交易 ${result.tx_hash}（${result.method}）。链上确认后抵押品会回到钱包，需自付 BNB gas。`,
+          variant: 'success',
+        })
+        refresh()
+      } catch (caught) {
+        toast({ title: '赎回失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+      } finally {
+        setRedeeming(null)
+      }
+    },
+    [accountId, refresh, toast],
+  )
   const lastScope = useRef<typeof scope>(scope)
   useEffect(() => {
     if (lastScope.current === scope) return
@@ -97,11 +139,21 @@ export function PositionsView() {
               <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>{data.items.map((position) => {
                 const pnl = positionPnl(position)
                 const venue = venueOf(position)
-                return <tr key={position.id} className="hover:bg-slate-50/60"><td className="max-w-[360px] px-5 py-4"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={position.question}>{position.question}</p><div className="mt-1.5 flex items-center gap-2 text-xs"><VenueChip venue={venue} /><span className="font-medium text-blue-700">{position.outcome}</span><span className="text-slate-300">·</span><span className="text-slate-400">#{position.id}</span></div></td><td className="px-4 py-4"><PositionStatusBadge status={position.status} exitKind={position.exit_kind} /></td><td className="px-4 py-4 text-right tabular-nums text-slate-700"><span>{formatPrice(position.entry_price)}</span><span className="mx-1.5 text-slate-300">→</span><span>{formatPrice(position.current_price)}</span></td><td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatNumber(position.shares, 4)}</td><td className="px-4 py-4 text-right"><p className="font-medium tabular-nums text-slate-800">{fmtMoney(position.cost, venue)}</p><p className="mt-1 text-[11px] text-slate-400">费用 {fmtMoney(position.fee, venue)}</p></td><td className="px-4 py-4 text-right"><p className={cn('font-semibold tabular-nums', pnlClass(pnl))}>{fmtMoney(pnl, venue, { signed: true })}</p><p className="mt-1 text-[11px] text-slate-400">{position.status === 'open' ? '未实现' : '已实现'}</p></td><td className="px-5 py-4 text-right text-xs text-slate-500"><p>{position.status === 'open' ? '开仓' : position.exit_kind === 'stop' ? '止损' : '结算'} {formatDate(position.status === 'open' ? position.opened_at : position.closed_at)}</p><p className="mt-1 text-[11px] text-slate-400" title={formatFullDate(position.end_date)}>收盘 {formatDate(position.end_date)}</p></td></tr>
+                const canRedeemRow = isLive && canRedeemVenue(venue) && (position.status === 'won' || position.status === 'lost' || position.status === 'split')
+                return <tr key={position.id} className="hover:bg-slate-50/60"><td className="max-w-[360px] px-5 py-4"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={position.question}>{position.question}</p><div className="mt-1.5 flex items-center gap-2 text-xs"><VenueChip venue={venue} /><span className="font-medium text-blue-700">{position.outcome}</span><span className="text-slate-300">·</span><span className="text-slate-400">#{position.id}</span></div></td><td className="px-4 py-4"><PositionStatusBadge status={position.status} exitKind={position.exit_kind} /></td><td className="px-4 py-4 text-right tabular-nums text-slate-700"><span>{formatPrice(position.entry_price)}</span><span className="mx-1.5 text-slate-300">→</span><span>{formatPrice(position.current_price)}</span></td><td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatNumber(position.shares, 4)}</td><td className="px-4 py-4 text-right"><p className="font-medium tabular-nums text-slate-800">{fmtMoney(position.cost, venue)}</p><p className="mt-1 text-[11px] text-slate-400">费用 {fmtMoney(position.fee, venue)}</p></td><td className="px-4 py-4 text-right"><p className={cn('font-semibold tabular-nums', pnlClass(pnl))}>{fmtMoney(pnl, venue, { signed: true })}</p><p className="mt-1 text-[11px] text-slate-400">{position.status === 'open' ? '未实现' : '已实现'}</p></td><td className="px-5 py-4 text-right text-xs text-slate-500"><p>{position.status === 'open' ? '开仓' : position.exit_kind === 'stop' ? '止损' : '结算'} {formatDate(position.status === 'open' ? position.opened_at : position.closed_at)}</p><p className="mt-1 text-[11px] text-slate-400" title={formatFullDate(position.end_date)}>收盘 {formatDate(position.end_date)}</p>{canRedeemRow && <Button className="mt-2" variant="secondary" onClick={() => handleRedeem(position)} disabled={redeeming === position.id}>{redeeming === position.id ? '赎回中…' : '赎回'}</Button>}</td></tr>
               })}</tbody>
             </table></div>
           </Card>
-          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{data.items.map((position) => <PositionCard key={position.id} position={position} isLive={isLive} />)}</div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{data.items.map((position) => (
+            <PositionCard
+              key={position.id}
+              position={position}
+              isLive={isLive}
+              canRedeem={canRedeemVenue(venueOf(position))}
+              redeeming={redeeming === position.id}
+              onRedeem={handleRedeem}
+            />
+          ))}</div>
         </>
       )}
     </>

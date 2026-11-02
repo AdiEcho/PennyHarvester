@@ -42,7 +42,7 @@ type NumericKey = typeof numericKeys[number]
 type SelectKey = typeof selectKeys[number]
 type SharedDraft = Record<NumericKey, string> & Record<SelectKey, string> & { stop_loss_enabled: boolean }
 
-const venueNumericKeys = ['order_size', 'max_position', 'max_exposure', 'fee_bps'] as const
+const venueNumericKeys = ['min_liquidity', 'order_size', 'max_position', 'max_exposure', 'fee_bps'] as const
 type VenueNumericKey = typeof venueNumericKeys[number]
 type VenueDraft = Record<VenueNumericKey, string> & { enabled: boolean }
 
@@ -80,6 +80,7 @@ function toVenueDraft(venue: Venue, value?: VenueSettings): VenueDraft {
   // keeps its platform default (Predict.fun stays disabled until enabled here).
   return {
     enabled: value?.enabled ?? venueMeta(venue).enabledByDefault,
+    min_liquidity: value?.min_liquidity ? String(value.min_liquidity) : '',
     order_size: value?.order_size ? String(value.order_size) : '',
     max_position: value?.max_position ? String(value.max_position) : '',
     max_exposure: value?.max_exposure ? String(value.max_exposure) : '',
@@ -154,8 +155,9 @@ function toPayload(base: Settings, draft: Draft): Settings {
     const loaded = base.venues?.[venue]
     const current = draft.venues[venue]
     venues[venue] = {
-      ...(loaded ?? { enabled: venueMeta(venue).enabledByDefault, order_size: 0, max_position: 0, max_exposure: 0, fee_bps: 0 }),
+      ...(loaded ?? { enabled: venueMeta(venue).enabledByDefault, min_liquidity: 0, order_size: 0, max_position: 0, max_exposure: 0, fee_bps: 0 }),
       enabled: current.enabled,
+      min_liquidity: numberOrZero(current.min_liquidity),
       order_size: numberOrZero(current.order_size),
       max_position: numberOrZero(current.max_position),
       max_exposure: numberOrZero(current.max_exposure),
@@ -216,6 +218,7 @@ function validate(draft: Draft): FieldErrors {
     if (maxPosition < orderSize) errors[key('max_position')] = `单市场持仓上限不能低于单笔金额（当前生效 ${orderSize}）。`
     if (maxExposure < maxPosition) errors[key('max_exposure')] = `总敞口上限不能低于单市场持仓上限（当前生效 ${maxPosition}）。`
     if ((current.fee_bps.trim() !== '' && (feeBps < 0 || feeBps > 1000)) || feeBps > 1000) errors[key('fee_bps')] = '费用范围为 0–1000 bps（0 表示继承全局值）。'
+    if (current.min_liquidity.trim() !== '' && numberOrZero(current.min_liquidity) < 0) errors[key('min_liquidity')] = '最低流动性不能小于 0。'
   }
   return errors
 }
@@ -495,12 +498,14 @@ function VenueSettingsSection({ venue, draft, shared, errors, onChange }: {
 }) {
   const meta = venueMeta(venue)
   const inherited = {
+    min_liquidity: Number(shared.min_liquidity),
     order_size: Number(shared.order_size),
     max_position: Number(shared.max_position),
     max_exposure: Number(shared.max_exposure),
     fee_bps: Number(shared.fee_bps),
   }
   const placeholder = (field: VenueNumericKey) => (Number.isFinite(inherited[field]) ? `继承全局 ${inherited[field]}` : '继承全局值')
+  const inheritLiquidity = Number.isFinite(inherited.min_liquidity) ? inherited.min_liquidity.toLocaleString() : '全局值'
   return (
     <SettingsSection
       icon={ShieldCheck}
@@ -522,6 +527,7 @@ function VenueSettingsSection({ venue, draft, shared, errors, onChange }: {
       </div>
 
       <div className="mt-6 grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
+        <NumberField id={`${venue}-min-liquidity`} label="最低流动性" description={venue === 'predictfun' ? `低于此值的市场不进入雷达。Predict.fun 的盘口深度通常远低于 Polymarket（实测 $90–$315k），建议设一个更低的门槛。留空继承全局值（当前 ${inheritLiquidity}）。` : `低于此值的市场不进入雷达。留空继承全局值（当前 ${inheritLiquidity}）。`} value={draft.min_liquidity} unit={meta.currency} min={0} placeholder={placeholder('min_liquidity')} error={errors[`${venue}.min_liquidity`]} onChange={(value) => onChange({ min_liquidity: value })} />
         <NumberField id={`${venue}-order-size`} label="单笔金额" description={`该场所每次自动买入的目标名义金额。雷达「真实收益」也按此金额报价。单位 ${meta.currency}。`} value={draft.order_size} unit={meta.currency} min={0} placeholder={placeholder('order_size')} error={errors[`${venue}.order_size`]} onChange={(value) => onChange({ order_size: value })} />
         <NumberField id={`${venue}-max-position`} label="单市场持仓上限" description={`不得低于该场所生效的单笔金额。单位 ${meta.currency}。`} value={draft.max_position} unit={meta.currency} min={0} placeholder={placeholder('max_position')} error={errors[`${venue}.max_position`]} onChange={(value) => onChange({ max_position: value })} />
         <NumberField id={`${venue}-max-exposure`} label="总敞口上限" description={`该场所全部未平仓头寸的风险预算上限，不得低于单市场上限。单位 ${meta.currency}，绝不与其他场所相加。`} value={draft.max_exposure} unit={meta.currency} min={0} placeholder={placeholder('max_exposure')} error={errors[`${venue}.max_exposure`]} onChange={(value) => onChange({ max_exposure: value })} />

@@ -33,6 +33,9 @@ function orderKindLabel(order: Order) {
 // Shared with the dashboard preview: a stop-loss sell (or any sell) is a sell,
 // never a settlement. Settlement orders are the only ones labelled 结算.
 export function orderTypeLabel(order: Pick<Order, 'type' | 'action'>, isLive: boolean) {
+  // A redemption is bookkeeping on a settled position (the engine stores it as a
+  // settle action named "redeem"), so it must not read as a second settlement.
+  if (order.action === 'redeem') return '链上赎回'
   if (order.action === 'stop') return isLive ? '实盘止损卖出' : '模拟止损卖出'
   if (order.action === 'sell' || order.type === 'sell') return isLive ? '实盘卖出' : '模拟卖出'
   if (order.type === 'buy') return isLive ? '实盘买入' : '模拟买入'

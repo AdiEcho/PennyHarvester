@@ -131,23 +131,28 @@ const FeeModelVersion = 2
 // inherits the matching global Settings field, so a payload written before
 // venues existed keeps behaving exactly as before.
 type VenueSettings struct {
-	Enabled     bool    `json:"enabled"`
-	OrderSize   float64 `json:"order_size"`
-	MaxPosition float64 `json:"max_position"`
-	MaxExposure float64 `json:"max_exposure"`
-	FeeBPS      float64 `json:"fee_bps"`
+	Enabled bool `json:"enabled"`
+	// MinLiquidity overrides the global floor for this venue. Predict.fun books
+	// are far thinner than Polymarket's, so one global number either hides every
+	// Predict.fun row or lets Polymarket noise through. Zero means "inherit".
+	MinLiquidity float64 `json:"min_liquidity"`
+	OrderSize    float64 `json:"order_size"`
+	MaxPosition  float64 `json:"max_position"`
+	MaxExposure  float64 `json:"max_exposure"`
+	FeeBPS       float64 `json:"fee_bps"`
 }
 
 // EffectiveSettings is one venue's settings after inheriting the global values.
 // Scan gates, sizing, exposure caps and the paper fee model all read this type,
 // which is what makes the caps per venue by construction.
 type EffectiveSettings struct {
-	Venue       market.Venue `json:"venue"`
-	Enabled     bool         `json:"enabled"`
-	OrderSize   float64      `json:"order_size"`
-	MaxPosition float64      `json:"max_position"`
-	MaxExposure float64      `json:"max_exposure"`
-	FeeBPS      float64      `json:"fee_bps"`
+	Venue        market.Venue `json:"venue"`
+	Enabled      bool         `json:"enabled"`
+	MinLiquidity float64      `json:"min_liquidity"`
+	OrderSize    float64      `json:"order_size"`
+	MaxPosition  float64      `json:"max_position"`
+	MaxExposure  float64      `json:"max_exposure"`
+	FeeBPS       float64      `json:"fee_bps"`
 }
 
 // defaultVenueEnabled is the upgrade-safe default: an existing installation
@@ -166,13 +171,17 @@ func (s Settings) For(v market.Venue) EffectiveSettings {
 	v = effectiveVenue(v)
 	effective := EffectiveSettings{
 		Venue: v, Enabled: defaultVenueEnabled(v),
-		OrderSize: s.OrderSize, MaxPosition: s.MaxPosition, MaxExposure: s.MaxExposure, FeeBPS: s.FeeBPS,
+		MinLiquidity: s.MinLiquidity,
+		OrderSize:    s.OrderSize, MaxPosition: s.MaxPosition, MaxExposure: s.MaxExposure, FeeBPS: s.FeeBPS,
 	}
 	override, ok := s.Venues[v]
 	if !ok {
 		return effective
 	}
 	effective.Enabled = override.Enabled
+	if override.MinLiquidity > 0 {
+		effective.MinLiquidity = override.MinLiquidity
+	}
 	if override.OrderSize > 0 {
 		effective.OrderSize = override.OrderSize
 	}
@@ -363,6 +372,9 @@ func (s Settings) Validate() error {
 		if effective.FeeBPS < 0 || effective.FeeBPS > 1000 ||
 			math.IsNaN(effective.FeeBPS) || math.IsInf(effective.FeeBPS, 0) {
 			return fmt.Errorf("%w: %s 的费率须为 0–1000 BPS", ErrInvalidSettings, label)
+		}
+		if effective.MinLiquidity < 0 || math.IsNaN(effective.MinLiquidity) || math.IsInf(effective.MinLiquidity, 0) {
+			return fmt.Errorf("%w: %s 的最低流动性不能小于 0", ErrInvalidSettings, label)
 		}
 	}
 	return nil
@@ -1297,7 +1309,10 @@ func findOpportunity(m market.Market, outcomeName, tokenID string, settings Sett
 	if !m.TradeReady() {
 		return Opportunity{}, fmt.Errorf("%w: 市场已暂停接受订单（acceptingOrders=false）", ErrInvalidOrder)
 	}
-	if len(m.Outcomes) != 2 || m.Liquidity < settings.MinLiquidity {
+	// The floor is per venue: a book that is thin by Polymarket standards is
+	// normal on Predict.fun, and one shared number would either hide every
+	// Predict.fun row or let Polymarket noise through.
+	if len(m.Outcomes) != 2 || m.Liquidity < settings.For(m.EffectiveVenue()).MinLiquidity {
 		return Opportunity{}, fmt.Errorf("%w: 非二元市场或流动性不足", ErrInvalidOrder)
 	}
 	if settings.MaxPriceChange24h > 0 && m.PriceChange24h != nil &&

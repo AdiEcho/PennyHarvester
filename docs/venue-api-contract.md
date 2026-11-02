@@ -26,13 +26,15 @@
   "max_slippage_bps": 100,
   "supports_cancel": false,
   "supports_settlement": true,
+  "supports_redeem": false,
   "read_only": false,
   "testnet": false
 } ] }
 ```
 
 - `read_only`：该场所只能只读扫描，不能下单。由注册状态决定：没有交易执行器的场所恒为 `true`（后端在注册时推导，不由调用方声明）。
-- `supports_settlement`：引擎能否用参考数据结算持仓。Predict.fun 为 `false` → 持仓保持 `open`，不会被猜着平掉。
+- `supports_settlement`：引擎能否用参考数据结算持仓。两个场所都为 `true`，但证据来源不同：Polymarket 走自己的 Gamma 解析结果，Predict.fun 把公布的获胜结果映射成 1/0（平局 0.5/0.5）。
+- `supports_redeem`：能否对已结算仓位提交链上赎回交易。只有 Predict.fun 为 `true`（Polymarket 是链上 CTF 仓位但本系统不做赎回，靠 Polymarket 自己的 UI/自动结算）；前端据此决定是否在已结算仓位上显示「赎回」按钮。
 - `quote_decimals`：抵押品小数位。前端**不需要**用它做运算，只用于文案提示（"18 位精度"）。
 - 顺序即展示顺序（Polymarket 在前）。
 
@@ -179,3 +181,39 @@ POST /api/v1/system/live/approve?venue=predictfun    # 发送缺失的授权交�
 - `POST` 是真实链上交易，钱包需要 BNB 支付 gas；它持有引擎的交易互斥锁，
   不会与签名中的订单交错。前端只在用户点击时调用，绝不自动触发。
 - 授权完成后无需重启：执行器在下次读取余额时拿到新的 allowance。
+
+## 10. 链上赎回（Predict.fun）
+
+```
+POST /api/v1/accounts/:id/positions/:positionId/redeem
+```
+
+无请求体。响应：
+
+```json
+{ "venue": "predictfun", "tx_hash": "0x…", "method": "ctf" }
+```
+
+`method` 为 `ctf`（普通市场，`CTF.redeemPositions`）或 `neg-risk`（neg-risk 市场，`NegRiskAdapter.redeemPositions`），只用于展示与排障。
+
+前置条件（全部由后端 `engine.RedeemPosition` 校验，前端只需要如实展示错误）：
+
+| 情况 | 状态码 | 错误文案 |
+| --- | --- | --- |
+|账户不存在|404|`账户不存在: …`|
+|模拟账户|400|`…模拟账户的仓位没有链上份额，无需赎回`|
+|仓位不属于该账户|400|`仓位不存在: …`|
+|仓位未结算（`open`）|400|`…只有已结算的仓位可以赎回（当前状态 open）`|
+|场所未声明 `supports_redeem`|409|`…<场所> 不支持链上赎回`|
+|场所无实盘执行器 / 未配置凭据|409|`…只读运行，无法执行链上赎回`|
+|同一仓位已提交过赎回|400|`…该仓位已经提交过赎回（工单 12）`|
+|BNB 余额不足 gas|502|`…赎回需要在 BSC 上支付 gas，但签名地址 0x… 的 BNB 余额不足（当前 0 wei），请先充值`|
+|neg-risk 未授权 NegRiskAdapter|502|`…neg-risk 市场赎回需要先授权 NegRiskAdapter 划转结果份额，请在「系统设置 → Predict.fun」执行链上授权`|
+
+行为约定：
+
+1. **先落库再签名**：赎回写一条 `type=settle`、`action=redeem` 的订单（`status=pending`，`reason` 里带工单号），交易提交后改为 `filled` 并把 `tx_hash` 写进 `reason`；失败改为 `rejected` 并写入链上错误。前端在订单列表里看到「链上赎回」。
+2. **幂等**：同一仓位只要存在 `pending`/`filled` 的赎回记录就拒绝重发（链上重复赎回只会烧 gas，所以这层只是省钱，不是防双付）。
+3. **串行化**：赎回与交易共用引擎的 `tradeMu`，不会与同一时刻的买入/止损交错。
+4. **不等待回执**：接口返回的是**已提交**的交易哈希。链上确认由 BNB 网络完成，钱包余额不会立刻变化；前端文案必须写"已提交"，不能写"已到账"。
+5. **不自动重试**：赎回失败不会自动重发（gas 与 nonce 的语义交给用户判断）。

@@ -115,6 +115,162 @@ func newProviderFixture(t *testing.T, clock *time.Time) (*Provider, *providerFix
 	return provider, fixture
 }
 
+// buildSettledJSON renders a terminal market using the exact shapes the live
+// API returns (verified 2026-11-02 over 56 settled markets): `status` is
+// RESOLVED, `tradingStatus` CLOSED, `resolution` repeats the winning outcome
+// with status WON, and `outcomes[]` carry status WON / LOST.
+//
+// winner 0 means "closed but no verdict yet": resolution is null and both
+// outcomes are still tagged OPEN.
+func buildSettledJSON(t *testing.T, id int, status, tradingStatus string, winner int) string {
+	t.Helper()
+	yes := map[string]any{
+		"name": "Yes", "indexSet": 1, "onChainId": "900", "positionId": "900",
+		"status": "OPEN", "bestBid": 0.97, "bestAsk": 0.98,
+	}
+	no := map[string]any{
+		"name": "No", "indexSet": 2, "onChainId": "901", "positionId": "901",
+		"status": "OPEN", "bestBid": 0.02, "bestAsk": 0.03,
+	}
+	var resolution any
+	switch winner {
+	case 1:
+		yes["status"] = "WON"
+		no["status"] = "LOST"
+		resolution = map[string]any{
+			"name": "Yes", "indexSet": 1, "onChainId": "900", "positionId": "900", "status": "WON",
+		}
+	case 2:
+		yes["status"] = "LOST"
+		no["status"] = "WON"
+		resolution = map[string]any{
+			"name": "No", "indexSet": 2, "onChainId": "901", "positionId": "901", "status": "WON",
+		}
+	case 3:
+		// Draw: both sides are tagged WON on chain with payoutNumerators [1,1]
+		// and payoutDenominator 2, so each share pays 0.50.
+		yes["status"] = "WON"
+		no["status"] = "WON"
+		resolution = map[string]any{
+			"name": "Yes", "indexSet": 1, "onChainId": "900", "positionId": "900", "status": "WON",
+		}
+	}
+	payload := map[string]any{
+		"id":               id,
+		"title":            fmt.Sprintf("Market %d", id),
+		"tradingStatus":    tradingStatus,
+		"status":           status,
+		"isVisible":        true,
+		"isNegRisk":        false,
+		"feeRateBps":       200,
+		"conditionId":      "0xsettled",
+		"categorySlug":     "crypto",
+		"decimalPrecision": 2,
+		"resolution":       resolution,
+		// The mids are deliberately decisive on the *wrong* side: a mapping that
+		// trusted them instead of the published verdict would settle the losing
+		// position as a win.
+		"outcomes": []map[string]any{yes, no},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("build settled json: %v", err)
+	}
+	return string(encoded)
+}
+
+func newSettledProvider(t *testing.T, clock time.Time, body string) *Provider {
+	t.Helper()
+	fixture := &providerFixture{
+		categoryCalls:  map[string]int{},
+		categoryEndsAt: map[string]string{"crypto": testEndsAt},
+		markets:        []string{body},
+	}
+	provider := NewProvider(newTestClient(t, fixture.handler()))
+	provider.now = func() time.Time { return clock }
+	return provider
+}
+
+func TestGetMapsPublishedWinnerOntoPayout(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	provider := newSettledProvider(t, clock, buildSettledJSON(t, 46, "RESOLVED", "CLOSED", 2))
+
+	item, err := provider.Get(context.Background(), "46")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !item.Closed || item.Active || item.ResolutionStatus != "resolved" {
+		t.Fatalf("terminal mapping = %+v", item)
+	}
+	if item.Outcomes[0].Price != 0 || item.Outcomes[1].Price != 1 {
+		t.Fatalf("payout must overwrite the mids, got %v/%v", item.Outcomes[0].Price, item.Outcomes[1].Price)
+	}
+	if price, resolved := item.SettlementPrice("901"); !resolved || price != 1 {
+		t.Fatalf("winner payout = %v/%v, want 1/true", price, resolved)
+	}
+	if price, resolved := item.SettlementPrice("900"); !resolved || price != 0 {
+		t.Fatalf("loser payout = %v/%v, want 0/true", price, resolved)
+	}
+}
+
+func TestGetSettlesFromOutcomeTagsWhenResolutionIsMissing(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	body := strings.Replace(
+		buildSettledJSON(t, 48, "RESOLVED", "CLOSED", 1),
+		`"resolution":{"indexSet":1,"name":"Yes","onChainId":"900","positionId":"900","status":"WON"}`,
+		`"resolution":null`, 1)
+	if !strings.Contains(body, `"resolution":null`) {
+		t.Fatalf("fixture did not drop the resolution object: %s", body)
+	}
+	provider := newSettledProvider(t, clock, body)
+	item, err := provider.Get(context.Background(), "48")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if item.ResolutionStatus != "resolved" || item.Outcomes[0].Price != 1 || item.Outcomes[1].Price != 0 {
+		t.Fatalf("the WON tag alone must settle market: %+v", item.Outcomes)
+	}
+}
+
+func TestGetMapsDrawToFiftyFifty(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	provider := newSettledProvider(t, clock, buildSettledJSON(t, 49, "RESOLVED", "CLOSED", 3))
+
+	item, err := provider.Get(context.Background(), "49")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if item.ResolutionStatus != "resolved" {
+		t.Fatalf("a draw is settled: %+v", item)
+	}
+	for _, outcome := range item.Outcomes {
+		if outcome.Price != 0.5 {
+			t.Fatalf("draw must pay 0.50 on both sides, got %+v", item.Outcomes)
+		}
+		price, resolved := item.SettlementPrice(outcome.TokenID)
+		if !resolved || price != 0.5 {
+			t.Fatalf("draw payout = %v/%v, want 0.5/true", price, resolved)
+		}
+	}
+}
+
+func TestGetRefusesToSettleClosedMarketWithoutWinner(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	provider := newSettledProvider(t, clock, buildSettledJSON(t, 47, "CLOSED", "CLOSED", 0))
+
+	item, err := provider.Get(context.Background(), "47")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !item.Closed || item.ResolutionStatus == "resolved" {
+		t.Fatalf("closed-but-unsettled must not look resolved: %+v", item)
+	}
+	// The deliberate 0.97/0.02 mids must not be mistaken for a settlement price.
+	if price, resolved := item.SettlementPrice("900"); resolved {
+		t.Fatalf("must not settle on stale mids, got %v", price)
+	}
+}
+
 func TestListOpenJoinsCategoryEndDateAndCaches(t *testing.T) {
 	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
 	provider, fixture := newProviderFixture(t, &clock)

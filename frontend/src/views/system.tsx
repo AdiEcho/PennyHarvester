@@ -903,6 +903,7 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
           <div className="flex justify-between gap-3 sm:block"><dt className="text-slate-500">Maker / Smart Wallet</dt><dd className="break-all font-mono text-[11px] text-slate-700">{runtime.maker || '—'}</dd></div>
         </dl>
         {!settlementSupported && <p className="mt-3 text-xs leading-5 text-amber-700">该场所暂不支持引擎结算（supports_settlement: false）：持仓到期后保持「持有中」，不要期待自动结算或自动赎回。</p>}
+        {settlementSupported && <p className="mt-3 text-xs leading-5 text-slate-500">引擎会按场所公布的获胜结果自动关账（账本损益立即结算），但链上份额仍需你在 Predict.fun 手动赎回，赎回交易需要自行支付 BNB gas；本版本不代发赎回交易。</p>}
       </div>
 
       <div className="mt-5 grid gap-x-5 gap-y-5 lg:grid-cols-2">
@@ -1411,7 +1412,7 @@ export function SystemView() {
                   busy={savingSection !== null}
                   runtime={venueRuntime(system, 'predictfun')}
                   baseURL={pfDraft.base_url}
-                  settlementSupported={pfCapability?.supports_settlement ?? false}
+                  settlementSupported={pfCapability?.supports_settlement ?? venueMeta('predictfun').supportsSettlement}
                   onChange={updatePfLive}
                   onReset={resetPfLive}
                   onSave={savePfLive}

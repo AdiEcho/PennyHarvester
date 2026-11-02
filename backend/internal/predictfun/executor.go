@@ -206,16 +206,23 @@ func New(cfg Config) (*Provider, *Executor, error) {
 // configured network.
 func Capabilities(cfg Config) venue.Capabilities {
 	return venue.Capabilities{
-		Venue:              market.VenuePredictFun,
-		Label:              "Predict.fun",
-		Currency:           market.CurrencyUSDT,
-		QuoteDecimals:      venue.USDTDecimals,
-		MinNotional:        defaultMinNotional,
-		OrderTypes:         []string{"LIMIT", "MARKET"},
-		MaxSlippageBPS:     defaultSlippageBPS,
-		SupportsCancel:     true,
-		SupportsSettlement: false,
-		Testnet:            cfg.Testnet,
+		Venue:          market.VenuePredictFun,
+		Label:          "Predict.fun",
+		Currency:       market.CurrencyUSDT,
+		QuoteDecimals:  venue.USDTDecimals,
+		MinNotional:    defaultMinNotional,
+		OrderTypes:     []string{"LIMIT", "MARKET"},
+		MaxSlippageBPS: defaultSlippageBPS,
+		SupportsCancel: true,
+		// Settlement is readable: the provider maps the published winning outcome
+		// onto a 1/0 payout, so the engine can close positions. Claiming the
+		// collateral is a separate capability (SupportsRedeem).
+		SupportsSettlement: true,
+		// Redemption is implemented for both market shapes: plain markets through
+		// ConditionalTokens.redeemPositions, neg-risk markets through the
+		// NegRiskAdapter. The operator still pays BNB gas for it.
+		SupportsRedeem: true,
+		Testnet:        cfg.Testnet,
 	}
 }
 
@@ -323,6 +330,64 @@ func (e *Executor) Approvals(ctx context.Context) (ApprovalState, error) {
 		return ApprovalState{}, err
 	}
 	return chain.Allowance(ctx)
+}
+
+// Redeem burns settled outcome shares back into USDT. It is the venue.Redeemer
+// capability: deliberately separate from Buying and Selling, because claiming is
+// a different permission (and a different gas bill) from trading.
+func (e *Executor) Redeem(ctx context.Context, request venue.RedeemRequest) (venue.RedeemResult, error) {
+	if err := e.requireLive(); err != nil {
+		return venue.RedeemResult{}, err
+	}
+	if !(request.Shares > 0) {
+		return venue.RedeemResult{}, fmt.Errorf("赎回数量必须大于 0")
+	}
+	meta, err := e.provider.marketMeta(ctx, request.TokenID, request.ConditionID)
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	indexSet, err := indexSetFor(meta, request.TokenID)
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	conditionID := strings.TrimSpace(meta.ConditionID)
+	if conditionID == "" {
+		conditionID = strings.TrimSpace(request.ConditionID)
+	}
+	chain, err := e.chainNow()
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	tx, err := chain.Redeem(ctx, RedeemRequest{
+		ConditionID: conditionID,
+		IndexSet:    indexSet,
+		// The amount is scaled here, from the human share count the position row
+		// shows, so the value that reaches the chain is the checked one.
+		Shares:  venue.Scale(request.Shares, venue.USDTDecimals),
+		NegRisk: meta.NegRisk,
+	})
+	if err != nil {
+		return venue.RedeemResult{}, err
+	}
+	return venue.RedeemResult{
+		Venue:  market.VenuePredictFun,
+		TxHash: tx.Hash.Hex(),
+		Method: tx.Method,
+	}, nil
+}
+
+// indexSetFor maps an outcome token id onto the CTF index set that redemption
+// burns. The set comes from the market's own outcome order (1 = Yes, 2 = No),
+// never from the outcome name, because a market may call its sides Up/Down.
+func indexSetFor(meta marketMeta, tokenID string) (int, error) {
+	token := strings.TrimSpace(tokenID)
+	switch {
+	case token != "" && token == strings.TrimSpace(meta.YesTokenID):
+		return 1, nil
+	case token != "" && token == strings.TrimSpace(meta.NoTokenID):
+		return 2, nil
+	}
+	return 0, fmt.Errorf("结果 %s 不属于市场 %s", tokenID, meta.MarketID)
 }
 
 // ApprovalState reports the on-chain allowances a Predict.fun order needs. It is

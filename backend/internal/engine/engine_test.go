@@ -757,6 +757,50 @@ func TestUnknownLiveStopLossIsReconciled(t *testing.T) {
 	}
 }
 
+// Predict.fun books are routinely thinner than Polymarket's, so the liquidity
+// floor is per venue: one global number would either hide every Predict.fun row
+// or let Polymarket noise through.
+func TestVenueMinLiquidityOverridesGlobalFloor(t *testing.T) {
+	ctx := context.Background()
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{
+		"pm": binary("pm", 0.97, 5000, 3),
+	}}, nil)
+	addVenue(t, registry, market.VenuePredictFun, &fakeProvider{
+		venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": binary("pf", 0.96, 5000, 2)},
+	}, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	// The global floor hides both fixtures; the Predict.fun override admits its own.
+	settings.MinLiquidity = 10000
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{MinLiquidity: 100})
+
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	list := instance.Opportunities()
+	if list.Total != 1 || list.Items[0].Venue != market.VenuePredictFun {
+		t.Fatalf("only the venue with a lower floor may pass: %+v", list.Items)
+	}
+
+	// The override must be per venue, not a global rewrite.
+	full := instance.Settings()
+	if full.MinLiquidity != 10000 {
+		t.Fatalf("global floor must stay 10000, got %v", full.MinLiquidity)
+	}
+	if got := full.For(market.VenuePolymarket).MinLiquidity; got != 10000 {
+		t.Fatalf("polymarket must inherit the global floor, got %v", got)
+	}
+	if got := full.For(market.VenuePredictFun).MinLiquidity; got != 100 {
+		t.Fatalf("predictfun must use its own floor, got %v", got)
+	}
+}
+
 func TestScopedScanKeepsOtherVenueRows(t *testing.T) {
 	ctx := context.Background()
 	registry := venue.NewRegistry()
@@ -1773,7 +1817,14 @@ func TestProbeRelayerUsesStoredSignerSettings(t *testing.T) {
 // addVenue registers one fake venue with the engine's test capabilities.
 func addVenue(t *testing.T, registry *venue.Registry, v market.Venue, data venue.MarketData, live engine.LiveExecutor) {
 	t.Helper()
-	if err := registry.Register(testCapabilities(v), data, live); err != nil {
+	addVenueCaps(t, registry, testCapabilities(v), data, live)
+}
+
+// addVenueCaps registers a venue with an explicit fact sheet, for the few tests
+// that care about a capability rather than about the venue itself.
+func addVenueCaps(t *testing.T, registry *venue.Registry, caps venue.Capabilities, data venue.MarketData, live engine.LiveExecutor) {
+	t.Helper()
+	if err := registry.Register(caps, data, live); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2019,7 +2070,12 @@ func TestSettlementIsSkippedForVenuesWithoutSupport(t *testing.T) {
 	pf := &fakeProvider{venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": pfMarket}}
 	registry := venue.NewRegistry()
 	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{}}, nil)
-	addVenue(t, registry, market.VenuePredictFun, pf, nil)
+	// Predict.fun does settle (its provider maps the published winner), so the
+	// mechanism under test is "no settler capability" and the fact sheet has to
+	// say so explicitly.
+	noSettler := testCapabilities(market.VenuePredictFun)
+	noSettler.SupportsSettlement = false
+	addVenueCaps(t, registry, noSettler, pf, nil)
 	instance, _ := newTestEngineWithRegistry(t, registry)
 	settings := instance.Settings()
 	settings.MinPrice = 0.10
@@ -2060,6 +2116,72 @@ func TestSettlementIsSkippedForVenuesWithoutSupport(t *testing.T) {
 	runtime := instance.SystemRuntime()
 	if !strings.Contains(runtime.Error, "暂不支持自动结算") || !strings.Contains(runtime.Error, "Predict.fun") {
 		t.Fatalf("runtime must surface the missing settler: %q", runtime.Error)
+	}
+}
+
+// Predict.fun publishes resolution.winningIndexSet, the provider maps it onto a
+// 1/0 payout, and the engine must then close the position exactly the way it
+// closes a Polymarket one.
+func TestPredictFunPositionSettlesOnPublishedWinner(t *testing.T) {
+	ctx := context.Background()
+	pfMarket := binary("pf", 0.40, 20000, 2)
+	pfMarket.FeeRateBPS = 200
+	pfMarket.Venue = market.VenuePredictFun
+	pfMarket.Currency = market.CurrencyUSDT
+	pf := &fakeProvider{venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": pfMarket}}
+	registry := venue.NewRegistry()
+	addVenue(t, registry, market.VenuePolymarket, &fakeProvider{markets: map[string]market.Market{}}, nil)
+	settling := testCapabilities(market.VenuePredictFun)
+	settling.SupportsSettlement = true
+	addVenueCaps(t, registry, settling, pf, nil)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+	paper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+		MarketID: "pf", Outcome: "Yes", TokenID: "pf-yes", Amount: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pfMarket.Closed = true
+	pfMarket.Active = false
+	pfMarket.ResolutionStatus = "resolved"
+	pfMarket.Outcomes[0].Price = 1
+	pfMarket.Outcomes[1].Price = 0
+	pf.markets["pf"] = pfMarket
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	won, err := instance.Positions(ctx, paper.ID, "won", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won.Total != 1 {
+		t.Fatalf("predictfun position must settle as won: %+v", won.Items)
+	}
+	position := won.Items[0]
+	if position.RealizedPNL <= 0 {
+		t.Fatalf("a winning position must book a payout: %+v", position)
+	}
+	settled, err := instance.Orders(ctx, paper.ID, "settled", 10, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled.Total != 1 || settled.Items[0].Type != "settle" {
+		t.Fatalf("expected one settle order: %+v", settled.Items)
+	}
+	if strings.Contains(instance.SystemRuntime().Error, "暂不支持自动结算") {
+		t.Fatalf("a settling venue must not be reported as unsupported: %q", instance.SystemRuntime().Error)
 	}
 }
 
@@ -2162,5 +2284,166 @@ func TestSystemSettingsRejectSharedVenuePrivateKey(t *testing.T) {
 	err := settings.Validate()
 	if err == nil || !strings.Contains(err.Error(), "不能与") {
 		t.Fatalf("reusing the Polymarket private key for Predict.fun must be rejected: %v", err)
+	}
+}
+
+// redeemLive is the venue.Redeemer half of a fake execution venue: it records
+// each redemption request so a test can assert that exactly one transaction was
+// attempted for a settled position.
+type redeemLive struct {
+	*fakeLive
+	redemptions []venue.RedeemRequest
+	err         error
+}
+
+func (r *redeemLive) Redeem(_ context.Context, request venue.RedeemRequest) (venue.RedeemResult, error) {
+	r.redemptions = append(r.redemptions, request)
+	if r.err != nil {
+		return venue.RedeemResult{}, r.err
+	}
+	return venue.RedeemResult{Venue: market.VenuePredictFun, TxHash: "0xredeemed", Method: "ctf"}, nil
+}
+
+// TestRedeemPositionBurnsSettledSharesOnce covers the money path: a live position
+// settles, one redemption is submitted with the position's own condition id and
+// share count, the attempt is recorded as an order, and a second click is refused
+// instead of spending gas on a transaction that would revert.
+func TestRedeemPositionBurnsSettledSharesOnce(t *testing.T) {
+	ctx := context.Background()
+	pfMarket := binary("pf", 0.40, 20000, 2)
+	pfMarket.FeeRateBPS = 200
+	pfMarket.Venue = market.VenuePredictFun
+	pfMarket.Currency = market.CurrencyUSDT
+	pf := &fakeProvider{venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": pfMarket}}
+	pfLive := &redeemLive{fakeLive: &fakeLive{
+		balance: 1000, allowance: 1000,
+		fill: engine.LiveFill{Shares: 100, Cost: 40, Price: 0.40, Status: "matched"},
+	}}
+	caps := testCapabilities(market.VenuePredictFun)
+	caps.SupportsSettlement = true
+	caps.SupportsRedeem = true
+	registry := venue.NewRegistry()
+	addVenueCaps(t, registry, caps, pf, pfLive)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+	account, err := instance.CreateAccount(ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(ctx, account.ID, engine.OrderRequest{
+		MarketID: "pf", Outcome: "Yes", TokenID: "pf-yes", Amount: 40,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pfMarket.Closed = true
+	pfMarket.Active = false
+	pfMarket.ResolutionStatus = "resolved"
+	pfMarket.Outcomes[0].Price = 1
+	pfMarket.Outcomes[1].Price = 0
+	pf.markets["pf"] = pfMarket
+	if err := instance.ScanOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	won, err := instance.Positions(ctx, account.ID, "won", "")
+	if err != nil || won.Total != 1 {
+		t.Fatalf("expected one settled position: %+v err=%v", won.Items, err)
+	}
+	position := won.Items[0]
+
+	result, err := instance.RedeemPosition(ctx, account.ID, position.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TxHash != "0xredeemed" || result.Method != "ctf" {
+		t.Fatalf("unexpected redemption result: %+v", result)
+	}
+	if len(pfLive.redemptions) != 1 {
+		t.Fatalf("expected exactly one redemption, got %d", len(pfLive.redemptions))
+	}
+	sent := pfLive.redemptions[0]
+	if sent.ConditionID != position.ConditionID || sent.TokenID != position.TokenID {
+		t.Fatalf("redemption used the wrong market: %+v position=%+v", sent, position)
+	}
+	if math.Abs(sent.Shares-position.Shares) > 1e-9 {
+		t.Fatalf("redemption shares = %v, want %v", sent.Shares, position.Shares)
+	}
+	orders, err := instance.Orders(ctx, account.ID, "all", 20, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var redemption *engine.Order
+	for i := range orders.Items {
+		if orders.Items[i].Action == "redeem" {
+			redemption = &orders.Items[i]
+		}
+	}
+	if redemption == nil || redemption.Type != "settle" || redemption.Status != "filled" ||
+		!strings.Contains(redemption.Reason, "0xredeemed") {
+		t.Fatalf("redemption was not recorded: %+v", orders.Items)
+	}
+
+	if _, err := instance.RedeemPosition(ctx, account.ID, position.ID); err == nil {
+		t.Fatal("a second redemption of the same position must be refused")
+	}
+	if len(pfLive.redemptions) != 1 {
+		t.Fatalf("a refused redemption must not reach the chain: %d attempts", len(pfLive.redemptions))
+	}
+}
+
+// TestRedeemPositionRejectsOpenAndSimulated covers the two ways a redemption must
+// be refused before any transaction is signed.
+func TestRedeemPositionRejectsOpenAndSimulated(t *testing.T) {
+	ctx := context.Background()
+	pfMarket := binary("pf", 0.40, 20000, 2)
+	pfMarket.FeeRateBPS = 200
+	pfMarket.Venue = market.VenuePredictFun
+	pfMarket.Currency = market.CurrencyUSDT
+	pf := &fakeProvider{venue: market.VenuePredictFun, markets: map[string]market.Market{"pf": pfMarket}}
+	pfLive := &redeemLive{fakeLive: &fakeLive{
+		balance: 1000, allowance: 1000,
+		fill: engine.LiveFill{Shares: 100, Cost: 40, Price: 0.40, Status: "matched"},
+	}}
+	caps := testCapabilities(market.VenuePredictFun)
+	caps.SupportsSettlement = true
+	caps.SupportsRedeem = true
+	registry := venue.NewRegistry()
+	addVenueCaps(t, registry, caps, pf, pfLive)
+	instance, _ := newTestEngineWithRegistry(t, registry)
+	settings := instance.Settings()
+	settings.MinPrice = 0.10
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
+	live, err := instance.CreateAccount(ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := instance.PlaceOrder(ctx, live.ID, engine.OrderRequest{
+		MarketID: "pf", Outcome: "Yes", TokenID: "pf-yes", Amount: 40,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.RedeemPosition(ctx, live.ID, open.ID); err == nil {
+		t.Fatal("an unsettled position must not be redeemable")
+	}
+	paper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.RedeemPosition(ctx, paper.ID, open.ID); err == nil {
+		t.Fatal("a simulated position must not be redeemable")
+	}
+	if len(pfLive.redemptions) != 0 {
+		t.Fatalf("no refused redemption may reach the chain: %d attempts", len(pfLive.redemptions))
 	}
 }

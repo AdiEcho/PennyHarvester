@@ -25,10 +25,11 @@ import (
 	"pennyharvester/backend/internal/market"
 )
 
-// Fill is the real exchange execution returned by a venue executor. For a buy,
-// Cost is the gross notional plus the taker fee. For a sell, Cost is the gross
-// proceeds minus the taker fee. Price is always the execution price excluding
-// the fee.
+// Fill is the real exchange execution returned by a venue executor. Cost is
+// always the gross notional (shares × price) with no fee folded in, and Fee is
+// reported separately, because different venues book fees differently and the
+// engine has exactly one place where the two are combined. Price is the
+// execution price excluding the fee.
 type Fill struct {
 	OrderID string
 	Shares  float64
@@ -84,9 +85,13 @@ type Capabilities struct {
 	MaxSlippageBPS float64 `json:"max_slippage_bps"`
 	SupportsCancel bool    `json:"supports_cancel"`
 	// SupportsSettlement reports whether the engine can settle positions from
-	// reference data. Predict.fun has no public resolution feed this build
-	// understands, so its positions stay open instead of being guessed closed.
+	// reference data. Predict.fun publishes the winning outcome, so its
+	// positions close automatically; Polymarket resolves through its own API.
 	SupportsSettlement bool `json:"supports_settlement"`
+	// SupportsRedeem reports whether the venue can burn settled shares back into
+	// collateral on chain (the venue.Redeemer capability). False for Polymarket,
+	// whose claims go through a relayer this build does not speak to.
+	SupportsRedeem bool `json:"supports_redeem"`
 	// Testnet is true when the executor is pointed at a test network.
 	Testnet bool `json:"testnet,omitempty"`
 	// ReadOnly is derived from the registration: a venue with market data but no

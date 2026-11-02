@@ -255,15 +255,19 @@ type MarketOutcome struct {
 	BestAsk   Quote  `json:"bestAsk"`
 }
 
-// Resolution is the settlement outcome. Only the fields needed to tell an
-// unresolved market from a terminal one are modelled.
+// Resolution is the venue's verdict on a settled market. It is shaped exactly
+// like a MarketOutcome: the live payload names the winning side directly
+// ({"name":"Up","indexSet":1,"onChainId":"…","positionId":"…","status":"WON"})
+// and the same outcome in `outcomes[]` carries status WON while the other side
+// carries LOST. Verified against the public API on 2026-11-02 over 56 settled
+// markets (57 WON / 55 LOST, exactly one winner each).
 type Resolution struct {
-	// Status is the resolver's lifecycle value; empty means "not reported".
+	Name       string `json:"name"`
+	IndexSet   Number `json:"indexSet"`
+	OnChainID  string `json:"onChainId"`
+	PositionID string `json:"positionId"`
+	// Status is "WON" for the winning side.
 	Status string `json:"status"`
-	// WinningIndexSet is set once the market resolves.
-	WinningIndexSet Number `json:"winningIndexSet"`
-	// ResolvedAt is an RFC3339 timestamp when the upstream reports one.
-	ResolvedAt string `json:"resolvedAt"`
 }
 
 // Stats is the per-market statistics object. The list endpoint reports it as

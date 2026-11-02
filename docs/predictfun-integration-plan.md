@@ -1,6 +1,6 @@
 # predict.fun 接入方案（架构 + 前后端改造）
 
-> 状态：**已实施**（2026-11，M0–M3 全部落地并通过 `go test ./... -race` 与真机联调；M4 的链上结算/赎回仍未做，见 §9）。
+> 状态：**已实施**（2026-11，M0–M3 全部落地并通过 `go test ./... -race` 与真机联调；2026-11-03 补齐自动结算与链上赎回，见 §12–§14；仍未做：代理钱包签名、合并/转换、WebSocket 盘口）。
 > 本文是施工前的设计记录，取代 `docs/multi-venue-architecture.md` 中"六边形重写"的部分（该文件已删除）。实际落地与本文的差异逐条列在 §9。
 > 接口契约以 `docs/venue-api-contract.md` 为准；结论先看 §0。
 
@@ -270,7 +270,7 @@ CREATE UNIQUE INDEX idx_orders_venue_ext ON orders(venue, external_id) WHERE ext
 5. **`Settings.Venues` 的缺省语义**：条目不存在时 PM 启用、PF 停用；条目存在则按字面读。这样升级到一个带多场所的版本，不会静默开始交易新场所。
 6. **`min_liquidity` 仍是全局值**（本文设计为逐场所）。PF 真实深度跨度很大（$90–$315k），逐场所流动性阈值是**已知待办**（记在 §8 之后，不阻塞本次交付）。
 7. **只读场所也能报价**：行情注册与执行器注册是分开的，没有签名器时 `/opportunities` 与真实收益报价照常工作，只有下单会以 409 拒绝并说明原因。
-8. **M4 未做**：PF 的结算/赎回（`supports_settlement=false`）。到期市场不会被自动结算，持仓保持未平仓并在「系统设置 → 场所运行状态」提示；链上 `redeem`/`merge` 留到下一轮。**链上授权已有入口**（见第 10 条）。
+8. **M4 已补齐（2026-11-03）**：PF 现在会自动结算（按公布的获胜结果映射 1/0，平局 0.5）并支持链上赎回；见 §12–§14。`merge`/`convert` 仍未做。**链上授权已有入口**（见第 10 条）。
 
 ## 10. 复审修复（同日回填）
 
@@ -303,3 +303,36 @@ CREATE UNIQUE INDEX idx_orders_venue_ext ON orders(venue, external_id) WHERE ext
 其它一并处理：4xx（非 429）视为确定性拒单而不是 `unknown`（避免无谓冻结止损）；`sideIsSell` 在响应缺 `side` 时才回退（显式 `0`=买入要被尊重）；`EnsureApprovals` 授权后重读链上状态（否则 `ReadyError` 仍报未授权）；探活恢复失败写入系统错误而不是静默吞掉；`Market.Category` 参与分类启发式；`sort.SliceStable`；`VenueSystemSettings.Merge` 把脱敏占位符当"保留";清理死分支、`gofmt`。
 
 **已知限制**（不阻塞交付，记入待办）：`min_liquidity` 仍是全局值；PF 结算/赎回未实现；PF 实盘只支持 EOA（smart wallet 会 fail-closed 拒绝）；对账中"token 已不在雷达"的订单会一直保持未对账状态并保守地阻止该账户自动交易，需要人工核对。
+
+## 12. 联网核实（2026-11-03）：结算与赎回的真实规则
+
+调研报告：`docs/research/predictfun-settlement.md`（550 行，结论按 [V] 已验证 / [I] 推断 / [?] 未知标注）。
+
+- **权威来源是 OpenAPI 而不是文档站**：`https://api-testnet.predict.fun/docs` 内嵌完整 OpenAPI 3.0（110 paths / 364 schemas），主网同构；`docs.predict.fun`/`dev.predict.fun` 在 2026-10 的安全事件后已下线。主网 GET 需要 `x-api-key`（401），测试网 keyless，schema 共用。
+- **`resolution` 不是枚举而是一个 outcome 对象**：真实载荷是 `{"name":"Up","indexSet":1,"onChainId":"5830…","positionId":"5830…","status":"WON",…}`，没有 `winningIndexSet`/`resolvedAt`/结算价。原先按字段名猜的 `Resolution{Status,WinningIndexSet,ResolvedAt}` 完全不存在——这类错误只能靠真机载荷发现。
+- **`?status=` 只接受 `OPEN|RESOLVED`，分页参数是 `?first=`**：`?limit=` 被忽略且恒返回 20 条，很容易误判"平台上只有 20 个已结算市场"。
+- **结算状态机**：`MarketStatus` = REGISTERED, PRICE_PROPOSED, PRICE_DISPUTED, PAUSED, UNPAUSED, RESOLVED, REMOVED；`PRICE_PROPOSED` **不是终态**（实测市场在提议后约 20 小时才正式结算），`PRICE_DISPUTED` 可能翻盘。所以只在 `RESOLVED` + `tradingStatus=CLOSED` 且"恰好一个 WON"时才给出 1/0。
+- **平局真实存在**：市场 1388 两侧都 WON，链上 `payoutDenominator=2`、`payoutNumerators=[1,1]` → 每股 0.50。"取第一个 WON 当赢家"会把一半仓位记错。
+- **赎回**：普通市场调 CTF `redeemPositions(USDT, parentCollectionId=0x0, conditionId, [indexSet])`（selector `0x01b7037c`，indexSet 必须取 `outcomes[].indexSet` 而不是名字顺序）；neg-risk 市场调 `NegRiskAdapter.redeemPositions(bytes32 conditionId, uint256[] amounts)`（selector `0xdbeccb23`，`amounts` 按结果槽位给值，Yes → `[amt,0]`、No → `[0,amt]`）。`convertPositions` 是独立的 NO 转换流程，不是赎回前置。
+- **gas**：两个官方 SDK 都没有 relayer/gasless，赎回就是普通 EOA 交易，签名地址必须有 BNB。`POST /v1/gateway/authorize{,/redeem}` 只签授权、不代发交易。
+- **授权**：普通赎回无需任何授权；neg-risk 的 redeem/merge/convert 需要 CTF 上 `setApprovalForAll(NEG_RISK_ADAPTER, true)`（已并入 `EnsureApprovals`）。
+- 链上真相已用 `eth_call` 核对：`payoutDenominator`(`0xdd34de67`)/`payoutNumerators`(`0x0504c814`) 与 API 一致；`conditionId == keccak256(resolverAddress‖oracleQuestionId‖uint256(2))` 复算命中。
+- **仍未解**：`positionId` 的推导公式（不要自己算 token id，直接用 `outcomes[].onChainId`）；`NegRiskAdapter.getResult` 的参数语义；交易所按长度还是 `signatureType` 分派代理钱包签名；交易所侧最小下单量（SDK 侧是 0.01 股）；主网与测试网载荷是否漂移（本仓库只在测试网真机验证过）。
+
+## 13. 本轮实现（2026-11-03）
+
+1. **逐场所 `min_liquidity`**：`Settings.venues[venue].min_liquidity`（0 = 继承全局）。PF 市场深度与 PM 差一个量级（实测 $90–$315k），单一阈值要么藏掉 PF 全部、要么放进 PM 噪声。
+2. **自动结算**：`predictfun.Provider.mapMarket` 按 `resolution.indexSet` → `outcomes[].onChainId` → `status==WON` 三级回退判定赢家，赢家价格记 1、其余记 0；**两个及以上 WON 视为平局**，两侧都记 0.5；terminal 但没有赢家时写 `resolution_pending`，防止引擎拿最后成交价结算。`Capabilities.SupportsSettlement` 改为 `true`。
+3. **链上赎回**：`venue.Redeemer` 契约 + `predictfun.OnChain.Redeem`（手写 ABI、gas 预检）+ `engine.RedeemPosition`（先落库再签名、幂等、持 `tradeMu`）+ `POST /accounts/:id/positions/:positionId/redeem` + 前端「赎回」按钮。
+4. **neg-risk 前置授权**：`EnsureApprovals` 增加第三个 operator（NegRiskAdapter 在 CTF 上的 `setApprovalForAll`），且不给它多余的 USDT allowance。
+
+## 14. 已知限制（本轮结束时）
+
+| 限制 | 影响 | 说明 |
+| --- | --- | --- |
+| 代理钱包（Kernel）签名未实现 | 托管账户/智能钱包用户无法实盘 | 签名格式已查清（订单哈希外层包 Kernel 域 + `0x01‖ECDSA_VALIDATOR‖sig` 86 字节），但没有真机向量，宁可不做也不猜 |
+| 赎回需自付 BNB gas | 无 gas 的账户赎回会失败 | 接口有余额预检与可操作文案；官方也无 relayer |
+| `merge`/`convert` 未做 | NO 侧无法合并成抵押品提前释放资金 | 需要额外合约调用与仓位配对逻辑 |
+| 主网未真机验证 | 主网载荷可能与测试网漂移 | 主网 GET 需要 `x-api-key`，本仓库只在测试网端到端跑过 |
+| WebSocket 未接 | 盘口刷新依赖轮询（默认 30s） | `wss://ws.predict.fun/ws` 的 topic 与心跳已记录在 §3 |
+| 平局/撤单的链上对账 | 平局按 0.5 关账，链上赎回按 0.5 赔付 | 需在平局时人工确认赎回金额 |

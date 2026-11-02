@@ -27,6 +27,7 @@ import type {
   VenueLiveSettings,
   VenueSystemPatch,
   VenueApprovalResponse,
+  VenueRedemption,
 } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api/v1'
@@ -167,6 +168,11 @@ export const api = {
       signal,
     }),
   /** 只读读取链上授权状态（不发交易）。 */
+  redeemPosition: (accountId: number, positionId: number, signal?: AbortSignal) =>
+    request<VenueRedemption>(`/accounts/${accountId}/positions/${positionId}/redeem`, {
+      method: 'POST',
+      signal,
+    }),
   getVenueApproval: (venue: Venue, signal?: AbortSignal) =>
     request<VenueApprovalResponse>(withVenue('/system/live/approval', venue), { signal }),
   /**

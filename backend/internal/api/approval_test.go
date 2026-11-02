@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -197,4 +198,44 @@ func approvalSession(t *testing.T, handler http.Handler) []*http.Cookie {
 		t.Fatalf("login failed: %d %s", login.Code, login.Body.String())
 	}
 	return sessionCookies(t, login)
+}
+
+// TestRedeemPositionRefusesBeforeSigning covers the API half of redemption: the
+// route exists, it is authenticated, and every refusal that should never cost gas
+// comes back as a 4xx with the reason intact.
+func TestRedeemPositionRefusesBeforeSigning(t *testing.T) {
+	handler, _ := newApprovalRouter(t)
+	cookies := approvalSession(t, handler)
+
+	// Unauthenticated calls must not reach the engine.
+	if response := request(t, handler, http.MethodPost, "/api/v1/accounts/1/positions/1/redeem", nil); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated redeem: %d %s", response.Code, response.Body.String())
+	}
+
+	// A paper account holds simulated shares; burning them on chain would spend
+	// gas to burn nothing.
+	created := requestWithCookie(t, handler, http.MethodPost, "/api/v1/accounts",
+		map[string]string{"name": "PF paper", "mode": "paper", "venue": "predictfun"}, cookies)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create account: %d %s", created.Code, created.Body.String())
+	}
+	var account engine.Account
+	if err := json.Unmarshal(created.Body.Bytes(), &account); err != nil {
+		t.Fatal(err)
+	}
+	simulated := requestWithCookie(t, handler, http.MethodPost,
+		"/api/v1/accounts/"+strconv.FormatInt(account.ID, 10)+"/positions/1/redeem", nil, cookies)
+	if simulated.Code != http.StatusBadRequest || !strings.Contains(simulated.Body.String(), "模拟账户") {
+		t.Fatalf("paper redeem must be refused: %d %s", simulated.Code, simulated.Body.String())
+	}
+
+	// Missing positions and malformed ids are client errors, not gateway errors.
+	missing := requestWithCookie(t, handler, http.MethodPost, "/api/v1/accounts/9999/positions/1/redeem", nil, cookies)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing account: %d %s", missing.Code, missing.Body.String())
+	}
+	malformed := requestWithCookie(t, handler, http.MethodPost, "/api/v1/accounts/1/positions/abc/redeem", nil, cookies)
+	if malformed.Code != http.StatusBadRequest || !strings.Contains(malformed.Body.String(), "仓位 ID") {
+		t.Fatalf("malformed position id: %d %s", malformed.Code, malformed.Body.String())
+	}
 }
