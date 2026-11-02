@@ -160,8 +160,13 @@ export const api = {
     }),
   toggleEngine: (running: boolean, signal?: AbortSignal) =>
     request<Engine>('/engine/toggle', { method: 'POST', body: { running }, signal }),
-  scan: (signal?: AbortSignal, execute = false) =>
-    request<OpportunitiesResponse>(`/scan${execute ? '?execute=true' : ''}`, { method: 'POST', signal }),
+  scan: (signal?: AbortSignal, execute = false, accountId?: number) => {
+    const params = new URLSearchParams()
+    if (execute) params.set('execute', 'true')
+    if (accountId) params.set('account_id', String(accountId))
+    const query = params.toString()
+    return request<OpportunitiesResponse>(`/scan${query ? `?${query}` : ''}`, { method: 'POST', signal })
+  },
   createOrder: (
     accountId: number,
     body: { market_id: string; outcome: string; token_id: string; amount: number },

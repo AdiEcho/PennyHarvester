@@ -289,6 +289,31 @@ func TestScanAPIDefaultsToScanOnly(t *testing.T) {
 	}
 }
 
+func TestScanAPIExecutesSelectedAccountWithoutAutoTradeSwitch(t *testing.T) {
+	handler, instance := setupRouter(t)
+	paperID := accountID(t, handler, engine.AccountModePaper)
+	response := request(t, handler, http.MethodPost, "/api/v1/scan?execute=true&account_id="+itoa(paperID), nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("execute scan failed: %d %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		AutoTrade engine.ScanSummary `json:"auto_trade"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.AutoTrade.AccountID != paperID || !payload.AutoTrade.Execute || payload.AutoTrade.OrdersPlaced != 1 {
+		t.Fatalf("unexpected scan summary: %s", response.Body.String())
+	}
+	positions, err := instance.Positions(context.Background(), paperID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("execute scan should auto-trade the selected account: %+v", positions.Items)
+	}
+}
+
 func TestOrdersAPIReportsTotalAndSupportsFilters(t *testing.T) {
 	handler, _ := setupRouter(t)
 	paperID := accountID(t, handler, engine.AccountModePaper)

@@ -279,7 +279,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
             <div className={cn('rounded-xl p-2.5', isLive ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700')}>{isLive ? <Radio className="h-[18px] w-[18px]" /> : <FlaskConical className="h-[18px] w-[18px]" />}</div>
             <div>
               <CardTitle>账户管理</CardTitle>
-              <CardDescription className="mt-1">实盘与模拟是完全隔离的账户。自动交易按账户单独开启。</CardDescription>
+              <CardDescription className="mt-1">实盘与模拟是完全隔离的账户。后台自动交易按账户单独开启；雷达「立即扫描」也可按次选择自动下单。</CardDescription>
             </div>
           </div>
           <ModeBadge mode={account.mode} />
@@ -305,7 +305,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
 
           <div className={cn('rounded-xl border p-4', isLive ? 'border-amber-200 bg-amber-50/50' : 'border-emerald-100 bg-emerald-50/50')}>
             <div className="flex items-center justify-between gap-3">
-              <div><p className="text-sm font-semibold text-slate-800">{isLive ? '实盘自动交易' : '模拟自动交易'}</p><p className="mt-0.5 text-xs leading-5 text-slate-500">{isLive ? '开启后，引擎将按策略参数提交真实买单。' : '开启后，引擎将按策略参数创建虚拟买单。'}</p></div>
+              <div><p className="text-sm font-semibold text-slate-800">{isLive ? '实盘自动交易' : '模拟自动交易'}</p><p className="mt-0.5 text-xs leading-5 text-slate-500">{isLive ? '开启后，后台扫描引擎将按策略参数提交真实买单。' : '开启后，后台扫描引擎将按策略参数创建虚拟买单。'}</p></div>
               <Switch checked={account.auto_trade} onCheckedChange={toggleAuto} disabled={saving || (isLive && !account.live_ready && !account.auto_trade)} aria-label={isLive ? '实盘自动交易' : '模拟自动交易'} />
             </div>
             <dl className="mt-4 space-y-2 text-xs">
@@ -460,7 +460,7 @@ export function SettingsView() {
     try {
       const next = await api.toggleEngine(running)
       setEngineOverride(next)
-      toast({ title: running ? '扫描引擎已启动' : '扫描引擎已暂停', description: running ? '将按设置间隔扫描公共行情，并按账户开关决定是否自动交易。' : '不再自动扫描，已有持仓保持不变。', variant: 'success' })
+      toast({ title: running ? '扫描引擎已启动' : '扫描引擎已暂停', description: running ? '将按设置间隔扫描公共行情；后台自动下单按账户开关执行。' : '后台不再定时扫描；雷达「立即扫描」仍可手动触发。已有持仓保持不变。', variant: 'success' })
       dashboardQuery.refresh()
     } catch (caught) {
       toast({ title: '引擎状态切换失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
@@ -476,7 +476,7 @@ export function SettingsView() {
       <Card className="mb-4 overflow-hidden border-navy bg-navy text-white">
         <div className="flex flex-col gap-5 p-5 sm:flex-row sm:items-center sm:p-6">
           <div className={cn('rounded-2xl p-3', engine?.running ? 'bg-brand-lime text-navy' : 'bg-white/10 text-slate-400')}><Activity className="h-6 w-6" /></div>
-          <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h2 className="text-base font-semibold">扫描引擎</h2>{engine && <Badge variant={engine.running ? 'lime' : 'navy'}>{engine.running ? '运行中' : '已暂停'}</Badge>}</div><p className="mt-1.5 text-sm leading-6 text-slate-400">控制公共行情扫描；是否自动下单由各账户的「自动交易」开关独立决定。</p>{engine?.last_error && <p className="mt-2 break-words text-xs leading-5 text-rose-300">最近错误：{engine.last_error}</p>}</div>
+          <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h2 className="text-base font-semibold">扫描引擎</h2>{engine && <Badge variant={engine.running ? 'lime' : 'navy'}>{engine.running ? '运行中' : '已暂停'}</Badge>}</div><p className="mt-1.5 text-sm leading-6 text-slate-400">控制后台定时扫描；后台自动下单由各账户的「自动交易」开关独立决定，雷达「立即扫描」可按次选择自动下单。</p>{engine?.last_error && <p className="mt-2 break-words text-xs leading-5 text-rose-300">最近错误：{engine.last_error}</p>}</div>
           <div className="flex items-center gap-3 sm:flex-col sm:items-end"><Switch checked={engine?.running || false} onCheckedChange={toggleEngine} disabled={!engine || toggling || dashboardQuery.isLoading} aria-label="启动或暂停扫描引擎" className="data-[state=checked]:bg-emerald-500" /><span className="text-xs text-slate-400">{toggling ? '正在切换…' : engine?.running ? '点击暂停' : '点击启动'}</span></div>
         </div>
         {dashboardQuery.error && !engine && <div className="break-words border-t border-white/10 bg-white/5 px-5 py-3 text-xs text-rose-300">{dashboardQuery.error}</div>}
@@ -559,7 +559,7 @@ export function SettingsView() {
             )}
             <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
               <div className="rounded-xl bg-surface p-2.5 text-slate-500"><UserCog className="h-5 w-5" /></div>
-              <div className="flex-1"><p className="text-sm font-semibold text-slate-800">自动交易开关已移到账户管理</p><p className="mt-1 text-xs leading-5 text-slate-500">实盘与模拟账户可以分别开启自动交易。实盘账户开启时需要二次确认。</p></div>
+              <div className="flex-1"><p className="text-sm font-semibold text-slate-800">自动交易开关已移到账户管理</p><p className="mt-1 text-xs leading-5 text-slate-500">实盘与模拟账户可以分别开启后台自动交易。雷达「立即扫描」可按次选择是否自动下单；实盘账户开启后台自动交易时需要二次确认。</p></div>
             </div>
           </SettingsSection>
 

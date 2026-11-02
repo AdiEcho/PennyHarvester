@@ -1230,6 +1230,56 @@ func TestScanOnlyDoesNotAutoTrade(t *testing.T) {
 	}
 }
 
+func TestManualScanAutoTradesSelectedAccountAndSkipsHeld(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"held":  nearClose(binary("held", 0.98, 20000, 2), 10*time.Minute),
+		"fresh": nearClose(binary("fresh", 0.98, 20000, 2), 10*time.Minute),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	focused := accountByMode(t, instance, engine.AccountModePaper)
+	other, err := instance.CreateAccount(context.Background(), "other paper", engine.AccountModePaper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The focused account already holds one of the two markets. Its AutoTrade
+	// switch stays off: an explicit manual scan is the user's consent for this
+	// one pass and must not leak into other accounts.
+	if _, err := instance.PlaceOrder(context.Background(), focused.ID, engine.OrderRequest{
+		MarketID: "held", Outcome: "Yes", TokenID: "held-yes", Amount: 50,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := instance.ManualScan(context.Background(), focused.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AccountID != focused.ID || !summary.Execute || summary.OrdersPlaced != 1 || summary.SkippedHeld != 1 {
+		t.Fatalf("unexpected manual scan summary: %+v", summary)
+	}
+	positions, err := instance.Positions(context.Background(), focused.ID, "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 2 {
+		t.Fatalf("manual scan should add exactly one position: %+v", positions.Items)
+	}
+	otherPositions, err := instance.Positions(context.Background(), other.ID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherPositions.Total != 0 {
+		t.Fatalf("manual scan leaked into another account: %+v", otherPositions.Items)
+	}
+	// Re-running must skip both markets instead of stacking another entry.
+	summary, err = instance.ManualScan(context.Background(), focused.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.OrdersPlaced != 0 || summary.SkippedHeld != 2 {
+		t.Fatalf("repeat scan should skip held markets: %+v", summary)
+	}
+}
+
 func TestOrdersTotalAndStatusFilter(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
 	instance, _ := newTestEngine(t, provider, nil)

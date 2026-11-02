@@ -202,6 +202,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const [amount, setAmount] = useState('')
   const [confirmed, setConfirmed] = useState(false)
   const [scanning, setScanning] = useState(false)
+  const [scanPrompt, setScanPrompt] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [orderError, setOrderError] = useState('')
   const [quotes, setQuotes] = useState<Record<string, QuoteState>>({})
@@ -283,14 +284,31 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     setOrderError('')
   }
 
-  const scan = async () => {
+  const runScan = async (execute: boolean) => {
+    setScanPrompt(false)
     scanController.current?.abort()
     const controller = new AbortController()
     scanController.current = controller
     setScanning(true)
     try {
-      const result = await api.scan(controller.signal)
-      toast({ title: '扫描完成', description: `本次返回 ${formatNumber(result.total, 0)} 个候选机会；仅刷新行情，未自动下单。`, variant: 'success' })
+      const result = await api.scan(controller.signal, execute, accountId)
+      if (execute) {
+        const summary = result.auto_trade
+        const placed = summary?.orders_placed ?? 0
+        const skipped = summary?.skipped_held ?? 0
+        const details = [
+          `本次返回 ${formatNumber(result.total, 0)} 个候选机会`,
+          placed > 0 ? `已对 ${placed} 个未持仓盘口自动下单` : '没有符合条件的新盘口，本轮未下单',
+          skipped > 0 ? `跳过 ${skipped} 个已有持仓记录的盘口` : '',
+        ].filter(Boolean).join('；')
+        toast({
+          title: summary?.error ? '扫描完成，但自动下单出现错误' : placed > 0 ? '扫描完成并已自动下单' : '扫描完成，未产生新订单',
+          description: summary?.error ? `${details}。${summary.error}` : `${details}。`,
+          variant: summary?.error ? 'error' : placed > 0 ? 'success' : 'info',
+        })
+      } else {
+        toast({ title: '扫描完成', description: `本次返回 ${formatNumber(result.total, 0)} 个候选机会；本次仅刷新行情，未自动下单。`, variant: 'success' })
+      }
       refresh()
       refreshHeld()
     } catch (caught) {
@@ -330,7 +348,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
 
   return (
     <>
-      <PageHeader eyebrow={isLive ? 'LIVE OPPORTUNITY RADAR' : 'OPPORTUNITY RADAR'} title="机会雷达" description={isLive ? '筛选公开市场价格偏离。点击实盘买入会把订单提交到 Polymarket CLOB，请务必确认金额与盘口深度。' : '筛选公开市场的价格偏离，以理论收益辅助研究，不构成结算承诺。'} actions={<><MarketLanguageSelect value={marketLanguage} onChange={setMarketLanguage} /><Button variant="primary" onClick={scan} loading={scanning}><Radar className={cn('h-4 w-4', !scanning && 'text-emerald-200 dark:text-emerald-950')} />{scanning ? '正在扫描…' : '立即扫描'}</Button></>} />
+      <PageHeader eyebrow={isLive ? 'LIVE OPPORTUNITY RADAR' : 'OPPORTUNITY RADAR'} title="机会雷达" description={isLive ? '筛选公开市场价格偏离。点击实盘买入会把订单提交到 Polymarket CLOB，请务必确认金额与盘口深度。' : '筛选公开市场的价格偏离，以理论收益辅助研究，不构成结算承诺。'} actions={<><MarketLanguageSelect value={marketLanguage} onChange={setMarketLanguage} /><Button variant="primary" onClick={() => setScanPrompt(true)} loading={scanning}><Radar className={cn('h-4 w-4', !scanning && 'text-emerald-200 dark:text-emerald-950')} />{scanning ? '正在扫描…' : '立即扫描'}</Button></>} />
       {error && data && <InlineError message={error} onRetry={refresh} />}
 
       <Card className="mb-4 p-4 sm:p-5">
@@ -370,7 +388,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           <span>毛收益 = (1 − 价格) / 价格（未计手续费）</span>
           <span>真实收益 = 实时盘口成交价 + 真实手续费，按「参数设置 → 单笔金额」{orderSize ? `（${formatCurrency(orderSize)}）` : ''}估算</span>
           <span>到期时间按本地时区显示</span>
-          <span>立即扫描仅刷新行情，不会自动下单</span>
+          <span>立即扫描会先询问是否自动下单；自动下单只处理当前账户尚无持仓记录的盘口</span>
           <span>默认分类来自「参数设置」；体育赛事盘口默认按加时/波动风险过滤</span>
           <span>{marketLanguage === 'zh' ? '市场问题与方向优先使用 Polymarket 中文文案' : '市场问题与方向显示 Polymarket 英文原文'}</span>
           {data && <span className="sm:ml-auto">来源 {data.source} · 扫描于 {formatFullDate(data.scanned_at)}</span>}
@@ -378,7 +396,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
       </Card>
 
       {isLoading ? <Card><LoadingBlock rows={6} /></Card> : error && !data ? <Card><ErrorState message={error} onRetry={refresh} /></Card> : !data?.items.length ? (
-        <Card><EmptyState icon={Binoculars} title="雷达暂未发现机会" description="当前筛选条件下没有候选市场。你可以重新扫描，或在参数设置中调整筛选阈值。" action={<Button variant="secondary" onClick={scan} loading={scanning}><Radar className="h-4 w-4" />重新扫描</Button>} /></Card>
+        <Card><EmptyState icon={Binoculars} title="雷达暂未发现机会" description="当前筛选条件下没有候选市场。你可以重新扫描，或在参数设置中调整筛选阈值。" action={<Button variant="secondary" onClick={() => setScanPrompt(true)} loading={scanning}><Radar className="h-4 w-4" />重新扫描</Button>} /></Card>
       ) : filtered.length === 0 ? (
         query.trim() ? (
           <Card><EmptyState icon={Search} title="没有匹配的市场" description={`没有找到与“${query}”相关的机会，请尝试其他关键词。`} action={<Button variant="secondary" onClick={() => setQuery('')}>清除搜索</Button>} /></Card>
@@ -412,6 +430,30 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
           <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{filtered.map((item) => <OpportunityCard key={`${item.market_id}-${item.token_id}`} item={item} held={heldByToken.get(item.token_id)} onBuy={openBuy} onQuote={() => fetchQuote(item)} quote={quotes[item.token_id]} orderSize={orderSize} isLive={isLive} language={marketLanguage} />)}</div>
         </>
       )}
+
+      <Dialog open={scanPrompt} onOpenChange={(open) => { if (!open && !scanning) setScanPrompt(false) }}>
+        <DialogContent className="max-w-md">
+          <div>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Badge variant={isLive ? 'danger' : 'success'}>{isLive ? <Radio className="h-3 w-3" /> : <FlaskConical className="h-3 w-3" />}{isLive ? '实盘账户' : '模拟账户'}</Badge>
+              <span className="text-xs text-slate-400">{account?.name || '当前账户'}</span>
+            </div>
+            <DialogTitle>立即扫描：是否自动下单？</DialogTitle>
+            <DialogDescription className="mt-2">扫描会拉取最新公开行情、刷新持仓盯市并记录净值。需要同时按自动交易规则买入本轮出现的新机会吗？</DialogDescription>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-600">
+            <p><span className="font-medium text-slate-800">自动下单范围：</span>仅当前账户中尚无持仓记录的盘口；已有持仓、已结算或已止损卖出的盘口会跳过。</p>
+            <p className="mt-1"><span className="font-medium text-slate-800">仍需通过：</span>单笔金额{orderSize ? `（${formatCurrency(orderSize)}）` : ''}、单市场与总敞口上限、尾盘下单窗口、未决订单熔断及实盘凭据检查。</p>
+            {isLive && <p className="mt-1 font-medium text-rose-700">实盘账户会向 Polymarket CLOB 提交真实买单，并动用真实 pUSD。</p>}
+          </div>
+          {isLive && !liveReady && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span>{account?.live_configured ? '实盘凭据未就绪，本次只能刷新行情。' : '实盘凭据未配置，本次只能刷新行情。'} 请先在「系统设置 → 实盘交易凭据」中完成配置。</span></div>}
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button variant="secondary" onClick={() => runScan(false)} disabled={scanning}><Radar className="h-4 w-4" />仅扫描行情</Button>
+            <Button variant={isLive ? 'danger' : 'primary'} onClick={() => runScan(true)} loading={scanning} disabled={!accountId || !liveReady}><Zap className="h-4 w-4" />扫描并自动下单</Button>
+          </div>
+          <p className="-mt-2 text-center text-[11px] leading-5 text-slate-400">自动下单只对本次扫描与当前账户生效，会忽略该账户的后台自动交易开关与引擎暂停状态。</p>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={selected !== null} onOpenChange={(open) => { if (!open && !submitting) setSelected(null) }}>
         <DialogContent>

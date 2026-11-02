@@ -203,17 +203,19 @@ func (h *Handler) scan(c *gin.Context) {
 		}
 		execute = parsed
 	}
-	var err error
-	if execute {
-		err = h.engine.Scan(c.Request.Context())
-	} else {
-		err = h.engine.ScanOnly(c.Request.Context())
+	accountID, ok := accountIDFromQuery(c)
+	if !ok {
+		return
 	}
+	summary, err := h.engine.ManualScan(c.Request.Context(), accountID, execute)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, h.engine.Opportunities())
+	c.JSON(http.StatusOK, struct {
+		engine.OpportunityList
+		AutoTrade engine.ScanSummary `json:"auto_trade"`
+	}{OpportunityList: h.engine.Opportunities(), AutoTrade: summary})
 }
 
 func (h *Handler) positions(c *gin.Context) {

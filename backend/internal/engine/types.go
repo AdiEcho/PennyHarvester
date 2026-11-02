@@ -702,6 +702,30 @@ type OpportunityList struct {
 	Source    string        `json:"source"`
 }
 
+// ScanOptions controls one scan pass. Execute enables automatic entries and the
+// stop-loss monitor. A non-zero AccountID scopes execution to one account;
+// zero means every account, which is what the background engine uses.
+type ScanOptions struct {
+	Execute   bool
+	AccountID int64
+	// Manual marks a user-initiated run. It overrides the account's background
+	// AutoTrade switch for this single pass so the radar's "自动下单" choice
+	// takes effect even when background auto trading is disabled.
+	Manual bool
+}
+
+// ScanSummary reports what a scan did for the requesting account. OrdersPlaced
+// counts automatic entries opened by this pass; SkippedHeld counts candidate
+// markets that already had a position record (open, settled or sold) and were
+// therefore not bought again.
+type ScanSummary struct {
+	AccountID    int64  `json:"account_id"`
+	Execute      bool   `json:"execute"`
+	OrdersPlaced int    `json:"orders_placed"`
+	SkippedHeld  int    `json:"skipped_held"`
+	Error        string `json:"error,omitempty"`
+}
+
 type PositionList struct {
 	Items []Position `json:"items"`
 	Total int        `json:"total"`

@@ -104,11 +104,23 @@ export interface Opportunity {
   version?: string | null
 }
 
+// ScanAutoTrade reports what a manual scan did for the requesting account.
+// orders_placed counts new automatic entries; skipped_held counts candidates
+// that already had a position record and were not bought again.
+export interface ScanAutoTrade {
+  account_id: number
+  execute: boolean
+  orders_placed: number
+  skipped_held: number
+  error?: string
+}
+
 export interface OpportunitiesResponse {
   items: Opportunity[]
   total: number
   scanned_at: string | null
   source: string
+  auto_trade?: ScanAutoTrade
 }
 
 // OpportunityQuote is a real-data estimate: the ask book and taker fee come

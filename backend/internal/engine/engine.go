@@ -550,23 +550,45 @@ func (e *Engine) DeleteAccount(ctx context.Context, id int64) error {
 
 // Scan refreshes public data and processes every account, including automatic
 // orders. It is used by the background engine and tests.
-func (e *Engine) Scan(ctx context.Context) error { return e.scan(ctx, true) }
+func (e *Engine) Scan(ctx context.Context) error {
+	_, err := e.scan(ctx, ScanOptions{Execute: true})
+	return err
+}
 
 // ScanOnly refreshes public data, marks positions and writes equity snapshots,
 // but never places an order. Manual scans use this so a user who only wants to
 // refresh the radar cannot accidentally trigger live automatic trading.
-func (e *Engine) ScanOnly(ctx context.Context) error { return e.scan(ctx, false) }
+func (e *Engine) ScanOnly(ctx context.Context) error {
+	_, err := e.scan(ctx, ScanOptions{})
+	return err
+}
 
-func (e *Engine) scan(ctx context.Context, execute bool) error {
+// ManualScan runs a user-initiated scan. A non-zero accountID scopes automatic
+// entries and stop-loss checks to that account, and an explicit execute choice
+// overrides the account's background AutoTrade switch for this one pass. The
+// summary reports how many positions were opened and how many held markets
+// were skipped so the radar can explain the result.
+func (e *Engine) ManualScan(ctx context.Context, accountID int64, execute bool) (ScanSummary, error) {
+	return e.scan(ctx, ScanOptions{Execute: execute, AccountID: accountID, Manual: accountID > 0})
+}
+
+func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, error) {
+	summary := ScanSummary{AccountID: options.AccountID, Execute: options.Execute}
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
+
+	if options.AccountID > 0 {
+		if _, err := e.repo.AccountByID(ctx, options.AccountID); err != nil {
+			return summary, err
+		}
+	}
 
 	settings := e.Settings()
 	markets, err := e.provider.ListOpen(ctx, settings.MaxDays)
 	now := time.Now().UTC()
 	e.recordScan(now, err)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUpstream, err)
+		return summary, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
 
 	opportunities := make([]Opportunity, 0)
@@ -639,49 +661,66 @@ func (e *Engine) scan(ctx context.Context, execute bool) error {
 	accounts, err := e.repo.ListAccounts(ctx)
 	if err != nil {
 		e.setProcessingError(err.Error())
-		return err
+		return summary, err
 	}
 	var processingErrors []string
+	var focusErrors []string
 	for _, account := range accounts {
+		appendError := func(message string) {
+			processingErrors = append(processingErrors, message)
+			if options.AccountID == 0 || options.AccountID == account.ID {
+				focusErrors = append(focusErrors, message)
+			}
+		}
 		unresolved := 0
 		if account.Mode == AccountModeLive {
 			remaining, err := e.reconcileLiveOrders(ctx, account, byID)
 			unresolved = remaining
 			if err != nil {
-				processingErrors = append(processingErrors, fmt.Sprintf("%s 对账: %v", account.Name, err))
+				appendError(fmt.Sprintf("%s 对账: %v", account.Name, err))
 			}
 		}
 		if err := e.refreshPositions(ctx, account.ID, byID); err != nil {
-			processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+			appendError(fmt.Sprintf("%s: %v", account.Name, err))
 			// Do not place new orders against positions whose marks or
 			// settlement state could not be refreshed.
 			unresolved++
 		}
-		if execute && e.isRunning() {
+		// A user-initiated execute pass only touches the selected account;
+		// the other accounts are still marked to market and snapshotted above.
+		scoped := options.AccountID == 0 || options.AccountID == account.ID
+		// An explicit manual request overrides the background AutoTrade switch
+		// for this one pass. Background scans keep respecting it.
+		autoEnabled := account.AutoTrade || options.Manual
+		if options.Execute && scoped && (e.isRunning() || options.Manual) {
 			if unresolved > 0 {
-				processingErrors = append(processingErrors, fmt.Sprintf("%s: 存在未对账或未刷新的持仓，跳过本轮止损与自动交易", account.Name))
+				appendError(fmt.Sprintf("%s: 存在未对账或未刷新的持仓，跳过本轮止损与自动交易", account.Name))
 			} else {
 				// Stop-loss is independent of the auto-entry switch: an operator
 				// who only buys manually still needs an automatic exit. It runs
 				// before new entries so a breached position is reduced first.
 				stopErr := e.runStopLoss(ctx, account, settings)
 				if stopErr != nil {
-					processingErrors = append(processingErrors, fmt.Sprintf("%s 止损: %v", account.Name, stopErr))
+					appendError(fmt.Sprintf("%s 止损: %v", account.Name, stopErr))
 				}
 				// Do not add risk while an exit is failing.
-				if account.AutoTrade && stopErr == nil {
-					if err := e.autoTrade(ctx, account, opportunities, settings); err != nil {
-						processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+				if autoEnabled && stopErr == nil {
+					outcome, tradeErr := e.autoTrade(ctx, account, opportunities, settings)
+					summary.OrdersPlaced += outcome.Placed
+					summary.SkippedHeld += outcome.SkippedHeld
+					if tradeErr != nil {
+						appendError(fmt.Sprintf("%s: %v", account.Name, tradeErr))
 					}
 				}
 			}
 		}
 		if err := e.snapshot(ctx, account); err != nil {
-			processingErrors = append(processingErrors, fmt.Sprintf("%s: %v", account.Name, err))
+			appendError(fmt.Sprintf("%s: %v", account.Name, err))
 		}
 	}
+	summary.Error = strings.Join(focusErrors, "; ")
 	e.setProcessingError(strings.Join(processingErrors, "; "))
-	return nil
+	return summary, nil
 }
 
 func (e *Engine) recordScan(at time.Time, scanErr error) {
@@ -765,7 +804,13 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 	return nil
 }
 
-func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) error {
+// autoTradeOutcome summarizes one account's automatic entry pass.
+type autoTradeOutcome struct {
+	Placed      int
+	SkippedHeld int
+}
+
+func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (autoTradeOutcome, error) {
 	if account.Mode == AccountModeLive {
 		return e.autoLiveTrade(ctx, account, opportunities, settings)
 	}
@@ -795,20 +840,24 @@ func withinAutoEntryWindow(opportunity Opportunity, settings Settings, now time.
 	return remaining > 0 && remaining <= window
 }
 
-func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) error {
+func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (outcome autoTradeOutcome, err error) {
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
 	if err != nil {
-		return err
+		return outcome, err
 	}
 	// Every position, open or already settled, is the durable "already
 	// ordered" mark for its market. One automatic entry per market is enough:
 	// a second outcome of the same binary market is the mirror bet, and a
 	// settled market must never be re-entered by a later scan.
 	orderedMarkets := make(map[string]bool, len(positions))
+	heldMarkets := make(map[string]bool, len(positions))
+	skippedMarkets := make(map[string]bool)
+	defer func() { outcome.SkippedHeld = len(skippedMarkets) }()
 	marketExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
 		orderedMarkets[position.MarketID] = true
+		heldMarkets[position.MarketID] = true
 		realized += position.RealizedPNL
 		if position.Status != "open" {
 			continue
@@ -824,6 +873,9 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	now := time.Now().UTC()
 	for _, opportunity := range opportunities {
 		if orderedMarkets[opportunity.MarketID] {
+			if heldMarkets[opportunity.MarketID] {
+				skippedMarkets[opportunity.MarketID] = true
+			}
 			continue
 		}
 		if !withinAutoEntryWindow(opportunity, settings, now) {
@@ -851,32 +903,37 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 			if errors.Is(err, ErrInvalidOrder) {
 				continue
 			}
-			return err
+			return outcome, err
 		}
+		outcome.Placed++
 		orderedMarkets[position.MarketID] = true
 		marketExposure[position.MarketID] += position.Cost
 		totalExposure += position.Cost
 		cash -= position.Cost
 	}
-	return nil
+	return outcome, nil
 }
 
-func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) error {
+func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (outcome autoTradeOutcome, err error) {
 	if e.live == nil || !e.live.Configured() {
-		return fmt.Errorf("%w: 实盘自动交易已开启，但未配置 POLYMARKET_PRIVATE_KEY", ErrLiveUnavailable)
+		return outcome, fmt.Errorf("%w: 实盘自动交易已开启，但未配置 POLYMARKET_PRIVATE_KEY", ErrLiveUnavailable)
 	}
 	if message := e.live.ReadyError(); message != "" {
-		return fmt.Errorf("%w: 实盘自动交易已开启，但实盘凭据未就绪: %s", ErrLiveUnavailable, message)
+		return outcome, fmt.Errorf("%w: 实盘自动交易已开启，但实盘凭据未就绪: %s", ErrLiveUnavailable, message)
 	}
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
 	if err != nil {
-		return err
+		return outcome, err
 	}
 	orderedMarkets := make(map[string]bool)
+	heldMarkets := make(map[string]bool, len(positions))
+	skippedMarkets := make(map[string]bool)
+	defer func() { outcome.SkippedHeld = len(skippedMarkets) }()
 	marketExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
 		orderedMarkets[position.MarketID] = true
+		heldMarkets[position.MarketID] = true
 		realized += position.RealizedPNL
 		if position.Status == "open" {
 			marketExposure[position.MarketID] += position.Cost
@@ -889,7 +946,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	strategyCash := account.BaselineEquity + realized - totalExposure
 	snapshot, err := e.live.Collateral(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: 读取实盘 pUSD 余额失败: %v", ErrLiveUnavailable, err)
+		return outcome, fmt.Errorf("%w: 读取实盘 pUSD 余额失败: %v", ErrLiveUnavailable, err)
 	}
 	cash := math.Min(strategyCash, snapshot.Amount)
 	now := time.Now().UTC()
@@ -897,6 +954,9 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		// orderedMarkets is keyed by market: all positions, including settled ones,
 		// mark the market as already ordered so auto trading cannot re-enter it.
 		if orderedMarkets[opportunity.MarketID] {
+			if heldMarkets[opportunity.MarketID] {
+				skippedMarkets[opportunity.MarketID] = true
+			}
 			continue
 		}
 		if !withinAutoEntryWindow(opportunity, settings, now) {
@@ -914,10 +974,10 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		budget := settings.OrderSize
 		estimatedFee, feeErr := e.live.EstimateBuyFee(ctx, opportunity.ConditionID, budget, opportunity.Price)
 		if feeErr != nil {
-			return fmt.Errorf("%w: 估算实盘手续费失败: %v", ErrLiveUnavailable, feeErr)
+			return outcome, fmt.Errorf("%w: 估算实盘手续费失败: %v", ErrLiveUnavailable, feeErr)
 		}
 		if estimatedFee < 0 || math.IsNaN(estimatedFee) || math.IsInf(estimatedFee, 0) {
-			return fmt.Errorf("%w: 实盘手续费估算无效", ErrLiveUnavailable)
+			return outcome, fmt.Errorf("%w: 实盘手续费估算无效", ErrLiveUnavailable)
 		}
 		cost := budget + estimatedFee
 		if totalExposure+cost > settings.MaxExposure+1e-9 {
@@ -927,7 +987,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 			continue
 		}
 		if cost > cash+1e-9 {
-			return fmt.Errorf("%w: 实盘策略资金不足（含预估手续费）", ErrInvalidOrder)
+			return outcome, fmt.Errorf("%w: 实盘策略资金不足（含预估手续费）", ErrInvalidOrder)
 		}
 		if snapshot.Allowance > 0 && cost > snapshot.Allowance+1e-9 {
 			break
@@ -937,14 +997,15 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 			if errors.Is(err, ErrInvalidOrder) || errors.Is(err, ErrLiveUnavailable) {
 				continue
 			}
-			return err
+			return outcome, err
 		}
+		outcome.Placed++
 		orderedMarkets[position.MarketID] = true
 		marketExposure[position.MarketID] += position.Cost
 		totalExposure += position.Cost
 		cash -= position.Cost
 	}
-	return nil
+	return outcome, nil
 }
 
 // runStopLoss checks every open position of an account against the configured
