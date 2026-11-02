@@ -48,7 +48,7 @@ func testProvider() *fixtureProvider {
 		"test-1": {
 			ID: "test-1", ConditionID: "condition-test-1", Question: "API test market",
 			Slug: "api-test-market", Active: true, Liquidity: 25000, Volume: 90000,
-			EndDate: time.Now().UTC().AddDate(0, 0, 3),
+			EndDate: time.Now().UTC().Add(10 * time.Minute),
 			Outcomes: []market.Outcome{
 				{Name: "Yes", TokenID: "yes", Price: 0.98},
 				{Name: "No", TokenID: "no", Price: 0.02},

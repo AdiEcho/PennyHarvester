@@ -80,9 +80,20 @@ type Settings struct {
 	// MaxPriceChange24h rejects markets whose reference price moved more than
 	// this amount in the last 24 hours. Zero disables the guard.
 	MaxPriceChange24h float64 `json:"max_price_change_24h"`
+	// EntryWindowMinutes only lets automatic buys happen during the last N
+	// minutes before a market closes. Sports markets use
+	// SportsEntryWindowMinutes instead because their result can still swing in
+	// overtime. Zero disables the gate for that group.
+	EntryWindowMinutes       int `json:"entry_window_minutes"`
+	SportsEntryWindowMinutes int `json:"sports_entry_window_minutes"`
 	// FeeModelVersion is managed by the server; clients must not set it.
 	FeeModelVersion int `json:"fee_model_version"`
 }
+
+// MaxEntryWindowMinutes bounds the pre-close entry window. A window longer
+// than a day has no practical use for this strategy and would mostly mask a
+// configuration mistake.
+const MaxEntryWindowMinutes = 1440
 
 const (
 	RadarCategoryAll       = "all"
@@ -129,6 +140,7 @@ func DefaultSettings() Settings {
 		ScanIntervalSeconds: 60, SlippageBPS: 20, FeeBPS: DefaultFeeBPS,
 		InitialBankroll: 10000, DefaultCategory: RadarCategoryNonSports,
 		SportsPolicy: SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
+		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5,
 		FeeModelVersion: FeeModelVersion,
 	}
 }
@@ -169,6 +181,12 @@ func (s Settings) Validate() error {
 	if s.MaxPriceChange24h < 0 || s.MaxPriceChange24h > 1 ||
 		math.IsNaN(s.MaxPriceChange24h) || math.IsInf(s.MaxPriceChange24h, 0) {
 		return fmt.Errorf("24 小时价格波动上限须为 0–1")
+	}
+	if s.EntryWindowMinutes < 0 || s.EntryWindowMinutes > MaxEntryWindowMinutes {
+		return fmt.Errorf("非体育尾盘下单窗口须为 0–%d 分钟", MaxEntryWindowMinutes)
+	}
+	if s.SportsEntryWindowMinutes < 0 || s.SportsEntryWindowMinutes > MaxEntryWindowMinutes {
+		return fmt.Errorf("体育尾盘下单窗口须为 0–%d 分钟", MaxEntryWindowMinutes)
 	}
 	return nil
 }

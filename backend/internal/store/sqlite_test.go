@@ -219,6 +219,10 @@ func TestLegacySettingsPayloadUsesDefaultsForMissingFields(t *testing.T) {
 	if settings.FeeModelVersion != engine.FeeModelVersion {
 		t.Fatalf("fee model version not stamped: %+v", settings)
 	}
+	defaults := engine.DefaultSettings()
+	if settings.EntryWindowMinutes != defaults.EntryWindowMinutes || settings.SportsEntryWindowMinutes != defaults.SportsEntryWindowMinutes {
+		t.Fatalf("missing entry windows should use the defaults: %+v", settings)
+	}
 
 	// A row written by the current build keeps an explicit zero fee.
 	deliberate := settings

@@ -758,20 +758,47 @@ func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities [
 	return e.autoPaperTrade(ctx, account, opportunities, settings)
 }
 
+// autoEntryWindow returns the configured pre-close entry window for an
+// opportunity. Sports markets use their own, usually shorter, window because
+// overtime and late-game swings can still change the result.
+func autoEntryWindow(opportunity Opportunity, settings Settings) time.Duration {
+	minutes := settings.EntryWindowMinutes
+	if opportunity.SportsGame || opportunity.Category == string(market.CategorySports) {
+		minutes = settings.SportsEntryWindowMinutes
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// withinAutoEntryWindow keeps automatic entries inside the last minutes before
+// a market closes, when a 0.95–0.99 tail price has little time left to reverse.
+// A zero window disables the gate. Manual orders are never gated.
+func withinAutoEntryWindow(opportunity Opportunity, settings Settings, now time.Time) bool {
+	window := autoEntryWindow(opportunity, settings)
+	if window <= 0 {
+		return true
+	}
+	remaining := opportunity.EndDate.Sub(now)
+	return remaining > 0 && remaining <= window
+}
+
 func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) error {
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all")
 	if err != nil {
 		return err
 	}
-	heldTokens := make(map[string]bool, len(positions))
+	// Every position, open or already settled, is the durable "already
+	// ordered" mark for its market. One automatic entry per market is enough:
+	// a second outcome of the same binary market is the mirror bet, and a
+	// settled market must never be re-entered by a later scan.
+	orderedMarkets := make(map[string]bool, len(positions))
 	marketExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
+		orderedMarkets[position.MarketID] = true
 		if position.Status != "open" {
 			realized += position.RealizedPNL
 			continue
 		}
-		heldTokens[position.TokenID] = true
 		marketExposure[position.MarketID] += position.Cost
 		totalExposure += position.Cost
 	}
@@ -780,8 +807,12 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		baseline = settings.InitialBankroll
 	}
 	cash := baseline + realized - totalExposure
+	now := time.Now().UTC()
 	for _, opportunity := range opportunities {
-		if heldTokens[opportunity.TokenID] {
+		if orderedMarkets[opportunity.MarketID] {
+			continue
+		}
+		if !withinAutoEntryWindow(opportunity, settings, now) {
 			continue
 		}
 		fee := settings.OrderSize * settings.FeeBPS / 10000
@@ -808,7 +839,7 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 			}
 			return err
 		}
-		heldTokens[position.TokenID] = true
+		orderedMarkets[position.MarketID] = true
 		marketExposure[position.MarketID] += position.Cost
 		totalExposure += position.Cost
 		cash -= position.Cost
@@ -827,11 +858,11 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	if err != nil {
 		return err
 	}
-	heldTokens := make(map[string]bool)
+	orderedMarkets := make(map[string]bool)
 	marketExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
-		heldTokens[position.TokenID] = true
+		orderedMarkets[position.MarketID] = true
 		if position.Status == "open" {
 			marketExposure[position.MarketID] += position.Cost
 			totalExposure += position.Cost
@@ -848,8 +879,14 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		return fmt.Errorf("%w: 读取实盘 pUSD 余额失败: %v", ErrLiveUnavailable, err)
 	}
 	cash := math.Min(strategyCash, snapshot.Amount)
+	now := time.Now().UTC()
 	for _, opportunity := range opportunities {
-		if heldTokens[opportunity.TokenID] {
+		// orderedMarkets is keyed by market: all positions, including settled ones,
+		// mark the market as already ordered so auto trading cannot re-enter it.
+		if orderedMarkets[opportunity.MarketID] {
+			continue
+		}
+		if !withinAutoEntryWindow(opportunity, settings, now) {
 			continue
 		}
 		if opportunity.ConditionID == "" {
@@ -889,7 +926,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 			}
 			return err
 		}
-		heldTokens[position.TokenID] = true
+		orderedMarkets[position.MarketID] = true
 		marketExposure[position.MarketID] += position.Cost
 		totalExposure += position.Cost
 		cash -= position.Cost

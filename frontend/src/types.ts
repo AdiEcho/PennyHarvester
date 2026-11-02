@@ -208,6 +208,8 @@ export interface Settings {
   default_category: string
   sports_policy: string
   max_price_change_24h: number
+  entry_window_minutes: number
+  sports_entry_window_minutes: number
 }
 
 export type ProxyMode = 'environment' | 'custom' | 'off'

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Activity,
+  Clock,
   FlaskConical,
   Gauge,
   Info,
@@ -33,7 +34,7 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { ModeBadge } from '@/components/status-badges'
 
-const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h'] as const
+const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes'] as const
 const selectKeys = ['default_category', 'sports_policy'] as const
 type NumericKey = typeof numericKeys[number]
 type SelectKey = typeof selectKeys[number]
@@ -74,6 +75,8 @@ function toDraft(settings: Settings): Draft {
     default_category: settings.default_category,
     sports_policy: settings.sports_policy,
     max_price_change_24h: String(settings.max_price_change_24h),
+    entry_window_minutes: String(settings.entry_window_minutes),
+    sports_entry_window_minutes: String(settings.sports_entry_window_minutes),
   }
 }
 
@@ -93,6 +96,8 @@ function toSettings(draft: Draft): Settings {
     default_category: draft.default_category,
     sports_policy: draft.sports_policy,
     max_price_change_24h: Number(draft.max_price_change_24h),
+    entry_window_minutes: Number(draft.entry_window_minutes),
+    sports_entry_window_minutes: Number(draft.sports_entry_window_minutes),
   }
 }
 
@@ -119,6 +124,8 @@ function validate(settings: Settings): FieldErrors {
   if (!defaultCategoryOptions.some((option) => option.value === settings.default_category)) errors.default_category = '请选择有效的默认分类。'
   if (!sportsPolicyOptions.some((option) => option.value === settings.sports_policy)) errors.sports_policy = '请选择有效的体育市场策略。'
   if (settings.max_price_change_24h < 0 || settings.max_price_change_24h > 1) errors.max_price_change_24h = '请输入 0–1 之间的数值（0 表示不限制）。'
+  if (!Number.isInteger(settings.entry_window_minutes) || settings.entry_window_minutes < 0 || settings.entry_window_minutes > 1440) errors.entry_window_minutes = '请输入 0–1440 之间的整数分钟数。'
+  if (!Number.isInteger(settings.sports_entry_window_minutes) || settings.sports_entry_window_minutes < 0 || settings.sports_entry_window_minutes > 1440) errors.sports_entry_window_minutes = '请输入 0–1440 之间的整数分钟数。'
   return errors
 }
 
@@ -497,6 +504,17 @@ export function SettingsView() {
               <NumberField id="order_size" label="单笔金额" description="每次自动买入的目标名义金额；机会雷达的「真实收益」也按此金额报价。" value={draft.order_size} unit="USD" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
               <NumberField id="max_position" label="单市场持仓上限" description="不得低于单笔金额。" value={draft.max_position} unit="USD" min={0} error={errors.max_position} onChange={(value) => update('max_position', value)} />
               <NumberField id="max_exposure" label="总敞口上限" description="全部未平仓头寸的风险预算上限。" value={draft.max_exposure} unit="USD" min={0} error={errors.max_exposure} onChange={(value) => update('max_exposure', value)} />
+            </div>
+          </SettingsSection>
+
+          <SettingsSection icon={Clock} title="尾盘下单窗口" description="自动买入只会在市场收盘前的窗口内执行；窗口外只保留候选，不会下单。手动买入不受限制。">
+            <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2">
+              <NumberField id="entry_window_minutes" label="非体育类下单窗口" description="距收盘多少分钟开始允许自动买入；0 表示不限制。" value={draft.entry_window_minutes} unit="分钟" min={0} max={1440} step="1" error={errors.entry_window_minutes} onChange={(value) => update('entry_window_minutes', value)} />
+              <NumberField id="sports_entry_window_minutes" label="体育类下单窗口" description="体育分类使用更短的窗口，避开临场加时与赔率剧烈波动；0 表示不限制。" value={draft.sports_entry_window_minutes} unit="分钟" min={0} max={1440} step="1" error={errors.sports_entry_window_minutes} onChange={(value) => update('sports_entry_window_minutes', value)} />
+            </div>
+            <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div className="rounded-xl bg-surface p-2.5 text-slate-500"><Info className="h-5 w-5" /></div>
+              <div className="flex-1"><p className="text-sm font-semibold text-slate-800">每个盘口只会自动下单一次</p><p className="mt-1 text-xs leading-5 text-slate-500">自动买入成功后会把该盘口标记为已下单；之后无论持仓是否已结算、盘口是否重新出现，都不会再次自动买入。窗口以市场到期时间为准，实际成交时点还受扫描间隔影响，可能晚于窗口起点最多一个扫描周期。</p></div>
             </div>
           </SettingsSection>
 

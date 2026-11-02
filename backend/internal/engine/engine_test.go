@@ -124,6 +124,13 @@ func binary(id string, price, liquidity float64, days int) market.Market {
 	}
 }
 
+// nearClose rewrites a test market's end date relative to now so automatic
+// entry-window tests do not have to use multi-day fixtures.
+func nearClose(item market.Market, remaining time.Duration) market.Market {
+	item.EndDate = time.Now().UTC().Add(remaining)
+	return item
+}
+
 func newTestEngine(t *testing.T, provider market.Provider, live engine.LiveExecutor) (*engine.Engine, *store.SQLite) {
 	t.Helper()
 	repository, err := store.Open(context.Background(), ":memory:")
@@ -556,8 +563,8 @@ func TestPaperOrderRiskAndSlippageRejection(t *testing.T) {
 
 func TestAutoPaperTradeHonorsExposureAndDoesNotDuplicate(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{
-		"one": binary("one", 0.98, 20000, 2),
-		"two": binary("two", 0.97, 20000, 3),
+		"one": nearClose(binary("one", 0.98, 20000, 2), 10*time.Minute),
+		"two": nearClose(binary("two", 0.97, 20000, 3), 11*time.Minute),
 	}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
@@ -585,8 +592,8 @@ func TestAutoPaperTradeHonorsExposureAndDoesNotDuplicate(t *testing.T) {
 
 func TestAutoTradeWithInsufficientCashSkipsWithoutSpam(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{
-		"one": binary("one", 0.98, 20000, 2),
-		"two": binary("two", 0.97, 20000, 3),
+		"one": nearClose(binary("one", 0.98, 20000, 2), 10*time.Minute),
+		"two": nearClose(binary("two", 0.97, 20000, 3), 11*time.Minute),
 	}}
 	instance, repository := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
@@ -613,6 +620,173 @@ func TestAutoTradeWithInsufficientCashSkipsWithoutSpam(t *testing.T) {
 	orders, _ := instance.Orders(context.Background(), paper.ID, "all", 10, 0)
 	if orders.Total != 0 {
 		t.Fatalf("automatic cash rejection should be skipped before logging: %+v", orders.Items)
+	}
+}
+
+func TestAutoTradeWaitsForEntryWindow(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"soon": nearClose(binary("soon", 0.98, 20000, 2), 30*time.Minute),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 0 {
+		t.Fatalf("auto trade must wait until the 20-minute window: %+v", positions.Items)
+	}
+
+	item := provider.markets["soon"]
+	item.EndDate = time.Now().UTC().Add(10 * time.Minute)
+	provider.markets["soon"] = item
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	positions, err = instance.Positions(context.Background(), paper.ID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("auto trade should enter inside the window: %+v", positions.Items)
+	}
+}
+
+func TestAutoTradeUsesShorterSportsEntryWindow(t *testing.T) {
+	item := nearClose(binary("sports-future", 0.98, 20000, 2), 10*time.Minute)
+	item.Tags = []market.Tag{{ID: "sports", Label: "Sports", Slug: "sports"}}
+	provider := &fakeProvider{markets: map[string]market.Market{"sports-future": item}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 0 {
+		t.Fatalf("sports markets must wait until the 5-minute window: %+v", positions.Items)
+	}
+
+	item.EndDate = time.Now().UTC().Add(4 * time.Minute)
+	provider.markets["sports-future"] = item
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	positions, err = instance.Positions(context.Background(), paper.ID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("sports markets should enter inside their 5-minute window: %+v", positions.Items)
+	}
+}
+
+func TestAutoTradeMarksMarketAsOrdered(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		// Both outcomes are inside the configured price range, so only the
+		// per-market mark prevents a second automatic entry.
+		"two-sided": nearClose(binary("two-sided", 0.60, 20000, 2), 10*time.Minute),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	settings := instance.Settings()
+	settings.MinPrice = 0.40
+	settings.MaxPrice = 0.99
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := instance.Scan(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("a market must only be auto-ordered once: %+v", positions.Items)
+	}
+	orders, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orders.Total != 1 {
+		t.Fatalf("expected exactly one filled automatic order, got %+v", orders.Items)
+	}
+}
+
+func TestAutoTradeDoesNotReenterSettledMarket(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"one": nearClose(binary("one", 0.98, 20000, 2), 10*time.Minute),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	item := provider.markets["one"]
+	item.Closed = true
+	item.Active = false
+	item.ResolutionStatus = "resolved"
+	item.Outcomes[0].Price = 1
+	item.Outcomes[1].Price = 0
+	provider.markets["one"] = item
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the upstream listing the same market as an open opportunity
+	// again. The settled position must still block a second automatic entry.
+	item.Closed = false
+	item.Active = true
+	item.ResolutionStatus = ""
+	item.Outcomes[0].Price = 0.98
+	item.Outcomes[1].Price = 0.02
+	item.EndDate = time.Now().UTC().Add(10 * time.Minute)
+	provider.markets["one"] = item
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	open, err := instance.Positions(context.Background(), paper.ID, "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.Total != 0 {
+		t.Fatalf("a settled market must not be re-entered: %+v", open.Items)
+	}
+	won, err := instance.Positions(context.Background(), paper.ID, "won")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won.Total != 1 {
+		t.Fatalf("expected the original settled position to remain: %+v", won.Items)
+	}
+	filled, err := instance.Orders(context.Background(), paper.ID, "filled", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filled.Total != 1 {
+		t.Fatalf("expected exactly one filled order, got %+v", filled.Items)
 	}
 }
 
@@ -803,7 +977,7 @@ func TestSplitSettlementUsesSplitStatusAndManualKind(t *testing.T) {
 }
 
 func TestScanOnlyDoesNotAutoTrade(t *testing.T) {
-	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	provider := &fakeProvider{markets: map[string]market.Market{"one": nearClose(binary("one", 0.98, 20000, 2), 10*time.Minute)}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
 	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil); err != nil {
