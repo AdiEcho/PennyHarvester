@@ -240,7 +240,7 @@ function validate(draft: Draft): FieldErrors {
     const key = (field: VenueNumericKey) => `${venue}.${field}`
     for (const field of venueNumericKeys) {
       if (current[field].trim() !== '' && !Number.isFinite(Number(current[field]))) {
-        errors[key(field)] = '请输入有效数字；留空表示继承全局值。'
+        errors[key(field)] = '请输入有效数字；留空表示继承账户策略值。'
       }
     }
     const orderSize = numberOrZero(current.order_size) || shared.order_size
@@ -250,7 +250,7 @@ function validate(draft: Draft): FieldErrors {
     if (current.order_size.trim() !== '' && orderSize <= 0) errors[key('order_size')] = '单笔金额必须大于 0。'
     if (maxPosition < orderSize) errors[key('max_position')] = `单市场持仓上限不能低于单笔金额（当前生效 ${orderSize}）。`
     if (maxExposure < maxPosition) errors[key('max_exposure')] = `总敞口上限不能低于单市场持仓上限（当前生效 ${maxPosition}）。`
-    if ((current.fee_bps.trim() !== '' && (feeBps < 0 || feeBps > 1000)) || feeBps > 1000) errors[key('fee_bps')] = '费用范围为 0–1000 bps（0 表示继承全局值）。'
+    if ((current.fee_bps.trim() !== '' && (feeBps < 0 || feeBps > 1000)) || feeBps > 1000) errors[key('fee_bps')] = '费用范围为 0–1000 bps（留空表示继承账户策略值）。'
     if (current.min_liquidity.trim() !== '' && numberOrZero(current.min_liquidity) < 0) errors[key('min_liquidity')] = '最低流动性不能小于 0。'
   }
   // The stop-loss sells a whole position as a limit order, and every venue floors
@@ -546,13 +546,13 @@ function VenueSettingsSection({ venue, draft, shared, errors, onChange }: {
     max_exposure: Number(shared.max_exposure),
     fee_bps: Number(shared.fee_bps),
   }
-  const placeholder = (field: VenueNumericKey) => (Number.isFinite(inherited[field]) ? `继承全局 ${inherited[field]}` : '继承全局值')
-  const inheritLiquidity = Number.isFinite(inherited.min_liquidity) ? inherited.min_liquidity.toLocaleString() : '全局值'
+  const placeholder = (field: VenueNumericKey) => (Number.isFinite(inherited[field]) ? `继承账户策略 ${inherited[field]}` : '继承账户策略值')
+  const inheritLiquidity = Number.isFinite(inherited.min_liquidity) ? inherited.min_liquidity.toLocaleString() : '账户策略值'
   return (
     <SettingsSection
       icon={ShieldCheck}
       title={`${meta.label} 场所参数`}
-      description={`${meta.label} 以 ${meta.currency} 计价（${meta.quoteDecimals} 位精度），订单类型 ${meta.orderTypes.join(' / ')}。留空的数字表示继承「策略」页的全局值。`}
+      description={`${meta.label} 以 ${meta.currency} 计价（${meta.quoteDecimals} 位精度），订单类型 ${meta.orderTypes.join(' / ')}。留空的数字表示继承当前账户「策略」页的值。`}
     >
       <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-start gap-3">
@@ -569,11 +569,11 @@ function VenueSettingsSection({ venue, draft, shared, errors, onChange }: {
       </div>
 
       <div className="mt-6 grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
-        <NumberField id={`${venue}-min-liquidity`} label="最低流动性" description={venue === 'predictfun' ? `低于此值的市场不进入雷达。Predict.fun 的盘口深度通常远低于 Polymarket（实测 $90–$315k），建议设一个更低的门槛。留空继承全局值（当前 ${inheritLiquidity}）。` : `低于此值的市场不进入雷达。留空继承全局值（当前 ${inheritLiquidity}）。`} value={draft.min_liquidity} unit={meta.currency} min={0} placeholder={placeholder('min_liquidity')} error={errors[`${venue}.min_liquidity`]} onChange={(value) => onChange({ min_liquidity: value })} />
+        <NumberField id={`${venue}-min-liquidity`} label="最低流动性" description={venue === 'predictfun' ? `低于此值的市场不进入雷达。Predict.fun 的盘口深度通常远低于 Polymarket（实测 $90–$315k），建议设一个更低的门槛。留空继承账户策略值（当前 ${inheritLiquidity}）。` : `低于此值的市场不进入雷达。留空继承账户策略值（当前 ${inheritLiquidity}）。`} value={draft.min_liquidity} unit={meta.currency} min={0} placeholder={placeholder('min_liquidity')} error={errors[`${venue}.min_liquidity`]} onChange={(value) => onChange({ min_liquidity: value })} />
         <NumberField id={`${venue}-order-size`} label="单笔金额" description={`该场所每次自动买入的目标名义金额。雷达「真实收益」也按此金额报价。单位 ${meta.currency}。`} value={draft.order_size} unit={meta.currency} min={0} placeholder={placeholder('order_size')} error={errors[`${venue}.order_size`]} onChange={(value) => onChange({ order_size: value })} />
         <NumberField id={`${venue}-max-position`} label="单市场持仓上限" description={`不得低于该场所生效的单笔金额。单位 ${meta.currency}。`} value={draft.max_position} unit={meta.currency} min={0} placeholder={placeholder('max_position')} error={errors[`${venue}.max_position`]} onChange={(value) => onChange({ max_position: value })} />
         <NumberField id={`${venue}-max-exposure`} label="总敞口上限" description={`该场所全部未平仓头寸的风险预算上限，不得低于单市场上限。单位 ${meta.currency}，绝不与其他场所相加。`} value={draft.max_exposure} unit={meta.currency} min={0} placeholder={placeholder('max_exposure')} error={errors[`${venue}.max_exposure`]} onChange={(value) => onChange({ max_exposure: value })} />
-        <NumberField id={`${venue}-fee-bps`} label="Paper 费用" description={venue === 'predictfun' ? '0–1000 bps，仅用于模拟成交；Predict.fun 实际按 费率 × min(p,1−p) × 份额 收取，maker 0 费。留空继承全局值。' : '0–1000 bps，仅用于模拟成交；留空继承全局值。'} value={draft.fee_bps} unit="bps" min={0} max={1000} placeholder={placeholder('fee_bps')} error={errors[`${venue}.fee_bps`]} onChange={(value) => onChange({ fee_bps: value })} />
+        <NumberField id={`${venue}-fee-bps`} label="Paper 费用" description={venue === 'predictfun' ? '0–1000 bps，仅用于模拟成交；Predict.fun 实际按 费率 × min(p,1−p) × 份额 收取，maker 0 费。留空继承账户策略值。' : '0–1000 bps，仅用于模拟成交；留空继承账户策略值。'} value={draft.fee_bps} unit="bps" min={0} max={1000} placeholder={placeholder('fee_bps')} error={errors[`${venue}.fee_bps`]} onChange={(value) => onChange({ fee_bps: value })} />
       </div>
       <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
         <div className="rounded-xl bg-surface p-2.5 text-slate-500"><Info className="h-5 w-5" /></div>
@@ -600,8 +600,11 @@ export function SettingsView() {
   const [engineOverride, setEngineOverride] = useState<Engine | null>(null)
   const saveController = useRef<AbortController | null>(null)
   const latestSettings = useRef<Settings | null>(null)
+  const draftAccount = useRef<number | undefined>(undefined)
   const { toast } = useToast()
-  const fetchSettings = useCallback((signal: AbortSignal) => api.settings(signal), [])
+  // Settings are stored per account: both the read and the write carry the
+  // selected account id so switching accounts never mixes their strategies.
+  const fetchSettings = useCallback((signal: AbortSignal) => api.settings(signal, account?.id), [account?.id])
   const fetchDashboard = useCallback((signal: AbortSignal) => api.dashboard(account?.id, signal), [account?.id])
   const settingsQuery = usePolling(fetchSettings, { interval: 30000 })
   const dashboardQuery = usePolling(fetchDashboard, { enabled: Boolean(account?.id) })
@@ -609,11 +612,24 @@ export function SettingsView() {
   const isLive = account?.mode === 'live'
   const accountVenue = venueOf(account)
 
+  // usePolling clears its data when the fetcher identity changes, so an
+  // account switch drops the previous account's settings and rebuilds the form
+  // from the newly loaded block. Unsaved edits are discarded on purpose.
+  useEffect(() => {
+    if (draftAccount.current === account?.id) return
+    draftAccount.current = account?.id
+    latestSettings.current = null
+    setDraft(null)
+    setDirty(false)
+    setErrors({})
+    setTab('shared')
+  }, [account?.id])
+
   useEffect(() => {
     if (!settingsQuery.data) return
     latestSettings.current = settingsQuery.data
     if (!dirty) setDraft(toDraft(settingsQuery.data))
-  }, [settingsQuery.data])
+  }, [settingsQuery.data, dirty])
 
   useEffect(() => () => saveController.current?.abort(), [])
 
@@ -670,20 +686,20 @@ export function SettingsView() {
       toast({ title: '保存失败', description: '尚未读取到后端参数，请稍后重试。', variant: 'error' })
       return
     }
-    // One PUT carries the global fields plus both venues, built from the loaded
-    // object so unrendered fields are never dropped.
+    // One PUT carries the account's strategy fields plus both venues, built from
+    // the loaded object so unrendered fields are never dropped.
     const payload = toPayload(base, draft)
     saveController.current?.abort()
     const controller = new AbortController()
     saveController.current = controller
     setSaving(true)
     try {
-      const saved = await api.updateSettings(payload, controller.signal)
+      const saved = await api.updateSettings(payload, controller.signal, account?.id)
       latestSettings.current = saved
       setDraft(toDraft(saved))
       setDirty(false)
       setErrors({})
-      toast({ title: '参数已保存', description: '策略与两个场所的参数已提交，后续扫描与风控将使用该配置。', variant: 'success' })
+      toast({ title: '参数已保存', description: `当前账户${account ? `「${account.name}」` : ''}的策略与两个场所参数已提交；其他账户不受影响。`, variant: 'success' })
       settingsQuery.refresh()
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
@@ -709,7 +725,7 @@ export function SettingsView() {
 
   return (
     <>
-      <PageHeader eyebrow={isLive ? 'LIVE CONFIGURATION' : 'PAPER CONFIGURATION'} title="参数设置" description={isLive ? `配置公共行情筛选、实盘风控与账户级自动交易。实盘成交价由所选场所（${venueLabel(accountVenue)}）的订单簿决定。` : '配置公共行情筛选、虚拟资金与 Paper 成交参数。市场筛选与风控对各场所同时生效，场所页签可覆写金额与费率。'} />
+      <PageHeader eyebrow={isLive ? 'LIVE CONFIGURATION' : 'PAPER CONFIGURATION'} title="参数设置" description={account ? `配置当前账户「${account.name}」的${isLive ? '行情筛选、实盘风控与自动交易参数' : '行情筛选、虚拟资金与 Paper 成交参数'}；每个账户保存自己的策略，互不影响。实盘成交价由所选场所（${venueLabel(accountVenue)}）的订单簿决定。` : '正在载入账户信息…'} />
 
       <Card className="mb-4 overflow-hidden border-navy bg-navy text-white">
         <div className="flex flex-col gap-5 p-5 sm:flex-row sm:items-center sm:p-6">
@@ -727,13 +743,13 @@ export function SettingsView() {
           {settingsQuery.error && <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">后台刷新失败，当前表单仍可编辑：{settingsQuery.error}</div>}
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <TabBar items={tabs} value={tab} onChange={setTab} label="参数分类" />
-            <p className="text-xs text-slate-500">「策略」是全局默认值；场所页签只覆写单笔金额、敞口与费用。</p>
+            <p className="text-xs text-slate-500">「策略」是当前账户的筛选与风控参数；场所页签只覆写单笔金额、敞口与费用。</p>
           </div>
 
           <div role="tabpanel" aria-label={tab === 'shared' ? '策略参数' : `${venueMeta(tab).label} 场所参数`} className="space-y-4">
           {tab === 'shared' ? (
             <>
-              <SettingsSection icon={SlidersHorizontal} title="市场筛选" description="只保留符合价格、到期时间、流动性与分类要求的公开市场候选。实盘与模拟共用同一套筛选条件；默认分类只决定雷达打开时的分类。">
+              <SettingsSection icon={SlidersHorizontal} title="市场筛选" description="只保留符合价格、到期时间、流动性与分类要求的公开市场候选。筛选条件属于当前账户；默认分类只决定雷达打开时的分类。">
                 <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
                   <NumberField id="min_price" label="最低指示价格" description="概率（0–1），必须大于 0，且不高于最高价格。" value={draft.shared.min_price} unit="0–1" min={0} max={1} error={errors.min_price} onChange={(value) => update('min_price', value)} />
                   <NumberField id="max_price" label="最高指示价格" description="概率（0–1），必须小于 1，且不低于最低价格。" value={draft.shared.max_price} unit="0–1" min={0} max={1} error={errors.max_price} onChange={(value) => update('max_price', value)} />
@@ -754,9 +770,9 @@ export function SettingsView() {
                 </div>
               </SettingsSection>
 
-              <SettingsSection icon={ShieldCheck} title="资金与风控（全局默认值）" description="这里的金额是各场所的默认值，单位随场所变化（Polymarket = USDC、Predict.fun = USDT）。需要不同的单笔金额或敞口时，在对应场所页签填写覆写值。">
+              <SettingsSection icon={ShieldCheck} title="资金与风控（当前账户）" description="这里的金额属于当前账户，单位随场所变化（Polymarket = USDC、Predict.fun = USDT）。需要不同的单笔金额或敞口时，在对应场所页签填写覆写值；其他账户不受影响。">
                 <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
-                  <NumberField id="initial_bankroll" label="新建模拟账户初始资金" description="只用于之后创建的模拟账户；已有账户使用创建时的基准，不会因修改此值而重算历史。" value={draft.shared.initial_bankroll} unit="场所币" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
+                  <NumberField id="initial_bankroll" label="新建模拟账户初始资金" description="仅用于尚未初始化基准权益的模拟账户；已有基准权益的账户不会因修改此值而重算历史。" value={draft.shared.initial_bankroll} unit="场所币" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
                   <NumberField id="order_size" label="单笔金额（默认）" description="每次自动买入的目标名义金额；机会雷达的「真实收益」也按该场所的金额报价。" value={draft.shared.order_size} unit="场所币" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
                   <NumberField id="max_position" label="单市场持仓上限（默认）" description="不得低于单笔金额。" value={draft.shared.max_position} unit="场所币" min={0} error={errors.max_position} onChange={(value) => update('max_position', value)} />
                   <NumberField id="max_exposure" label="总敞口上限（默认）" description="单个场所全部未平仓头寸的风险预算上限；不得低于单市场持仓上限。绝不跨场所合并。" value={draft.shared.max_exposure} unit="场所币" min={0} error={errors.max_exposure} onChange={(value) => update('max_exposure', value)} />
@@ -774,11 +790,11 @@ export function SettingsView() {
                 </div>
               </SettingsSection>
 
-              <SettingsSection icon={ShieldAlert} title="止损保护" description="各场所都没有交易所原生止损单。开启后，扫描引擎会在每次扫描时检查未平仓头寸的参考价，跌到入场价的止损比例时自动提交市价卖出。">
+              <SettingsSection icon={ShieldAlert} title="止损保护" description="各场所都没有交易所原生止损单。开启后，扫描引擎会在每次扫描时检查当前账户未平仓头寸的参考价，跌到入场价的止损比例时自动提交市价卖出。">
                 <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex items-start gap-3">
                     <div className={cn('rounded-xl p-2.5', draft.shared.stop_loss_enabled ? 'bg-amber-50 text-amber-600' : 'bg-surface text-slate-400')}><ShieldAlert className="h-5 w-5" /></div>
-                    <div><p className="text-sm font-semibold text-slate-800">自动止损</p><p className="mt-1 text-xs leading-5 text-slate-500">扫描引擎运行时对所有账户的未平仓头寸生效，不要求开启自动交易；自动交易开关只控制新的自动买入。</p></div>
+                    <div><p className="text-sm font-semibold text-slate-800">自动止损</p><p className="mt-1 text-xs leading-5 text-slate-500">扫描引擎运行时只检查当前账户的未平仓头寸，不要求开启自动交易；自动交易开关只控制新的自动买入。</p></div>
                   </div>
                   <div className="flex items-center gap-3 sm:flex-col sm:items-end">
                     <Switch checked={draft.shared.stop_loss_enabled} onCheckedChange={updateStopLoss} aria-label="开启或关闭自动止损" />
@@ -799,9 +815,9 @@ export function SettingsView() {
                 </div>
               </SettingsSection>
 
-              <SettingsSection icon={TimerReset} title="扫描与模拟成交" description="调整扫描频率，以及模拟成交时计入的滑点和费用。实盘成交价以各场所订单簿为准。">
+              <SettingsSection icon={TimerReset} title="扫描与模拟成交" description="扫描间隔控制后台引擎的全局节奏（所有账户共用）；滑点与费用属于当前账户，实盘成交价以各场所订单簿为准。">
                 <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-3">
-                  <NumberField id="scan_interval_seconds" label="扫描间隔" description="允许 10–86400 秒，需为整数。" value={draft.shared.scan_interval_seconds} unit="秒" min={10} max={86400} step="1" error={errors.scan_interval_seconds} onChange={(value) => update('scan_interval_seconds', value)} />
+                  <NumberField id="scan_interval_seconds" label="扫描间隔（全局）" description="所有账户共用同一后台扫描节奏，允许 10–86400 秒，需为整数。" value={draft.shared.scan_interval_seconds} unit="秒" min={10} max={86400} step="1" error={errors.scan_interval_seconds} onChange={(value) => update('scan_interval_seconds', value)} />
                   <NumberField id="slippage_bps" label="Paper 滑点" description="0–1000 bps；仅影响模拟成交。" value={draft.shared.slippage_bps} unit="bps" min={0} max={1000} error={errors.slippage_bps} onChange={(value) => update('slippage_bps', value)} />
                   <NumberField id="fee_bps" label="Paper 费用（默认）" description="0–1000 bps。Polymarket 等效费率 ≈ 类别费率 × (1 − 价格)；Predict.fun 按 费率 × min(p,1−p) 计，maker 0 费。可在场所页签覆写。" value={draft.shared.fee_bps} unit="bps" min={0} max={1000} error={errors.fee_bps} onChange={(value) => update('fee_bps', value)} />
                 </div>
@@ -820,7 +836,7 @@ export function SettingsView() {
           </div>
 
           <div className="sticky bottom-4 z-10 flex flex-col gap-3 rounded-2xl border border-slate-200 bg-surface/95 p-4 shadow-float backdrop-blur sm:flex-row sm:items-center">
-            <div className="flex flex-1 items-start gap-2 text-xs leading-5 text-slate-500"><Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" /><span>{dirty ? `有尚未保存的更改${tab === 'shared' ? '（策略页）' : `（${venueMeta(tab).label} 页）`}，保存会同时提交策略与两个场所的参数。` : '当前参数已与后端同步。'} 筛选与风控参数对各场所同时生效；场所页签覆写单笔金额、敞口与费用。</span></div>
+            <div className="flex flex-1 items-start gap-2 text-xs leading-5 text-slate-500"><Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" /><span>{dirty ? `有尚未保存的更改${tab === 'shared' ? '（策略页）' : `（${venueMeta(tab).label} 页）`}，保存会同时提交当前账户的策略与两个场所的参数。` : '当前账户的参数已与后端同步。'} 每个账户独立保存策略；扫描间隔仍是全账户共用的后台节奏。</span></div>
             <div className="flex gap-2"><Button type="button" variant="secondary" onClick={reset} disabled={!dirty || saving}><RotateCcw className="h-4 w-4" />放弃更改</Button><Button type="submit" variant="primary" loading={saving} disabled={!dirty}>{saving ? '正在保存…' : <><Save className="h-4 w-4" />保存参数</>}</Button></div>
           </div>
         </form>

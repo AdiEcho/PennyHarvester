@@ -236,8 +236,8 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   // The scope is read from a ref and a change triggers refresh() instead, so
   // the previous page stays visible (dimmed) until the new one arrives.
   const fetchOpportunities = useCallback(
-    (signal: AbortSignal) => api.opportunities(scopeRef.current === 'all' ? null : scopeRef.current, signal),
-    [scopeRef],
+    (signal: AbortSignal) => api.opportunities(scopeRef.current === 'all' ? null : scopeRef.current, signal, accountId),
+    [scopeRef, accountId],
   )
   const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchOpportunities)
   const lastScope = useRef<VenueScope>(scope)
@@ -263,18 +263,18 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     persistMarketLanguage(marketLanguage)
   }, [marketLanguage])
 
-  // The real-yield button quotes the venue's configured single-order size. The
-  // same request supplies the default radar category. A manual category
-  // selection must not be overwritten by a later poll.
+  // The real-yield button quotes the account's configured single-order size, and
+  // the same request supplies the account's default radar category. A manual
+  // category selection must not be overwritten by a later poll.
   useEffect(() => {
     const controller = new AbortController()
-    api.settings(controller.signal).then((next) => {
+    api.settings(controller.signal, accountId).then((next) => {
       setSettings(next)
       setSportsPolicy(next.sports_policy)
       if (!categoryTouched.current) setCategory(normalizeCategoryFilter(next.default_category))
     }).catch(() => {})
     return () => controller.abort()
-  }, [])
+  }, [accountId])
 
   const orderSizeFor = useCallback((venue: Venue) => venueOrderSize(settings, venue), [settings])
   const scopeLabel = scope === 'all' ? VENUES.map((venue) => venueMeta(venue).label).join(' + ') : venueMeta(scope).label
@@ -307,7 +307,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     quoteControllers.current.set(key, controller)
     setQuotes((current) => ({ ...current, [key]: { ...current[key], loading: true, error: undefined } }))
     try {
-      const quote = await api.quoteOpportunity(item.token_id, quoteAmount, venueOf(item), controller.signal)
+      const quote = await api.quoteOpportunity(item.token_id, quoteAmount, venueOf(item), controller.signal, accountId)
       setQuotes((current) => ({ ...current, [key]: { quote } }))
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return

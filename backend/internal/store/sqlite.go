@@ -73,6 +73,11 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		payload TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS account_settings (
+		account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		payload TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
 	CREATE TABLE IF NOT EXISTS access_password (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		password_hash TEXT NOT NULL,
@@ -469,6 +474,42 @@ func (s *SQLite) SaveSettings(ctx context.Context, settings engine.Settings) err
 	return err
 }
 
+// LoadAccountSettings reads one account's strategy block. Accounts that never
+// saved their own settings inherit the global defaults; the fallback is a live
+// read so a fresh installation keeps working without a migration copying rows
+// into every account.
+func (s *SQLite) LoadAccountSettings(ctx context.Context, accountID int64) (engine.Settings, error) {
+	var payload string
+	err := s.db.QueryRowContext(ctx, "SELECT payload FROM account_settings WHERE account_id = ?", accountID).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.LoadSettings(ctx)
+	}
+	if err != nil {
+		return engine.Settings{}, err
+	}
+	// Start from defaults so a payload written by an older version that lacks
+	// a newly added field stays readable.
+	settings := engine.DefaultSettings()
+	if err := json.Unmarshal([]byte(payload), &settings); err != nil {
+		return engine.Settings{}, fmt.Errorf("读取账户策略设置: %w", err)
+	}
+	if err := settings.Validate(); err != nil {
+		return engine.Settings{}, fmt.Errorf("账户 %d 的策略设置无效: %w", accountID, err)
+	}
+	return settings, nil
+}
+
+func (s *SQLite) SaveAccountSettings(ctx context.Context, accountID int64, settings engine.Settings) error {
+	payload, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO account_settings(account_id, payload, updated_at) VALUES(?, ?, ?)
+		ON CONFLICT(account_id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`,
+		accountID, string(payload), formatTime(time.Now().UTC()))
+	return err
+}
+
 func (s *SQLite) LoadSystemSettings(ctx context.Context) (engine.SystemSettings, error) {
 	var payload string
 	err := s.db.QueryRowContext(ctx, "SELECT payload FROM system_settings WHERE id = 1").Scan(&payload)
@@ -708,6 +749,7 @@ func (s *SQLite) DeleteAccount(ctx context.Context, id int64) error {
 		"DELETE FROM orders WHERE account_id = ?",
 		"DELETE FROM positions WHERE account_id = ?",
 		"DELETE FROM equity_snapshots WHERE account_id = ?",
+		"DELETE FROM account_settings WHERE account_id = ?",
 		"DELETE FROM accounts WHERE id = ?",
 	} {
 		if _, err := tx.ExecContext(ctx, statement, id); err != nil {

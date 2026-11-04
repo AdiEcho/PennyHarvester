@@ -189,7 +189,11 @@ func (h *Handler) opportunities(c *gin.Context) {
 	if !ok {
 		return
 	}
-	list := h.engine.Opportunities()
+	accountID, ok := accountIDFromQuery(c)
+	if !ok {
+		return
+	}
+	list := h.engine.OpportunitiesFor(accountID)
 	if v != "" {
 		list.Items = filterOpportunities(list.Items, v)
 		list.Total = len(list.Items)
@@ -220,7 +224,11 @@ func (h *Handler) quoteOpportunity(c *gin.Context) {
 		}
 		v = request.Venue
 	}
-	quote, err := h.engine.QuoteOpportunity(c.Request.Context(), request.TokenID, request.Amount, v)
+	accountID, ok := accountIDFromQuery(c)
+	if !ok {
+		return
+	}
+	quote, err := h.engine.QuoteOpportunity(c.Request.Context(), accountID, request.TokenID, request.Amount, v)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -251,7 +259,7 @@ func (h *Handler) scan(c *gin.Context) {
 		respondError(c, err)
 		return
 	}
-	list := h.engine.Opportunities()
+	list := h.engine.OpportunitiesFor(accountID)
 	if v != "" {
 		list.Items = filterOpportunities(list.Items, v)
 		list.Total = len(list.Items)
@@ -327,10 +335,23 @@ func (h *Handler) orders(c *gin.Context) {
 }
 
 func (h *Handler) settings(c *gin.Context) {
-	c.JSON(http.StatusOK, h.engine.Settings())
+	accountID, ok := accountIDFromQuery(c)
+	if !ok {
+		return
+	}
+	settings, err := h.engine.SettingsFor(c.Request.Context(), accountID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, settings)
 }
 
 func (h *Handler) updateSettings(c *gin.Context) {
+	accountID, ok := accountIDFromQuery(c)
+	if !ok {
+		return
+	}
 	var settings engine.Settings
 	if err := c.ShouldBindJSON(&settings); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "设置 JSON 无效: " + err.Error()})
@@ -340,11 +361,23 @@ func (h *Handler) updateSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := h.engine.UpdateSettings(c.Request.Context(), settings); err != nil {
+	ctx := c.Request.Context()
+	var err error
+	if accountID > 0 {
+		err = h.engine.UpdateAccountSettings(ctx, accountID, settings)
+	} else {
+		err = h.engine.UpdateSettings(ctx, settings)
+	}
+	if err != nil {
 		respondError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, h.engine.Settings())
+	saved, err := h.engine.SettingsFor(ctx, accountID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, saved)
 }
 
 func (h *Handler) toggleEngine(c *gin.Context) {

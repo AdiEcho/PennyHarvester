@@ -259,7 +259,7 @@ func TestQuoteOpportunityUsesRealBookAndFee(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	quote, err := instance.QuoteOpportunity(context.Background(), "eligible-yes", 0, "")
+	quote, err := instance.QuoteOpportunity(context.Background(), 0, "eligible-yes", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestQuoteOpportunityUsesRealBookAndFee(t *testing.T) {
 	// live order would be rejected even though the reference price passed.
 	live.quote.FillPrice = 0.995
 	live.quote.LimitPrice = 0.995
-	quote, err = instance.QuoteOpportunity(context.Background(), "eligible-yes", 50, "")
+	quote, err = instance.QuoteOpportunity(context.Background(), 0, "eligible-yes", 50, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestQuoteOpportunityUsesRealBookAndFee(t *testing.T) {
 		t.Fatalf("a fill above max_price must be flagged: %+v", quote)
 	}
 
-	if _, err := instance.QuoteOpportunity(context.Background(), "missing-token", 0, ""); !errors.Is(err, engine.ErrInvalidOrder) {
+	if _, err := instance.QuoteOpportunity(context.Background(), 0, "missing-token", 0, ""); !errors.Is(err, engine.ErrInvalidOrder) {
 		t.Fatalf("an unknown token must be rejected, got %v", err)
 	}
 }
@@ -2533,5 +2533,125 @@ func TestStopLossRefusesOrderSizeBelowSellFloor(t *testing.T) {
 		if order.Action == "stop" {
 			t.Fatalf("no stop order may be submitted below the sell floor: %+v", order)
 		}
+	}
+}
+
+func TestAccountSettingsAreIndependentFromGlobalDefaults(t *testing.T) {
+	ctx := context.Background()
+	instance, repository := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{}}, nil)
+	accounts, err := repository.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) < 2 {
+		t.Fatalf("expected at least two seeded accounts, got %+v", accounts)
+	}
+	first, second := accounts[0], accounts[1]
+	global, err := instance.SettingsFor(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both accounts inherit the global block until one saves its own.
+	inherited, err := instance.SettingsFor(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inherited.OrderSize != global.OrderSize {
+		t.Fatalf("an account without its own settings must inherit the global defaults: %+v", inherited)
+	}
+
+	custom := global
+	custom.OrderSize = 7
+	custom.MaxPosition = 21
+	custom.MaxExposure = 42
+	custom.Venues = map[market.Venue]engine.VenueSettings{
+		market.VenuePolymarket: {Enabled: true, OrderSize: 7, MaxPosition: 21, MaxExposure: 42},
+	}
+	if err := instance.UpdateAccountSettings(ctx, first.ID, custom); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := instance.SettingsFor(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.OrderSize != 7 || stored.MaxPosition != 21 {
+		t.Fatalf("account settings were not saved: %+v", stored)
+	}
+	other, err := instance.SettingsFor(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.OrderSize != global.OrderSize {
+		t.Fatalf("saving one account changed another account's strategy: %+v", other)
+	}
+
+	// Changing the global defaults must not rewrite an account that already has
+	// its own block, while an account that never saved one follows the change.
+	nextGlobal := instance.Settings()
+	nextGlobal.MinPrice = 0.90
+	if err := instance.UpdateSettings(ctx, nextGlobal); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = instance.SettingsFor(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.OrderSize != 7 || stored.MinPrice != global.MinPrice {
+		t.Fatalf("a global update rewrote the account's own strategy: %+v", stored)
+	}
+	other, err = instance.SettingsFor(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.MinPrice != 0.90 {
+		t.Fatalf("an inheriting account must follow the global defaults: %+v", other)
+	}
+}
+
+func TestScanBuildsRadarViewPerAccount(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"eligible": binary("eligible", 0.98, 20000, 2),
+		"higher":   binary("higher", 0.995, 20000, 2),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	live := accountByMode(t, instance, engine.AccountModeLive)
+
+	// The paper account raises its lower price bound, so it accepts the 0.995
+	// market while the live account keeps the global 0.95-0.99 range.
+	narrow, err := instance.SettingsFor(context.Background(), paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrow.MinPrice = 0.99
+	narrow.MaxPrice = 0.999
+	if err := instance.UpdateAccountSettings(context.Background(), paper.ID, narrow); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	paperView := instance.OpportunitiesFor(paper.ID)
+	if paperView.Total != 1 || paperView.Items[0].MarketID != "higher" {
+		t.Fatalf("paper radar was not filtered by its own strategy: %+v", paperView)
+	}
+	liveView := instance.OpportunitiesFor(live.ID)
+	if liveView.Total != 1 || liveView.Items[0].MarketID != "eligible" {
+		t.Fatalf("live radar must keep using the inherited strategy: %+v", liveView)
+	}
+	// The union view stays the cross-account superset that legacy callers and
+	// token lookups rely on.
+	union := instance.Opportunities()
+	if union.Total != 2 {
+		t.Fatalf("union radar must hold both accounts' rows: %+v", union)
+	}
+	inherited, err := instance.SettingsFor(context.Background(), live.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inherited.MinPrice != 0.95 || inherited.MaxPrice != 0.99 {
+		t.Fatalf("the account-scoped update leaked into another account: %+v", inherited)
 	}
 }

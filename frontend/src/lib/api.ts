@@ -111,10 +111,10 @@ export const api = {
     request<Dashboard>(withAccount('/dashboard', accountId), { signal }),
   getVenues: (signal?: AbortSignal) =>
     request<VenuesResponse>('/venues', { signal }).then((response) => response?.venues ?? []),
-  opportunities: (venue?: Venue | null, signal?: AbortSignal) =>
-    request<OpportunitiesResponse>(withVenue('/opportunities', venue), { signal }),
-  quoteOpportunity: (tokenId: string, amount?: number, venue?: Venue | null, signal?: AbortSignal) =>
-    request<OpportunityQuote>('/opportunities/quote', {
+  opportunities: (venue?: Venue | null, signal?: AbortSignal, accountId?: number) =>
+    request<OpportunitiesResponse>(withVenue(withAccount('/opportunities', accountId), venue), { signal }),
+  quoteOpportunity: (tokenId: string, amount?: number, venue?: Venue | null, signal?: AbortSignal, accountId?: number) =>
+    request<OpportunityQuote>(withAccount('/opportunities/quote', accountId), {
       method: 'POST',
       body: {
         token_id: tokenId,
@@ -138,9 +138,10 @@ export const api = {
     venue?: Venue | null,
     signal?: AbortSignal,
   ) => request<OrdersResponse>(withVenue(withAccount(`/orders?status=${status}&limit=${limit}&offset=${offset}`, accountId), venue), { signal }),
-  settings: (signal?: AbortSignal) => request<Settings>('/settings', { signal }),
-  updateSettings: (settings: Settings, signal?: AbortSignal) =>
-    request<Settings>('/settings', { method: 'PUT', body: settings, signal }),
+  settings: (signal?: AbortSignal, accountId?: number) =>
+    request<Settings>(withAccount('/settings', accountId), { signal }),
+  updateSettings: (settings: Settings, signal?: AbortSignal, accountId?: number) =>
+    request<Settings>(withAccount('/settings', accountId), { method: 'PUT', body: settings, signal }),
   authStatus: (signal?: AbortSignal) => request<AuthStatus>('/auth/status', { signal }),
   login: (password: string, signal?: AbortSignal) =>
     request<void>('/auth/login', { method: 'POST', body: { password }, signal }),

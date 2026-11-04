@@ -26,6 +26,10 @@ type Engine struct {
 	system        SystemSettings
 	systemError   string
 	opportunities []Opportunity
+	// opportunitiesByAccount holds each account's own radar view, filtered by
+	// that account's strategy. The union above keeps legacy callers and token
+	// lookups working across accounts.
+	opportunitiesByAccount map[int64][]Opportunity
 	// scannedVenues records which venues contributed market data to the last
 	// scan, including venues that returned markets but no qualifying rows.
 	scannedVenues []market.Venue
@@ -79,7 +83,8 @@ func New(ctx context.Context, repo Repository, venues *venue.Registry, proxy *ne
 	}
 	instance := &Engine{
 		repo: repo, venues: venues, proxy: proxy, settings: settings, system: system,
-		opportunities: []Opportunity{}, running: true, done: make(chan struct{}),
+		opportunities: []Opportunity{}, opportunitiesByAccount: map[int64][]Opportunity{},
+		running: true, done: make(chan struct{}),
 	}
 	// Apply web-managed runtime settings on top of the process environment. A
 	// row written by an older build has empty fields and therefore inherits the
@@ -270,12 +275,12 @@ func cloneVenueSettings(in map[market.Venue]VenueSettings) map[market.Venue]Venu
 	return out
 }
 
-func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
+// normalizeSettingsInput fills the server-owned version and the fields older
+// API clients omit, so a partial payload is not rejected outright.
+func normalizeSettingsInput(settings Settings) Settings {
 	// The version is owned by the server so a client payload can never roll the
 	// one-time fee migration back or trigger it again.
 	settings.FeeModelVersion = FeeModelVersion
-	// Older API clients do not know the category fields. Treat an omitted value
-	// as "use the built-in default" instead of rejecting the whole payload.
 	defaults := DefaultSettings()
 	if settings.DefaultCategory == "" {
 		settings.DefaultCategory = defaults.DefaultCategory
@@ -286,23 +291,35 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	if settings.StopLossRatio == 0 {
 		settings.StopLossRatio = defaults.StopLossRatio
 	}
-	e.tradeMu.Lock()
-	defer e.tradeMu.Unlock()
-	// Read-modify-write for the venue map: an old client that only sends the
-	// flat fields must not erase per-venue overrides it does not know about.
-	previous := e.Settings()
+	return settings
+}
+
+// mergeVenueSettings keeps per-venue overrides a payload does not mention. An
+// old client that only sends the flat fields must not erase the venue map.
+func mergeVenueSettings(previous, settings Settings) Settings {
 	if settings.Venues == nil {
 		settings.Venues = previous.Venues
-	} else if len(previous.Venues) > 0 {
-		merged := make(map[market.Venue]VenueSettings, len(previous.Venues)+len(settings.Venues))
-		for v, entry := range previous.Venues {
-			merged[v] = entry
-		}
-		for v, entry := range settings.Venues {
-			merged[v] = entry
-		}
-		settings.Venues = merged
+		return settings
 	}
+	if len(previous.Venues) == 0 {
+		return settings
+	}
+	merged := make(map[market.Venue]VenueSettings, len(previous.Venues)+len(settings.Venues))
+	for v, entry := range previous.Venues {
+		merged[v] = entry
+	}
+	for v, entry := range settings.Venues {
+		merged[v] = entry
+	}
+	settings.Venues = merged
+	return settings
+}
+
+func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
+	settings = normalizeSettingsInput(settings)
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	settings = mergeVenueSettings(e.Settings(), settings)
 	if err := settings.Validate(); err != nil {
 		return err
 	}
@@ -316,6 +333,47 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	e.settings = settings
 	e.mu.Unlock()
 	return nil
+}
+
+// SettingsFor returns the strategy block that applies to one account. A
+// non-positive account ID resolves to the global defaults, which is also the
+// template a new account inherits until it saves its own strategy.
+func (e *Engine) SettingsFor(ctx context.Context, accountID int64) (Settings, error) {
+	return e.settingsForAccount(ctx, accountID)
+}
+
+func (e *Engine) settingsForAccount(ctx context.Context, accountID int64) (Settings, error) {
+	if accountID <= 0 {
+		return e.Settings(), nil
+	}
+	return e.repo.LoadAccountSettings(ctx, accountID)
+}
+
+// UpdateAccountSettings validates and persists one account's strategy block.
+// The global settings stay untouched: saving account A must never change what
+// account B trades.
+func (e *Engine) UpdateAccountSettings(ctx context.Context, accountID int64, settings Settings) error {
+	if accountID <= 0 {
+		return fmt.Errorf("%w: account_id 不能为空", ErrInvalidOrder)
+	}
+	if _, err := e.repo.AccountByID(ctx, accountID); err != nil {
+		return err
+	}
+	settings = normalizeSettingsInput(settings)
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	previous, err := e.settingsForAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	settings = mergeVenueSettings(previous, settings)
+	if err := settings.Validate(); err != nil {
+		return err
+	}
+	if err := e.validateStopLossExit(settings); err != nil {
+		return err
+	}
+	return e.repo.SaveAccountSettings(ctx, accountID, settings)
 }
 
 // validateStopLossExit refuses to enable the stop-loss when this build could not
@@ -920,18 +978,54 @@ func (e *Engine) isRunning() bool {
 }
 
 func (e *Engine) Opportunities() OpportunityList {
+	return e.OpportunitiesFor(0)
+}
+
+// OpportunitiesFor returns the radar for one account. A non-positive account ID
+// returns the union view, which is what a client without account context (and
+// the legacy API) sees.
+func (e *Engine) OpportunitiesFor(accountID int64) OpportunityList {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	items := append([]Opportunity{}, e.opportunities...)
+	items := e.opportunities
+	if accountID > 0 {
+		items = e.opportunitiesByAccount[accountID]
+	}
+	items = append([]Opportunity{}, items...)
 	venues := append([]market.Venue{}, e.scannedVenues...)
 	return OpportunityList{Items: items, Total: len(items), ScannedAt: e.lastSyncAt, Source: e.sourceName(), Venues: venues}
+}
+
+// flattenOpportunities merges per-account radar views into the legacy union
+// list. A row visible to several accounts appears once; the radar rows are
+// identical because they are built from the same market data.
+func flattenOpportunities(views map[int64][]Opportunity) []Opportunity {
+	seen := make(map[string]struct{})
+	items := make([]Opportunity, 0)
+	for _, view := range views {
+		for _, item := range view {
+			key := opportunityKey(item)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			items = append(items, item)
+		}
+	}
+	sortOpportunities(items)
+	return items
+}
+
+// opportunityKey identifies one tradable outcome across venues and accounts.
+func opportunityKey(opportunity Opportunity) string {
+	return marketKey(opportunity.EffectiveVenue(), opportunity.MarketID) + "\x00" + opportunity.TokenID
 }
 
 // QuoteOpportunity returns a real-data estimate for one radar row: the ask
 // book and taker fee are read from the venue that owns the token, so NetYield
 // is net of that venue's fees and uses the price a real order would pay. It is
 // read-only and available for paper accounts too.
-func (e *Engine) QuoteOpportunity(ctx context.Context, tokenID string, amount float64, onlyVenue market.Venue) (OpportunityQuote, error) {
+func (e *Engine) QuoteOpportunity(ctx context.Context, accountID int64, tokenID string, amount float64, onlyVenue market.Venue) (OpportunityQuote, error) {
 	tokenID = strings.TrimSpace(tokenID)
 	if tokenID == "" {
 		return OpportunityQuote{}, fmt.Errorf("%w: token_id 不能为空", ErrInvalidOrder)
@@ -939,21 +1033,39 @@ func (e *Engine) QuoteOpportunity(ctx context.Context, tokenID string, amount fl
 	if amount < 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
 		return OpportunityQuote{}, fmt.Errorf("%w: 金额必须为有限正数", ErrInvalidOrder)
 	}
-	settings := e.Settings()
+	settings, err := e.settingsForAccount(ctx, accountID)
+	if err != nil {
+		return OpportunityQuote{}, err
+	}
 
 	e.mu.RLock()
+	candidates := e.opportunities
+	if accountID > 0 {
+		if view, ok := e.opportunitiesByAccount[accountID]; ok {
+			candidates = view
+		}
+	}
 	var target Opportunity
 	found := false
-	for _, opportunity := range e.opportunities {
-		if opportunity.TokenID != tokenID {
-			continue
+	lookup := func(items []Opportunity) {
+		for _, opportunity := range items {
+			if opportunity.TokenID != tokenID {
+				continue
+			}
+			if onlyVenue != "" && opportunity.EffectiveVenue() != onlyVenue {
+				continue
+			}
+			target = opportunity
+			found = true
+			return
 		}
-		if onlyVenue != "" && opportunity.EffectiveVenue() != onlyVenue {
-			continue
-		}
-		target = opportunity
-		found = true
-		break
+	}
+	lookup(candidates)
+	if !found && accountID > 0 {
+		// The account view is rebuilt on each scan, so settings saved after the
+		// last scan can briefly hide a row. Fall back to the union and let the
+		// account's own price cap judge the quote.
+		lookup(e.opportunities)
 	}
 	e.mu.RUnlock()
 	if !found {
@@ -1224,9 +1336,69 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 		}
 	}
 
-	settings := e.Settings()
+	accounts, err := e.repo.ListAccounts(ctx)
+	if err != nil {
+		return summary, err
+	}
+	// Each account owns one strategy block. Resolving them before the market
+	// scan makes the radar account-specific and lets the venue list be a union:
+	// an account that enabled Predict.fun must be scanned even when another
+	// account only trades Polymarket.
+	type accountPlan struct {
+		account  Account
+		settings Settings
+	}
+	plans := make([]accountPlan, 0, len(accounts))
+	fallback := e.Settings()
+	scanSettings := fallback
+	enabledVenueSettings := make(map[market.Venue]VenueSettings, len(market.VenueOrder))
+	maxDays := 0
+	for _, account := range accounts {
+		accountSettings, err := e.settingsForAccount(ctx, account.ID)
+		if err != nil {
+			return summary, err
+		}
+		plans = append(plans, accountPlan{account: account, settings: accountSettings})
+		if accountSettings.MaxDays > maxDays {
+			maxDays = accountSettings.MaxDays
+		}
+		for _, v := range e.Venues() {
+			effective := accountSettings.For(v)
+			if !effective.Enabled {
+				continue
+			}
+			entry, exists := enabledVenueSettings[v]
+			if !exists {
+				entry = VenueSettings{Enabled: true}
+			}
+			// The scan only needs to admit anything at least one account
+			// accepts; findOpportunity re-checks each account's own limits in
+			// the per-account loop below.
+			if effective.MinLiquidity < entry.MinLiquidity {
+				entry.MinLiquidity = effective.MinLiquidity
+			}
+			enabledVenueSettings[v] = entry
+		}
+	}
+	if len(plans) == 0 {
+		// A brand-new database can show a radar before any account exists; use
+		// the global defaults for that installation.
+		if fallback.MaxDays > maxDays {
+			maxDays = fallback.MaxDays
+		}
+		for _, v := range e.Venues() {
+			if fallback.For(v).Enabled {
+				enabledVenueSettings[v] = VenueSettings{Enabled: true}
+			}
+		}
+	}
+	if maxDays <= 0 {
+		maxDays = fallback.MaxDays
+	}
+	scanSettings.MaxDays = maxDays
+	scanSettings.Venues = enabledVenueSettings
 	now := time.Now().UTC()
-	venues := e.venueList(settings, options.Venue)
+	venues := e.venueList(scanSettings, options.Venue)
 	markets := make([]market.Market, 0)
 	byID := make(map[string]market.Market)
 	scanned := make([]market.Venue, 0, len(venues))
@@ -1241,7 +1413,7 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 		// Each venue gets its own deadline so one slow upstream cannot consume
 		// the scan budget of another venue.
 		scanCtx, cancel := venueScanContext(ctx, len(venues))
-		items, listErr := source.ListOpen(scanCtx, settings.MaxDays)
+		items, listErr := source.ListOpen(scanCtx, scanSettings.MaxDays)
 		cancel()
 		if listErr != nil {
 			// Error isolation: a failing venue is recorded and skipped, but the
@@ -1273,51 +1445,78 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 		e.recordScan(now, nil)
 	}
 
-	opportunities := make([]Opportunity, 0)
-	for _, item := range markets {
-		if !settings.For(item.EffectiveVenue()).Enabled {
-			continue
-		}
-		for _, outcome := range item.Outcomes {
-			opportunity, candidateErr := findOpportunity(item, outcome.Name, outcome.TokenID, settings, now)
-			if candidateErr == nil {
-				opportunities = append(opportunities, opportunity)
+	opportunitiesByAccount := make(map[int64][]Opportunity, len(plans))
+	unionByKey := make(map[string]Opportunity)
+	for _, plan := range plans {
+		items := make([]Opportunity, 0)
+		for _, item := range markets {
+			if !plan.settings.For(item.EffectiveVenue()).Enabled {
+				continue
+			}
+			for _, outcome := range item.Outcomes {
+				opportunity, candidateErr := findOpportunity(item, outcome.Name, outcome.TokenID, plan.settings, now)
+				if candidateErr == nil {
+					items = append(items, opportunity)
+				}
 			}
 		}
+		// Resolve categories and this account's sports policy only for rows that
+		// already passed its price/liquidity/volatility filters.
+		items = e.classifyOpportunities(ctx, items, byID, plan.settings)
+		opportunitiesByAccount[plan.account.ID] = items
+		for _, item := range items {
+			unionByKey[opportunityKey(item)] = item
+		}
 	}
-	// Resolve categories and sports risk only for candidates that already
-	// passed the price/liquidity/volatility filters. This also removes sports
-	// game markets before localization, which keeps scans cheap.
-	opportunities = e.classifyOpportunities(ctx, opportunities, byID, settings)
-	sortOpportunities(opportunities)
 
-	// Polymarket exposes Chinese question and outcome labels through the Gamma
-	// locale parameter. Ask each venue's provider that supports it, only for
-	// the markets that passed the filters. A translation failure must not break
-	// trading; the original text remains available as a fallback.
-	opportunities = e.localizeOpportunities(ctx, opportunities)
+	// Language enrichment is account independent: localize the union once, then
+	// copy the localized text back into every account's view.
+	union := make([]Opportunity, 0, len(unionByKey))
+	for _, item := range unionByKey {
+		union = append(union, item)
+	}
+	union = e.localizeOpportunities(ctx, union)
+	localized := make(map[string]Opportunity, len(union))
+	for _, item := range union {
+		localized[opportunityKey(item)] = item
+	}
+	for accountID, items := range opportunitiesByAccount {
+		for i := range items {
+			if localizedItem, ok := localized[opportunityKey(items[i])]; ok {
+				items[i] = localizedItem
+			}
+		}
+		sortOpportunities(items)
+		opportunitiesByAccount[accountID] = items
+	}
 
 	e.mu.Lock()
 	// A scan can be scoped to one venue (the radar chip, or a per-venue scan
-	// button). Replacing the whole radar would make the other venues' rows
-	// disappear until the next full scan, so a scoped scan swaps only its own
-	// rows and leaves the rest in place.
-	scoped := options.Venue != ""
-	e.opportunities = mergeOpportunities(e.opportunities, opportunities, scanned, scoped)
+	// button) or to one account (a manual scan). Replacing every view would
+	// make other rows disappear until the next full scan, so in scope accounts
+	// merge only the venues this pass covered and out-of-scope accounts keep
+	// their previous view.
+	views := make(map[int64][]Opportunity, len(opportunitiesByAccount))
+	for accountID, items := range opportunitiesByAccount {
+		previous := e.opportunitiesByAccount[accountID]
+		if options.AccountID > 0 && accountID != options.AccountID {
+			views[accountID] = previous
+			continue
+		}
+		views[accountID] = mergeOpportunities(previous, items, scanned, options.Venue != "")
+	}
+	e.opportunitiesByAccount = views
+	e.opportunities = flattenOpportunities(views)
 	// The reported venue list must describe what the radar holds now, not just
 	// what this pass touched.
 	e.scannedVenues = coveredVenues(e.opportunities, scanned)
 	e.lastSyncAt = timePointer(now)
 	e.mu.Unlock()
 
-	accounts, err := e.repo.ListAccounts(ctx)
-	if err != nil {
-		e.setProcessingError(err.Error())
-		return summary, err
-	}
 	var processingErrors []string
 	var focusErrors []string
-	for _, account := range accounts {
+	for _, plan := range plans {
+		account := plan.account
 		appendError := func(message string) {
 			processingErrors = append(processingErrors, message)
 			if options.AccountID == 0 || options.AccountID == account.ID {
@@ -1351,13 +1550,13 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 				// Stop-loss is independent of the auto-entry switch: an operator
 				// who only buys manually still needs an automatic exit. It runs
 				// before new entries so a breached position is reduced first.
-				stopErr := e.runStopLoss(ctx, account, settings)
+				stopErr := e.runStopLoss(ctx, account, plan.settings)
 				if stopErr != nil {
 					appendError(fmt.Sprintf("%s 止损: %v", account.Name, stopErr))
 				}
 				// Do not add risk while an exit is failing.
 				if autoEnabled && stopErr == nil {
-					outcome, tradeErr := e.autoTrade(ctx, account, opportunities, settings)
+					outcome, tradeErr := e.autoTrade(ctx, account, opportunitiesByAccount[account.ID], plan.settings)
 					summary.OrdersPlaced += outcome.Placed
 					summary.SkippedHeld += outcome.SkippedHeld
 					if tradeErr != nil {
@@ -1737,7 +1936,7 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		if marketExposure[key]+cost > effective.MaxPosition+1e-9 {
 			continue
 		}
-		position, err := e.executePaperBuy(ctx, account, opportunity, "auto", amount)
+		position, err := e.executePaperBuy(ctx, account, opportunity, "auto", amount, settings)
 		if err != nil {
 			// A risk rejection is already logged as an order; it must not stop
 			// the engine from evaluating the remaining candidates this round.
@@ -1844,7 +2043,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		if snapshot.Allowance > 0 && cost > snapshot.Allowance+1e-9 {
 			break
 		}
-		position, err := e.executeLiveBuy(ctx, account, opportunity, "auto", budget)
+		position, err := e.executeLiveBuy(ctx, account, opportunity, "auto", budget, settings)
 		if err != nil {
 			if errors.Is(err, ErrInvalidOrder) || errors.Is(err, ErrLiveUnavailable) || errors.Is(err, ErrVenueNotConfigured) {
 				continue
@@ -2117,7 +2316,11 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 	if request.Venue != "" && effectiveVenue(request.Venue) != v {
 		return Position{}, fmt.Errorf("%w", ErrVenueMismatch)
 	}
-	if !e.Settings().For(v).Enabled {
+	settings, err := e.settingsForAccount(ctx, account.ID)
+	if err != nil {
+		return Position{}, err
+	}
+	if !settings.For(v).Enabled {
 		return Position{}, fmt.Errorf("%w: %s 当前已在参数设置中禁用", ErrInvalidOrder, v.Label())
 	}
 	source := e.data(v)
@@ -2134,7 +2337,6 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 	if item.Currency == "" {
 		item.Currency = currencyForVenue(v)
 	}
-	settings := e.Settings()
 	opportunity, err := findOpportunity(item, request.Outcome, request.TokenID, settings, time.Now().UTC())
 	if err != nil {
 		return Position{}, err
@@ -2146,13 +2348,12 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 		return Position{}, err
 	}
 	if account.Mode == AccountModeLive {
-		return e.executeLiveBuy(ctx, account, opportunity, "manual", request.Amount)
+		return e.executeLiveBuy(ctx, account, opportunity, "manual", request.Amount, settings)
 	}
-	return e.executePaperBuy(ctx, account, opportunity, "manual", request.Amount)
+	return e.executePaperBuy(ctx, account, opportunity, "manual", request.Amount, settings)
 }
 
-func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64) (Position, error) {
-	settings := e.Settings()
+func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64, settings Settings) (Position, error) {
 	effective := settings.For(opportunity.EffectiveVenue())
 	if !effective.Enabled {
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, opportunity.EffectiveVenue().Label()+" 当前已在参数设置中禁用", "")
@@ -2219,7 +2420,7 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	return position, nil
 }
 
-func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64) (Position, error) {
+func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64, settings Settings) (Position, error) {
 	v := opportunity.EffectiveVenue()
 	if v != account.EffectiveVenue() {
 		return Position{}, fmt.Errorf("%w", ErrVenueMismatch)
@@ -2249,7 +2450,6 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
 			"该市场属于 Polymarket Protocol V2（positionId + ExchangeV3），当前实盘执行器只支持 CTF（v1）市场；请改用模拟账户或等待 V2 签名支持", "")
 	}
-	settings := e.Settings()
 	effective := settings.For(v)
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
@@ -2580,7 +2780,10 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	if err != nil {
 		return Dashboard{}, err
 	}
-	settings := e.Settings()
+	settings, err := e.settingsForAccount(ctx, account.ID)
+	if err != nil {
+		return Dashboard{}, err
+	}
 	metrics := Metrics{
 		Mode: string(account.Mode), Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
 		InitialBankroll: settings.InitialBankroll,

@@ -34,7 +34,7 @@
 - **账户绑定场所，创建后不可更改**。每个账户属于一个场所，持仓、订单、净值与指标都带 `venue` + `currency`，接口与界面均支持按场所筛选（`?venue=polymarket|predictfun`）。**不同场所的金额永不求和**：USDC（6 位小数）与 USDT（18 位小数）各自独立展示，跨场所加总只会得到没有意义的数字。
 - **币种与精度分离**。Polymarket 结算币为 USDC（6 位小数），Predict.fun 为 USDT（18 位小数）；Predict.fun 的下单金额在内部以 `big.Int` 按最小单位（wei）计算，绝不经过 `float64`，并根据市场 `decimalPrecision` 向下量化价位。
 - **费用模型按场所分派**。Polymarket 沿用历史口径 `费率 × 名义额`；Predict.fun 按官方公式 `费率 × min(价格, 1 − 价格) × 份额`，因此低价盘口的真实成本远低于名义额比例。
-- **风控按场所独立**。除全局参数外，每个场所可单独设置开关、单笔金额、单账户最大持仓、场所总敞口与费率；留空即继承全局值。
+- **策略参数按账户独立，再按场所细分**。每个账户保存自己的一份参数（`account_settings` 表）：价格区间、流动性、分类与体育策略、尾盘窗口、止损、单笔金额与敞口都只作用于该账户，切换账户不会串用配置。每个场所还可单独覆写开关、单笔金额、单账户最大持仓、场所总敞口与费率；留空即继承该账户「策略」页的值。尚未保存过参数的账户实时继承全局默认模板（`settings` 表），新建账户也以该模板为起点。
 - **Predict.fun 当前支持**：只读行情与报价（无需任何凭据）、限价/市价买入、持仓与余额查询、按币种计价的手续费与收益测算、**自动结算**（Predict.fun 公布获胜结果后，引擎把胜方记 1.00、负方记 0.00、平局记 0.50 并关账）、**链上赎回**（对已结算仓位提交 `redeemPositions` 交易取回 USDT，见下文）、测试网（`PREDICTFUN_TESTNET=1`）。
 - **Predict.fun 暂不支持**：代理钱包签名（当前要求 EOA 私钥与 maker 一致；Kernel 域包装的签名格式已有调研记录但未实现）、链上合并/转换（`merge`/`convert`）、WebSocket 盘口订阅（走轮询）。赎回由本系统**代发交易**，签名地址必须有 BNB 支付 gas；neg-risk 市场的赎回还需要先在「系统设置 → Predict.fun」执行一次链上授权（授权 NegRiskAdapter 划转结果份额）。
 - **合约与签名**：Predict.fun 订单使用 EIP-712（域名为 `predict.fun CTF Exchange`，链 ID 56 / 测试网 97），合约地址由官方 SDK 的 `Constants.ts` 生成到 `backend/internal/predictfun/addresses.go`（**生成文件，请勿手改**）。首次实盘前需要为交易所合约授权 USDT 与 ERC1155（`EnsureApprovals`，当前通过代码/接口触发，不静默自动授权）。
@@ -52,7 +52,7 @@
 - **分类筛选与默认分类**：雷达按「全部 / 非体育 / 政治 / 加密 / 金融 / 科技 / 文化 / 体育 / 其他」分类展示，并显示各分类数量；「参数设置 → 市场筛选」可配置雷达打开时默认选中的分类（默认「非体育」）。分类只影响雷达展示，不改变自动交易策略。
 - **体育赛事与加时保护**：Gamma 的赛事标签、`gameStartTime` 与标题规则会识别「单场赛事盘口」。这类盘口可能因足球加时、篮球加时、冰球加时、棒球延长局或电竞决胜局而改写结果，默认排除；赛季冠军等长期体育预测仍可保留。选择「保留并标记风险」后，雷达会显示「赛事 · 加时风险」标记与买入确认提示。
 - **24 小时波动上限**：读取 Gamma 的 `oneDayPriceChange`，当参考价在 24 小时内变动超过阈值时跳过该市场，避免追逐临场剧烈波动的盘口；设为 `0` 可关闭。该保护同时作用于雷达与手动下单。
-- **真实收益报价**：雷达每行可点击「获取真实收益」，后端读取该 token 的 CLOB 实时卖盘与市场 `FeeSchedule`，按参数设置中的单笔金额逐档计算成交均价、taker 手续费、净成本与净收益率；同时标记盘口深度不足或成交限价超过 `max_price`（实盘会拒单）。报价只读、不会下单，未配置实盘私钥也可使用；模拟账户仍按自身滑点与固定费率记账。
+- **真实收益报价**：雷达每行可点击「获取真实收益」，后端读取该 token 的 CLOB 实时卖盘与市场 `FeeSchedule`，按当前账户参数设置中的单笔金额逐档计算成交均价、taker 手续费、净成本与净收益率；同时标记盘口深度不足或成交限价超过 `max_price`（实盘会拒单）。报价只读、不会下单，未配置实盘私钥也可使用；模拟账户仍按自身滑点与固定费率记账。
 - **已买入标记**：雷达会读取当前账户的未平仓头寸，对已经买过的市场显示「已买入」标记与买入价。同一 token 有多笔成交时按份额加权计算买入价，悬停可查看份额、总成本与笔数；买入确认弹窗也会提示当前持仓，避免重复买入时误判价格。
 - **行情异常保护**：当上游行情不可用或结算数据异常时，系统会保持现有持仓状态不变并明确报错，绝不使用占位数据或猜测结果替代真实行情。
 
@@ -149,7 +149,7 @@
 净收益率  = (份额 − 名义成本 − 手续费) / (名义成本 + 手续费)
 ```
 
-- 报价按参数设置中的「单笔金额」计算；在买入弹窗中也可按当前输入金额重新获取。
+- 报价按当前账户参数设置中的「单笔金额」计算；在买入弹窗中也可按当前输入金额重新获取。
 - `限价 > max_price` 时会在雷达上标红：即使成交均价更低，实盘订单仍会被风控拒绝。
 - 卖盘深度不足以覆盖单笔金额时会标记「深度不足」，并按可用深度给出参考值。
 - 报价是快照，盘口与费率会变化；界面显示报价时间，可随时点击刷新。
@@ -182,6 +182,8 @@
 
 ### 默认策略参数
 
+下表是内置的全局默认模板。每个账户在参数设置页保存后即拥有自己的独立参数；从未保存过的账户实时继承该模板，新建账户也以它为起点。修改某个账户不影响其他账户，修改全局模板也不会覆盖已保存账户的参数。
+
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
 | 参考价区间 | `0.95 – 0.99` | 仅筛选价格落在该区间内的二元结果 |
@@ -192,14 +194,14 @@
 | 24 小时波动上限 | `0.10 USD` | 参考价 24 小时变动超过该值时跳过；`0` 表示不限制 |
 | 单笔金额 | `100 USD` | 每次买入的名义下单金额 |
 | 单市场 / 总敞口上限 | `250 / 1,000 USD` | 单一市场最大投入与账户总持仓投入上限 |
-| 模拟初始资金 | `10,000 USD` | 仅对新创建的模拟账户生效 |
+| 模拟初始资金 | `10,000 USD` | 全局默认模板；新建模拟账户与尚未初始化基准权益的账户使用该值 |
 | 模拟滑点 (`slippage_bps`) | `20 BPS` | 模拟买入时的价格上浮比例（0.20%） |
 | 模拟费用 (`fee_bps`) | `15 BPS` | 按名义金额计，≈ `类别费率 × (1 − p)`；见上表换算 |
 | 实盘手续费 | 自动计算 | 按市场 `FeeSchedule` 动态读取并核算 |
 | 扫描间隔 | `60 秒` | 后台引擎自动轮询行情的周期，也是止损检查的最短间隔 |
 | 非体育尾盘下单窗口 | `20 分钟` | 距收盘 ≤ 20 分钟才允许自动买入；`0` 表示不限制 |
 | 体育类尾盘下单窗口 | `5 分钟` | 体育分类使用更短窗口，避开临场加时与剧烈波动；`0` 表示不限制 |
-| 自动止损 | `关闭` | 扫描引擎运行时对所有账户生效，不依赖自动交易开关；关闭时不会自动卖出 |
+| 自动止损 | `关闭` | 按账户生效（账户参数决定），不依赖自动交易开关；关闭时不会自动卖出 |
 | 止损比例 | `0.70` | 参考价 ≤ 加权入场价 × 比例时卖出全部剩余份额；`0.70` 表示入场价的 70%，不是绝对价格 0.70 |
 | 默认账户 / 自动交易 | `实盘 / 关闭` | 自动交易默认关闭，需按账户单独开启 |
 
@@ -372,11 +374,11 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `PATCH` | `/accounts/:id` | 修改账户名称、自动交易开关或设为默认账户 |
 | `DELETE` | `/accounts/:id` | 删除指定模拟账户（级联清除其持仓、订单与净值记录） |
 | `GET` | `/dashboard?account_id=1` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照 |
-| `GET` | `/opportunities` | 获取最近一次成功扫描筛选出的市场机会列表；每项同时返回原始 `question` / `outcome`、Polymarket 中文翻译 `question_zh` / `outcome_zh`，以及中文赛事标题 `event_title_zh` 和盘口短标题 `group_item_title`，用于体育盘口的中文兜底展示。分类与风险字段包括 `category`（`sports / politics / crypto / finance / tech / culture / other`）、`sports_game`、`overtime_risk` 与 `price_change_24h` |
+| `GET` | `/opportunities?account_id=1` | 获取当前账户最近一次成功扫描筛选出的市场机会列表；每项同时返回原始 `question` / `outcome`、Polymarket 中文翻译 `question_zh` / `outcome_zh`，以及中文赛事标题 `event_title_zh` 和盘口短标题 `group_item_title`，用于体育盘口的中文兜底展示。分类与风险字段包括 `category`（`sports / politics / crypto / finance / tech / culture / other`）、`sports_game`、`overtime_risk` 与 `price_change_24h`。列表按该账户的价格、流动性、到期与体育策略过滤；省略 `account_id` 时返回所有账户候选的并集 |
 | `POST` | `/scan` | 手动触发扫描：默认仅刷新行情、持仓盯市与净值，不自动下单；附加 `?execute=true` 时同步执行自动交易。建议同时传 `?account_id=`：自动下单与止损只作用于该账户，且该显式请求会覆盖账户的后台自动交易开关；响应中的 `auto_trade` 返回本次下单数、跳过的已持仓盘口数与本账户错误 |
 | `GET` | `/positions?account_id=1&status=open` | 查询持仓列表，`status` 支持 `all / open / won / lost / split / sold`（`sold` 是止损筛选别名，底层为 `status=lost` + `exit_kind=stop`） |
 | `GET` | `/orders?account_id=1&status=all&limit=100&offset=0` | 查询订单记录，`status` 支持 `all / filled / settled / rejected / pending / unknown / unresolved`；`type` 为 `buy / sell / settle`，止损单的来源 `kind` 为 `stop` |
-| `GET / PUT` | `/settings` | 读取或更新全局策略筛选条件与风控参数 |
+| `GET / PUT` | `/settings?account_id=1` | 读取或更新指定账户的策略筛选与风控参数；省略 `account_id` 时读写全局默认模板（新账户的继承来源） |
 | `GET / PUT` | `/system` | 读取或更新系统设置（各场所数据源地址、实盘凭据、网络出口代理）；私钥、L2 Secret、Passphrase 与代理密码在响应中自动掩码，并额外返回 `*_configured` 布尔值供前端判断「是否已配置」。请求体支持按分区部分更新：`proxy`、`data_source`、`live` 与 `venues.<venue>` 可单独提交；提交时请带上该分区的完整字段，掩码值会自动还原为已保存的密钥。响应中的 `runtime.venues` 给出逐场所的 `configured / ready / signer / maker / error` |
 | `POST` | `/system/live/test?venue=predictfun` | 实盘凭据只读验证。Polymarket：请求体 `live` + `clob_base_url`；Predict.fun：请求体 `venues.predictfun.live`（`api_key` / `private_key` / `smart_wallet` / `testnet`）。测试成功后会把凭据还原为已保存值，不会留下未保存的配置 |
 | `POST` | `/system/proxy/test` | 使用请求体中的代理配置探测 `https://clob.polymarket.com/time`，不保存设置 |
@@ -409,7 +411,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 ## 数据库迁移与测试验证
 
 ### 自动数据库迁移
-服务启动时会自动检测并升级旧版 SQLite 数据库结构：包括为 `positions` 表补充 `kind / exit_kind` 字段与 `split` 状态、为 `orders` 表补充 `pending / unknown` 状态与 `fee / action` 字段、为存量模拟账户补写基准权益，以及创建 `system_settings`（网络代理配置）与 `access_password`（访问密码哈希）两张新表。新增字段使用 `ALTER TABLE ADD COLUMN`，不会重建带有额外列、索引或触发器的数据库；只有在缺少 `split` 或 `pending/unknown` 约束的旧库上才会重建对应表。所有迁移均在数据库事务内执行，若失败会自动回滚；建议在版本升级前先备份 `pennyharvester.db`。
+服务启动时会自动检测并升级旧版 SQLite 数据库结构：包括为 `positions` 表补充 `kind / exit_kind` 字段与 `split` 状态、为 `orders` 表补充 `pending / unknown` 状态与 `fee / action` 字段、为存量模拟账户补写基准权益，以及创建 `system_settings`（网络代理配置）、`access_password`（访问密码哈希）与 `account_settings`（每账户独立策略参数）等新表。新增字段使用 `ALTER TABLE ADD COLUMN`，不会重建带有额外列、索引或触发器的数据库；只有在缺少 `split` 或 `pending/unknown` 约束的旧库上才会重建对应表。已有安装升级后，全局 `settings` 行保留为默认模板，账户在首次保存前继续实时继承它，因此升级不会改变任何账户的当前行为。所有迁移均在数据库事务内执行，若失败会自动回滚；建议在版本升级前先备份 `pennyharvester.db`。
 
 ### 运行测试与构建检查
 

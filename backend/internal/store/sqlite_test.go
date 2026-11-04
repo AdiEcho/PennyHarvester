@@ -708,3 +708,63 @@ func TestAccountVenueRoundTripAndUpdateKeepsVenue(t *testing.T) {
 		t.Fatalf("empty account venue was not coalesced: %+v", got)
 	}
 }
+
+func TestAccountSettingsAreStoredPerAccount(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	accounts, err := repository.ListAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) < 2 {
+		t.Fatalf("expected the seeded live and paper accounts, got %+v", accounts)
+	}
+	global, err := repository.LoadSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A fresh account inherits the global block without a row of its own.
+	inherited, err := repository.LoadAccountSettings(ctx, accounts[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inherited.OrderSize != global.OrderSize || inherited.MaxExposure != global.MaxExposure {
+		t.Fatalf("an account without its own block must inherit the global defaults: %+v", inherited)
+	}
+
+	custom := global
+	custom.OrderSize = 7
+	custom.MaxPosition = 21
+	custom.MaxExposure = 42
+	custom.Venues = map[market.Venue]engine.VenueSettings{
+		market.VenuePolymarket: {Enabled: true, OrderSize: 7, MaxPosition: 21, MaxExposure: 42},
+	}
+	if err := repository.SaveAccountSettings(ctx, accounts[0].ID, custom); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repository.LoadAccountSettings(ctx, accounts[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.OrderSize != 7 || stored.MaxPosition != 21 || stored.MaxExposure != 42 {
+		t.Fatalf("account settings were not persisted: %+v", stored)
+	}
+	other, err := repository.LoadAccountSettings(ctx, accounts[1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.OrderSize != global.OrderSize {
+		t.Fatalf("saving one account changed another account's strategy: %+v", other)
+	}
+	reloaded, err := repository.LoadSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.OrderSize != global.OrderSize {
+		t.Fatalf("saving account settings changed the global defaults: %+v", reloaded)
+	}
+}

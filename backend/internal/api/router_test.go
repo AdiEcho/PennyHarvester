@@ -584,3 +584,67 @@ func TestOrderRejectsVenueMismatchAndUnconfiguredLive(t *testing.T) {
 		t.Fatalf("unconfigured live must be a 409 with the readiness text: %d %s", response.Code, response.Body.String())
 	}
 }
+
+func TestSettingsEndpointIsScopedToAccount(t *testing.T) {
+	handler, _ := setupRouter(t)
+	paper := accountID(t, handler, engine.AccountModePaper)
+	live := accountID(t, handler, engine.AccountModeLive)
+
+	baseline := request(t, handler, http.MethodGet, "/api/v1/settings", nil)
+	if baseline.Code != http.StatusOK {
+		t.Fatalf("settings failed: %d %s", baseline.Code, baseline.Body.String())
+	}
+	var settings engine.Settings
+	if err := json.Unmarshal(baseline.Body.Bytes(), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.OrderSize == 9 {
+		t.Fatalf("baseline order size already equals the test value: %+v", settings)
+	}
+
+	settings.OrderSize = 9
+	settings.MaxPosition = 27
+	settings.MaxExposure = 54
+	settings.Venues = map[market.Venue]engine.VenueSettings{
+		market.VenuePolymarket: {Enabled: true, OrderSize: 9, MaxPosition: 27, MaxExposure: 54},
+	}
+	update := request(t, handler, http.MethodPut, "/api/v1/settings?account_id="+itoa(paper), settings)
+	if update.Code != http.StatusOK {
+		t.Fatalf("account settings update failed: %d %s", update.Code, update.Body.String())
+	}
+	var saved engine.Settings
+	if err := json.Unmarshal(update.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.OrderSize != 9 || saved.MaxPosition != 27 || saved.MaxExposure != 54 {
+		t.Fatalf("account settings were not saved: %+v", saved)
+	}
+
+	paperSettings := request(t, handler, http.MethodGet, "/api/v1/settings?account_id="+itoa(paper), nil)
+	var reread engine.Settings
+	if err := json.Unmarshal(paperSettings.Body.Bytes(), &reread); err != nil {
+		t.Fatal(err)
+	}
+	if reread.OrderSize != 9 {
+		t.Fatalf("account settings were not persisted: %+v", reread)
+	}
+
+	// The other account still inherits the global block, and the global block
+	// itself must not have been rewritten by an account-scoped update.
+	liveSettings := request(t, handler, http.MethodGet, "/api/v1/settings?account_id="+itoa(live), nil)
+	var inherited engine.Settings
+	if err := json.Unmarshal(liveSettings.Body.Bytes(), &inherited); err != nil {
+		t.Fatal(err)
+	}
+	if inherited.OrderSize != 100 {
+		t.Fatalf("another account was affected by the account-scoped update: %+v", inherited)
+	}
+	global := request(t, handler, http.MethodGet, "/api/v1/settings", nil)
+	var globalSettings engine.Settings
+	if err := json.Unmarshal(global.Body.Bytes(), &globalSettings); err != nil {
+		t.Fatal(err)
+	}
+	if globalSettings.OrderSize != 100 {
+		t.Fatalf("the global defaults were rewritten by an account-scoped update: %+v", globalSettings)
+	}
+}

@@ -1256,6 +1256,10 @@ type LiveQuote = venue.Quote
 type Repository interface {
 	LoadSettings(context.Context) (Settings, error)
 	SaveSettings(context.Context, Settings) error
+	// LoadAccountSettings returns the strategy block that applies to one
+	// account. A missing row falls back to the global settings.
+	LoadAccountSettings(context.Context, int64) (Settings, error)
+	SaveAccountSettings(context.Context, int64, Settings) error
 
 	LoadSystemSettings(context.Context) (SystemSettings, error)
 	SaveSystemSettings(context.Context, SystemSettings) error
