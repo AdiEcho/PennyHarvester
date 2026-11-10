@@ -198,13 +198,18 @@ func (s Settings) For(v market.Venue) EffectiveSettings {
 }
 
 type Settings struct {
-	MinPrice            float64 `json:"min_price"`
-	MaxPrice            float64 `json:"max_price"`
-	MaxDays             int     `json:"max_days"`
-	MinLiquidity        float64 `json:"min_liquidity"`
-	OrderSize           float64 `json:"order_size"`
-	MaxPosition         float64 `json:"max_position"`
-	MaxExposure         float64 `json:"max_exposure"`
+	MinPrice     float64 `json:"min_price"`
+	MaxPrice     float64 `json:"max_price"`
+	MaxDays      int     `json:"max_days"`
+	MinLiquidity float64 `json:"min_liquidity"`
+	OrderSize    float64 `json:"order_size"`
+	MaxPosition  float64 `json:"max_position"`
+	MaxExposure  float64 `json:"max_exposure"`
+	// MaxEventExposure caps the summed cost of the open positions that share
+	// one event (for example every market of a single election). Markets of one
+	// event settle together, so several tail bets on that event are one bet.
+	// Zero disables the cap.
+	MaxEventExposure    float64 `json:"max_event_exposure"`
 	ScanIntervalSeconds int     `json:"scan_interval_seconds"`
 	SlippageBPS         float64 `json:"slippage_bps"`
 	FeeBPS              float64 `json:"fee_bps"`
@@ -225,6 +230,11 @@ type Settings struct {
 	// overtime. Zero disables the gate for that group.
 	EntryWindowMinutes       int `json:"entry_window_minutes"`
 	SportsEntryWindowMinutes int `json:"sports_entry_window_minutes"`
+	// CryptoEntryWindowSeconds is the pre-close window for crypto markets,
+	// expressed in seconds because those markets are often hourly and resolve
+	// on a price print. It takes precedence over the minutes windows above for
+	// anything classified as Crypto. Zero disables the gate for that category.
+	CryptoEntryWindowSeconds int `json:"crypto_entry_window_seconds"`
 	// StopLossEnabled turns the local stop-loss monitor on. Polymarket's CLOB
 	// has no native stop order, so the engine watches the mark price on every
 	// scan and submits a market sell when the trigger is hit.
@@ -244,6 +254,10 @@ type Settings struct {
 // than a day has no practical use for this strategy and would mostly mask a
 // configuration mistake.
 const MaxEntryWindowMinutes = 1440
+
+// MaxCryptoEntryWindowSeconds bounds the crypto entry window. Crypto markets
+// are traded on a seconds clock, so the bound is one day expressed in seconds.
+const MaxCryptoEntryWindowSeconds = 86400
 
 const (
 	RadarCategoryAll       = "all"
@@ -291,11 +305,11 @@ const DefaultStopLossRatio = 0.70
 func DefaultSettings() Settings {
 	return Settings{
 		MinPrice: 0.95, MaxPrice: 0.99, MaxDays: 30, MinLiquidity: 10000,
-		OrderSize: 100, MaxPosition: 250, MaxExposure: 1000,
+		OrderSize: 100, MaxPosition: 250, MaxExposure: 1000, MaxEventExposure: 250,
 		ScanIntervalSeconds: 60, SlippageBPS: 20, FeeBPS: DefaultFeeBPS,
 		InitialBankroll: 10000, DefaultCategory: RadarCategoryNonSports,
 		SportsPolicy: SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
-		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5,
+		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5, CryptoEntryWindowSeconds: 60,
 		StopLossEnabled: false, StopLossRatio: DefaultStopLossRatio,
 		FeeModelVersion: FeeModelVersion,
 		// Polymarket stays enabled for existing installations; Predict.fun is
@@ -327,6 +341,12 @@ func (s Settings) Validate() error {
 	if s.MaxExposure < s.OrderSize {
 		return fmt.Errorf("总敞口上限不能小于单笔金额")
 	}
+	if s.MaxEventExposure < 0 || math.IsNaN(s.MaxEventExposure) || math.IsInf(s.MaxEventExposure, 0) {
+		return fmt.Errorf("单事件敞口上限不能小于 0")
+	}
+	if s.MaxEventExposure > 0 && s.MaxEventExposure < s.OrderSize {
+		return fmt.Errorf("单事件敞口上限不能小于单笔金额，0 表示不限")
+	}
 	if s.ScanIntervalSeconds < 10 || s.ScanIntervalSeconds > 86400 {
 		return fmt.Errorf("扫描间隔须为 10–86400 秒")
 	}
@@ -349,6 +369,9 @@ func (s Settings) Validate() error {
 	}
 	if s.SportsEntryWindowMinutes < 0 || s.SportsEntryWindowMinutes > MaxEntryWindowMinutes {
 		return fmt.Errorf("体育尾盘下单窗口须为 0–%d 分钟", MaxEntryWindowMinutes)
+	}
+	if s.CryptoEntryWindowSeconds < 0 || s.CryptoEntryWindowSeconds > MaxCryptoEntryWindowSeconds {
+		return fmt.Errorf("加密尾盘下单窗口须为 0–%d 秒", MaxCryptoEntryWindowSeconds)
 	}
 	if s.StopLossRatio <= 0 || s.StopLossRatio >= 1 ||
 		math.IsNaN(s.StopLossRatio) || math.IsInf(s.StopLossRatio, 0) {
@@ -957,7 +980,10 @@ type walletDiscovery interface {
 }
 
 type Opportunity struct {
-	MarketID       string    `json:"market_id"`
+	MarketID string `json:"market_id"`
+	// EventID groups the markets that resolve together. Several tail entries in
+	// one event are one correlated bet, so they share an exposure cap.
+	EventID        string    `json:"event_id,omitempty"`
 	ConditionID    string    `json:"condition_id"`
 	Question       string    `json:"question"`
 	QuestionZH     string    `json:"question_zh"`
@@ -1044,17 +1070,20 @@ type OpportunityQuote struct {
 }
 
 type Position struct {
-	ID          int64           `json:"id"`
-	AccountID   int64           `json:"account_id"`
-	Venue       market.Venue    `json:"venue"`
-	Currency    market.Currency `json:"currency"`
-	MarketID    string          `json:"market_id"`
-	ConditionID string          `json:"condition_id"`
-	Question    string          `json:"question"`
-	Outcome     string          `json:"outcome"`
-	TokenID     string          `json:"token_id"`
-	Side        string          `json:"side"`
-	Kind        string          `json:"kind"`
+	ID        int64           `json:"id"`
+	AccountID int64           `json:"account_id"`
+	Venue     market.Venue    `json:"venue"`
+	Currency  market.Currency `json:"currency"`
+	MarketID  string          `json:"market_id"`
+	// EventID is the market's settlement event. It is copied from the entry
+	// opportunity so the event exposure cap can be enforced across scans.
+	EventID     string `json:"event_id,omitempty"`
+	ConditionID string `json:"condition_id"`
+	Question    string `json:"question"`
+	Outcome     string `json:"outcome"`
+	TokenID     string `json:"token_id"`
+	Side        string `json:"side"`
+	Kind        string `json:"kind"`
 	// ExitKind is empty for normal holdings and "stop" for a position closed by
 	// the stop-loss monitor. The status itself stays won/lost/split so the
 	// existing SQLite CHECK constraints (and any older database) remain valid.
@@ -1149,10 +1178,22 @@ type Metrics struct {
 	SettledPositions int     `json:"settled_positions"`
 	SplitPositions   int     `json:"split_positions"`
 	// StoppedPositions counts positions closed early by the stop-loss. They are
-	// settled for cash purposes but excluded from the win-rate denominator.
-	StoppedPositions int     `json:"stopped_positions"`
-	WinRate          float64 `json:"win_rate"`
-	TotalOrders      int64   `json:"total_orders"`
+	// decided outcomes and count as losses in the win rate.
+	StoppedPositions int `json:"stopped_positions"`
+	// WinRate is wins / (settled - splits); split refunds stay out of both sides.
+	WinRate float64 `json:"win_rate"`
+	// AutoTradeStartedAt is the account's first automatic buy, i.e. when the
+	// strategy actually started trading. Nil until an auto entry exists, so a
+	// manually traded account never claims a strategy window it did not run.
+	AutoTradeStartedAt *time.Time `json:"auto_trade_started_at"`
+	// AnnualizedReturn compounds TotalReturn over AnnualizedDays since
+	// AutoTradeStartedAt. It stays 0 below one day: an annualized figure built
+	// on hours of samples is noise, not an estimate.
+	AnnualizedReturn float64 `json:"annualized_return"`
+	// AnnualizedDays is the elapsed window in days, reported whenever an auto
+	// entry exists so the UI can show how long the estimate covers.
+	AnnualizedDays float64 `json:"annualized_days"`
+	TotalOrders    int64   `json:"total_orders"`
 }
 
 type EngineStatus struct {
@@ -1279,6 +1320,10 @@ type Repository interface {
 	ListPositions(context.Context, int64, string, market.Venue) ([]Position, error)
 	ListOrders(context.Context, int64, string, int, int, market.Venue) ([]Order, error)
 	CountOrders(context.Context, int64, string, market.Venue) (int64, error)
+	// EarliestAutoBuyAt returns the creation time of the account's first
+	// automatic buy, which is the start of the strategy's live performance
+	// window. Nil means the account has never auto-entered.
+	EarliestAutoBuyAt(context.Context, int64) (*time.Time, error)
 	ListUnresolvedOrders(context.Context, int64) ([]Order, error)
 	MarkOrderStatus(context.Context, int64, string, string) error
 	FinalizeLiveBuy(context.Context, int64, Position, LiveFill) (Position, error)
@@ -1297,7 +1342,7 @@ func opportunityFor(m market.Market, outcome market.Outcome, now time.Time) Oppo
 	days := m.EndDate.Sub(now).Hours() / 24
 	grossYield := (1 - outcome.Price) / outcome.Price
 	return Opportunity{
-		MarketID: m.ID, ConditionID: m.ConditionID, Question: m.Question, GroupItemTitle: m.GroupItemTitle,
+		MarketID: m.ID, EventID: m.EventID, ConditionID: m.ConditionID, Question: m.Question, GroupItemTitle: m.GroupItemTitle,
 		Slug: m.Slug, Outcome: outcome.Name, TokenID: outcome.TokenID, Price: outcome.Price,
 		Liquidity: m.Liquidity, Volume: m.Volume, EndDate: m.EndDate, DaysToEnd: days,
 		GrossYield: grossYield, URL: m.URL(), PriceChange24h: m.PriceChange24h,

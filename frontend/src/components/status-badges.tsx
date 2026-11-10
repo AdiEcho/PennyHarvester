@@ -29,9 +29,17 @@ export function OrderStatusBadge({ status }: { status: OrderStatus }) {
   return <Badge variant="danger"><X className="h-3 w-3" /> 未成交</Badge>
 }
 
-export function PositionStatusBadge({ status, exitKind }: { status: PositionStatus; exitKind?: string }) {
+// A position stays "open" until the venue publishes a resolution, which for a
+// real election or game can land hours after the scheduled end date. The badge
+// switches to 待场馆结算 once that time has passed so an overdue row does not
+// read as a stuck one.
+export function PositionStatusBadge({ status, exitKind, endDate }: { status: PositionStatus; exitKind?: string; endDate?: string | null }) {
   if (exitKind === 'stop') return <Badge variant="warning"><ShieldAlert className="h-3 w-3" /> 已止损</Badge>
-  if (status === 'open') return <Badge variant="info"><Clock3 className="h-3 w-3" /> 持有中</Badge>
+  if (status === 'open') {
+    const overdue = endDate ? new Date(endDate).getTime() <= Date.now() : false
+    if (overdue) return <Badge variant="warning" title="到期时间已过，场馆尚未公布结算结果；结果公布后引擎会自动按结算价平仓。"><Clock3 className="h-3 w-3" /> 待场馆结算</Badge>
+    return <Badge variant="info"><Clock3 className="h-3 w-3" /> 持有中</Badge>
+  }
   if (status === 'won') return <Badge variant="success"><CircleCheck className="h-3 w-3" /> 已胜出</Badge>
   if (status === 'split') return <Badge variant="warning"><AlertTriangle className="h-3 w-3" /> 平局退款</Badge>
   return <Badge variant="danger"><CircleX className="h-3 w-3" /> 未胜出</Badge>

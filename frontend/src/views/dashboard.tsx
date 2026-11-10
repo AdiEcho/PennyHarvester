@@ -154,7 +154,7 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
   const venue = venueOf(metrics)
   const meta = venueMeta(venue)
   return (
-    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
       <StatCard
         label={isLive ? '实盘账户权益' : '模拟账户权益'}
         value={metrics ? fmtMoney(metrics.equity, venue) : '—'}
@@ -189,6 +189,28 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
         venue={venue}
         loading={loading}
         detail={metrics ? `${formatNumber(metrics.open_positions, 0)} 个持有中仓位` : '正在加载账户数据'}
+      />
+      <StatCard
+        label="预估年化收益率"
+        value={metrics ? (metrics.annualized_days >= 1 ? formatPercent(metrics.annualized_return, 1, true) : '—') : '—'}
+        icon={TrendingUp}
+        venue={venue}
+        loading={loading}
+        detail={metrics ? (metrics.annualized_days >= 1
+          ? <span>按 {formatNumber(metrics.annualized_days, 1)} 天折算 · 累计 <span className={pnlClass(metrics.total_return)}>{formatPercent(metrics.total_return, 2, true)}</span></span>
+          : metrics.auto_trade_started_at ? '自动下单不足 1 天，暂不折算' : '尚未产生自动买入') : '正在加载账户数据'}
+      />
+      <StatCard
+        label="自动下单开始时间"
+        value={metrics ? (metrics.auto_trade_started_at ? formatDate(metrics.auto_trade_started_at) : '—') : '—'}
+        icon={Clock3}
+        venue={venue}
+        loading={loading}
+        detail={metrics ? (metrics.auto_trade_started_at
+          ? (metrics.annualized_days >= 1
+            ? `首笔自动买入 · 距今 ${formatNumber(metrics.annualized_days, 1)} 天`
+            : `首笔自动买入 · 距今 ${formatNumber(metrics.annualized_days * 24, 1)} 小时`)
+          : '开启自动交易并成交后开始计时') : '正在加载账户数据'}
       />
     </div>
   )
@@ -250,7 +272,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
                 <dl className="space-y-3 border-t border-slate-100 px-1 pt-4 text-xs">
                   <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-1.5 text-slate-500"><Clock3 className="h-3.5 w-3.5" />最近扫描</dt><dd className="text-slate-700">{formatDate(data.engine.last_scan_at)}</dd></div>
                   <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-1.5 text-slate-500"><RefreshCw className="h-3.5 w-3.5" />最近同步</dt><dd className="text-slate-700">{formatDate(data.source.last_sync_at)}</dd></div>
-                  <div className="flex items-center justify-between gap-4"><dt className="text-slate-500">已结算 / 胜率</dt><dd className="text-slate-700">{formatNumber(data.metrics.settled_positions, 0)} 笔{data.metrics.split_positions > 0 ? `（含 ${formatNumber(data.metrics.split_positions, 0)} 笔平局）` : ''}{data.metrics.stopped_positions > 0 ? `（含 ${formatNumber(data.metrics.stopped_positions, 0)} 笔止损）` : ''} / {data.metrics.settled_positions - data.metrics.split_positions - data.metrics.stopped_positions > 0 ? formatPercent(data.metrics.win_rate, 1) : '—'}</dd></div>
+                  <div className="flex items-center justify-between gap-4"><dt className="text-slate-500">已结算 / 胜率</dt><dd className="text-slate-700">{formatNumber(data.metrics.settled_positions, 0)} 笔{data.metrics.split_positions > 0 ? `（含 ${formatNumber(data.metrics.split_positions, 0)} 笔平局）` : ''}{data.metrics.stopped_positions > 0 ? `（含 ${formatNumber(data.metrics.stopped_positions, 0)} 笔止损）` : ''} / {data.metrics.settled_positions - data.metrics.split_positions > 0 ? formatPercent(data.metrics.win_rate, 1) : '—'}</dd></div>
                 </dl>
                 {isLive && !data.account.live_ready && (
                   <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">

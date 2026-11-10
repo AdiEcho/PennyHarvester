@@ -273,6 +273,43 @@ func TestAccountCreationAndDefaultSwitch(t *testing.T) {
 	}
 }
 
+func TestAccountCreationUsesSubmittedBankroll(t *testing.T) {
+	handler, _ := setupRouter(t)
+	created := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
+		"name": "自定义本金", "mode": "paper", "initial_bankroll": 25000,
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create account failed: %d %s", created.Code, created.Body.String())
+	}
+	var account engine.Account
+	if err := json.Unmarshal(created.Body.Bytes(), &account); err != nil {
+		t.Fatal(err)
+	}
+	if account.BaselineEquity != 25000 {
+		t.Fatalf("submitted bankroll was ignored: baseline=%v", account.BaselineEquity)
+	}
+	// Omitting the field keeps the strategy default instead of writing zero.
+	fallback := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
+		"name": "默认本金", "mode": "paper",
+	})
+	if fallback.Code != http.StatusCreated {
+		t.Fatalf("create account failed: %d %s", fallback.Code, fallback.Body.String())
+	}
+	var inherited engine.Account
+	if err := json.Unmarshal(fallback.Body.Bytes(), &inherited); err != nil {
+		t.Fatal(err)
+	}
+	if inherited.BaselineEquity <= 0 {
+		t.Fatalf("default bankroll was not applied: baseline=%v", inherited.BaselineEquity)
+	}
+	negative := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
+		"name": "非法本金", "mode": "paper", "initial_bankroll": -100,
+	})
+	if negative.Code != http.StatusBadRequest {
+		t.Fatalf("negative bankroll should be rejected: %d %s", negative.Code, negative.Body.String())
+	}
+}
+
 func itoa(value int64) string {
 	return strconv.FormatInt(value, 10)
 }
@@ -646,5 +683,50 @@ func TestSettingsEndpointIsScopedToAccount(t *testing.T) {
 	}
 	if globalSettings.OrderSize != 100 {
 		t.Fatalf("the global defaults were rewritten by an account-scoped update: %+v", globalSettings)
+	}
+}
+
+func TestScanIntervalEndpointUpdatesGlobalOnly(t *testing.T) {
+	handler, instance := setupRouter(t)
+	paper := accountID(t, handler, engine.AccountModePaper)
+
+	update := request(t, handler, http.MethodPut, "/api/v1/settings/scan-interval", map[string]any{
+		"scan_interval_seconds": 10,
+	})
+	if update.Code != http.StatusOK {
+		t.Fatalf("scan interval update failed: %d %s", update.Code, update.Body.String())
+	}
+	if got := instance.Settings().ScanIntervalSeconds; got != 10 {
+		t.Fatalf("global scan interval = %d, want 10", got)
+	}
+
+	// An account-scoped save still carries the old field, but it must not be
+	// able to override the process-wide cadence.
+	account := request(t, handler, http.MethodGet, "/api/v1/settings?account_id="+itoa(paper), nil)
+	var settings engine.Settings
+	if err := json.Unmarshal(account.Body.Bytes(), &settings); err != nil {
+		t.Fatal(err)
+	}
+	settings.ScanIntervalSeconds = 600
+	saved := request(t, handler, http.MethodPut, "/api/v1/settings?account_id="+itoa(paper), settings)
+	if saved.Code != http.StatusOK {
+		t.Fatalf("account settings update failed: %d %s", saved.Code, saved.Body.String())
+	}
+	if got := instance.Settings().ScanIntervalSeconds; got != 10 {
+		t.Fatalf("an account save changed the global interval to %d", got)
+	}
+	account = request(t, handler, http.MethodGet, "/api/v1/settings?account_id="+itoa(paper), nil)
+	if err := json.Unmarshal(account.Body.Bytes(), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.ScanIntervalSeconds != 10 {
+		t.Fatalf("account read exposed a dead scan interval: %d", settings.ScanIntervalSeconds)
+	}
+
+	invalid := request(t, handler, http.MethodPut, "/api/v1/settings/scan-interval", map[string]any{
+		"scan_interval_seconds": 5,
+	})
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-range scan interval accepted: %d %s", invalid.Code, invalid.Body.String())
 	}
 }

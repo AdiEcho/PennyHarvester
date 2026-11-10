@@ -198,6 +198,12 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "positions", "currency", "TEXT NOT NULL DEFAULT 'USDC'"); err != nil {
 		return err
 	}
+	// event_id groups the markets of one settlement event so automatic entries
+	// can be capped per event. Rows written before the column existed keep ""
+	// and are capped per market only.
+	if err := s.ensureColumn(ctx, "positions", "event_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "orders", "venue", "TEXT NOT NULL DEFAULT 'polymarket'"); err != nil {
 		return err
 	}
@@ -800,11 +806,11 @@ func insertPosition(ctx context.Context, db execer, p engine.Position) (engine.P
 	venue := p.EffectiveVenue()
 	currency := p.EffectiveCurrency()
 	result, err := db.ExecContext(ctx, `INSERT INTO positions(
-		account_id, venue, currency, market_id, condition_id, question, outcome, token_id, side, kind, exit_kind, entry_price,
+		account_id, venue, currency, market_id, event_id, condition_id, question, outcome, token_id, side, kind, exit_kind, entry_price,
 		current_price, shares, cost, fee, status, opened_at, closed_at, end_date,
 		realized_pnl, unrealized_pnl
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.AccountID, venue, currency, p.MarketID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, kind, p.ExitKind, p.EntryPrice,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.AccountID, venue, currency, p.MarketID, p.EventID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, kind, p.ExitKind, p.EntryPrice,
 		p.CurrentPrice, p.Shares, p.Cost, p.Fee, p.Status, formatTime(p.OpenedAt),
 		nullableTime(p.ClosedAt), formatTime(p.EndDate), p.RealizedPNL, p.UnrealizedPNL)
 	if err != nil {
@@ -867,7 +873,7 @@ func insertOrder(ctx context.Context, db orderInserter, order engine.Order) (int
 }
 
 func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status string, v market.Venue) ([]engine.Position, error) {
-	query := `SELECT id, account_id, venue, currency, market_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
+	query := `SELECT id, account_id, venue, currency, market_id, event_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
 		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at,
 		end_date, realized_pnl, unrealized_pnl FROM positions WHERE account_id = ?`
 	args := []any{accountID}
@@ -881,7 +887,7 @@ func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status stri
 		query += " AND status <> 'open' AND exit_kind = 'stop'"
 	case "lost":
 		// Keep stopped positions out of the ordinary loss tab; they have their
-		// own tab and are excluded from the win-rate denominator.
+		// own tab and are counted as stop-loss exits in the metrics.
 		query += " AND status = 'lost' AND exit_kind <> 'stop'"
 	default:
 		query += " AND status = ?"
@@ -902,7 +908,7 @@ func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status stri
 		var p engine.Position
 		var openedAt, endDate string
 		var closedAt sql.NullString
-		if err := rows.Scan(&p.ID, &p.AccountID, &p.Venue, &p.Currency, &p.MarketID, &p.ConditionID, &p.Question, &p.Outcome,
+		if err := rows.Scan(&p.ID, &p.AccountID, &p.Venue, &p.Currency, &p.MarketID, &p.EventID, &p.ConditionID, &p.Question, &p.Outcome,
 			&p.TokenID, &p.Side, &p.Kind, &p.ExitKind, &p.EntryPrice, &p.CurrentPrice, &p.Shares, &p.Cost,
 			&p.Fee, &p.Status, &openedAt, &closedAt, &endDate, &p.RealizedPNL, &p.UnrealizedPNL); err != nil {
 			return nil, err
@@ -999,6 +1005,29 @@ func (s *SQLite) CountOrders(ctx context.Context, accountID int64, status string
 	var count int64
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
+}
+
+// EarliestAutoBuyAt returns the oldest automatic buy by creation time, not by
+// insertion order, so a backfilled history row still marks the real start of
+// the strategy. Ties inside one second fall back to id: the stored RFC3339Nano
+// text has a variable number of fraction digits, and a sub-second difference
+// cannot move an annualized figure.
+func (s *SQLite) EarliestAutoBuyAt(ctx context.Context, accountID int64) (*time.Time, error) {
+	var createdAt string
+	err := s.db.QueryRowContext(ctx, `SELECT created_at FROM orders
+		WHERE account_id = ? AND kind = 'auto' AND type = 'buy'
+		ORDER BY created_at ASC, id ASC LIMIT 1`, accountID).Scan(&createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := parseTime(createdAt)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
 }
 
 func (s *SQLite) ListUnresolvedOrders(ctx context.Context, accountID int64) ([]engine.Order, error) {

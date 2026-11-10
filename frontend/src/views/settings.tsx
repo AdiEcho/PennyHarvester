@@ -37,7 +37,7 @@ import { TabBar, type TabItem } from '@/components/ui/tab-bar'
 import { PageHeader } from '@/components/page-header'
 import { ModeBadge, VenueChip } from '@/components/status-badges'
 
-const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes', 'stop_loss_ratio'] as const
+const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'max_event_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes', 'crypto_entry_window_seconds', 'stop_loss_ratio'] as const
 const selectKeys = ['default_category', 'sports_policy'] as const
 type NumericKey = typeof numericKeys[number]
 type SelectKey = typeof selectKeys[number]
@@ -99,6 +99,7 @@ function toDraft(settings: Settings): Draft {
       order_size: String(settings.order_size),
       max_position: String(settings.max_position),
       max_exposure: String(settings.max_exposure),
+      max_event_exposure: String(settings.max_event_exposure ?? 0),
       scan_interval_seconds: String(settings.scan_interval_seconds),
       slippage_bps: String(settings.slippage_bps),
       fee_bps: String(settings.fee_bps),
@@ -108,6 +109,7 @@ function toDraft(settings: Settings): Draft {
       max_price_change_24h: String(settings.max_price_change_24h),
       entry_window_minutes: String(settings.entry_window_minutes),
       sports_entry_window_minutes: String(settings.sports_entry_window_minutes),
+      crypto_entry_window_seconds: String(settings.crypto_entry_window_seconds),
       stop_loss_ratio: String(settings.stop_loss_ratio),
       stop_loss_enabled: settings.stop_loss_enabled,
     },
@@ -127,6 +129,7 @@ function toShared(draft: SharedDraft) {
     order_size: Number(draft.order_size),
     max_position: Number(draft.max_position),
     max_exposure: Number(draft.max_exposure),
+    max_event_exposure: Number(draft.max_event_exposure),
     scan_interval_seconds: Number(draft.scan_interval_seconds),
     slippage_bps: Number(draft.slippage_bps),
     fee_bps: Number(draft.fee_bps),
@@ -136,6 +139,7 @@ function toShared(draft: SharedDraft) {
     max_price_change_24h: Number(draft.max_price_change_24h),
     entry_window_minutes: Number(draft.entry_window_minutes),
     sports_entry_window_minutes: Number(draft.sports_entry_window_minutes),
+    crypto_entry_window_seconds: Number(draft.crypto_entry_window_seconds),
     stop_loss_ratio: Number(draft.stop_loss_ratio),
     stop_loss_enabled: draft.stop_loss_enabled,
   }
@@ -187,6 +191,8 @@ function validateShared(shared: SharedDraft): FieldErrors {
   if (settings.order_size <= 0) errors.order_size = '单笔金额必须大于 0。'
   if (settings.max_position < settings.order_size) errors.max_position = '单市场持仓上限不能低于单笔金额。'
   if (settings.max_exposure < settings.max_position) errors.max_exposure = '总敞口上限不能低于单市场持仓上限。'
+  if (settings.max_event_exposure < 0) errors.max_event_exposure = '单事件敞口上限不能小于 0（0 表示不限）。'
+  else if (settings.max_event_exposure > 0 && settings.max_event_exposure < settings.order_size) errors.max_event_exposure = '单事件敞口上限不能低于单笔金额（0 表示不限）。'
   if (!Number.isInteger(settings.scan_interval_seconds) || settings.scan_interval_seconds < 10 || settings.scan_interval_seconds > 86400) errors.scan_interval_seconds = '请输入 10–86400 之间的整数秒数。'
   if (settings.slippage_bps < 0 || settings.slippage_bps > 1000) errors.slippage_bps = '滑点范围为 0–1000 bps。'
   if (settings.fee_bps < 0 || settings.fee_bps > 1000) errors.fee_bps = '费用范围为 0–1000 bps。'
@@ -196,6 +202,7 @@ function validateShared(shared: SharedDraft): FieldErrors {
   if (settings.max_price_change_24h < 0 || settings.max_price_change_24h > 1) errors.max_price_change_24h = '请输入 0–1 之间的数值（0 表示不限制）。'
   if (!Number.isInteger(settings.entry_window_minutes) || settings.entry_window_minutes < 0 || settings.entry_window_minutes > 1440) errors.entry_window_minutes = '请输入 0–1440 之间的整数分钟数。'
   if (!Number.isInteger(settings.sports_entry_window_minutes) || settings.sports_entry_window_minutes < 0 || settings.sports_entry_window_minutes > 1440) errors.sports_entry_window_minutes = '请输入 0–1440 之间的整数分钟数。'
+  if (!Number.isInteger(settings.crypto_entry_window_seconds) || settings.crypto_entry_window_seconds < 0 || settings.crypto_entry_window_seconds > 86400) errors.crypto_entry_window_seconds = '请输入 0–86400 之间的整数秒数。'
   if (settings.stop_loss_ratio <= 0 || settings.stop_loss_ratio >= 1) errors.stop_loss_ratio = '请输入 0–1 之间的小数，例如 0.70。'
   return errors
 }
@@ -333,7 +340,7 @@ function SettingsSection({ icon: Icon, title, description, children }: {
   )
 }
 
-function AccountSection({ account, accounts }: { account: Account; accounts: Account[] }) {
+function AccountSection({ account, accounts, defaultBankroll }: { account: Account; accounts: Account[]; defaultBankroll: string }) {
   const { refreshAccounts, selectAccount } = useAccount()
   const { toast } = useToast()
   const [name, setName] = useState(account.name)
@@ -343,6 +350,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
   const [newName, setNewName] = useState('')
   const [newMode, setNewMode] = useState<AccountMode>('paper')
   const [newVenue, setNewVenue] = useState<Venue>(venueOf(account))
+  const [newBankroll, setNewBankroll] = useState('')
   const [creating, setCreating] = useState(false)
   const isLive = account.mode === 'live'
   const venue = venueOf(account)
@@ -380,14 +388,24 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
       toast({ title: '请输入账户名称', variant: 'error' })
       return
     }
+    const bankroll = Number(newBankroll)
+    if (newMode === 'paper' && (newBankroll.trim() === '' || !Number.isFinite(bankroll) || bankroll <= 0)) {
+      toast({ title: '请填写有效的初始资金', description: '模拟账户的初始资金必须大于 0，单位为新账户所属场所的计价币。', variant: 'error' })
+      return
+    }
     setCreating(true)
     try {
-      const created = await api.createAccount({ name: newName.trim(), mode: newMode, venue: newVenue })
+      const created = await api.createAccount({
+        name: newName.trim(),
+        mode: newMode,
+        venue: newVenue,
+        ...(newMode === 'paper' ? { initial_bankroll: bankroll } : {}),
+      })
       refreshAccounts()
       selectAccount(created.id)
       setCreateOpen(false)
       setNewName('')
-      toast({ title: '账户已创建', description: `${created.name} · ${venueLabel(venueOf(created))} · ${created.mode === 'live' ? '实盘' : '模拟'}`, variant: 'success' })
+      toast({ title: '账户已创建', description: `${created.name} · ${venueLabel(venueOf(created))} · ${created.mode === 'live' ? '实盘' : '模拟'}${created.mode === 'paper' ? ` · 初始资金 ${fmtMoney(created.baseline_equity, venueOf(created))}` : ''}`, variant: 'success' })
     } catch (caught) {
       toast({ title: '创建账户失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
     } finally {
@@ -437,7 +455,7 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
             <div className="mt-3 flex flex-wrap gap-2">
               {!account.is_default && <Button variant="ghost" size="sm" onClick={() => void save({ is_default: true }, '默认账户已切换')} disabled={saving}><Star className="h-3.5 w-3.5" />设为默认</Button>}
               {!isLive && !account.is_default && <Button variant="ghost" size="sm" className="text-rose-600 hover:bg-rose-50 hover:text-rose-700" onClick={() => void removeAccount()} disabled={saving}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
-              <Button variant="ghost" size="sm" onClick={() => setCreateOpen(true)}><Plus className="h-3.5 w-3.5" />新建账户</Button>
+              <Button variant="ghost" size="sm" onClick={() => { setNewBankroll(defaultBankroll); setCreateOpen(true) }}><Plus className="h-3.5 w-3.5" />新建账户</Button>
             </div>
           </div>
 
@@ -521,6 +539,17 @@ function AccountSection({ account, accounts }: { account: Account; accounts: Acc
               </SelectContent>
             </Select>
           </div>
+          {newMode === 'paper' && (
+            <NumberField
+              id="new-account-bankroll"
+              label="模拟初始资金"
+              description={`写入该账户的基准权益，单位 ${venueMeta(newVenue).currency}；创建后不会随策略页的默认值变化而重算。`}
+              value={newBankroll}
+              unit={venueMeta(newVenue).currency}
+              min={0}
+              onChange={setNewBankroll}
+            />
+          )}
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
             <Button variant="secondary" onClick={() => setCreateOpen(false)} disabled={creating}>取消</Button>
             <Button variant="primary" onClick={() => void createAccount()} loading={creating}>创建账户</Button>
@@ -604,9 +633,11 @@ export function SettingsView() {
   const { toast } = useToast()
   // Settings are stored per account: both the read and the write carry the
   // selected account id so switching accounts never mixes their strategies.
+  // The global template is intentionally never loaded here: editing it would
+  // arm the stop-loss for every account that has not saved its own block.
   const fetchSettings = useCallback((signal: AbortSignal) => api.settings(signal, account?.id), [account?.id])
   const fetchDashboard = useCallback((signal: AbortSignal) => api.dashboard(account?.id, signal), [account?.id])
-  const settingsQuery = usePolling(fetchSettings, { interval: 30000 })
+  const settingsQuery = usePolling(fetchSettings, { interval: 30000, enabled: Boolean(account?.id) })
   const dashboardQuery = usePolling(fetchDashboard, { enabled: Boolean(account?.id) })
   const engine = engineOverride || dashboardQuery.data?.engine || null
   const isLive = account?.mode === 'live'
@@ -668,6 +699,12 @@ export function SettingsView() {
 
   const save = async () => {
     if (!draft) return
+    // A write without an account id lands on the global template, which would
+    // change the stop-loss of every account that never saved its own block.
+    if (!account?.id) {
+      toast({ title: '请先选择账户', description: '参数按账户保存，账户信息尚未载入完成。', variant: 'error' })
+      return
+    }
     const validation = validate(draft)
     setErrors(validation)
     const errorKeys = Object.keys(validation)
@@ -689,21 +726,41 @@ export function SettingsView() {
     // One PUT carries the account's strategy fields plus both venues, built from
     // the loaded object so unrendered fields are never dropped.
     const payload = toPayload(base, draft)
+    // Scanning is process-wide. The account settings endpoint deliberately
+    // ignores this field, so a changed cadence needs its own global update.
+    const scanInterval = Number(draft.shared.scan_interval_seconds)
+    const scanChanged = scanInterval !== base.scan_interval_seconds
     saveController.current?.abort()
     const controller = new AbortController()
     saveController.current = controller
     setSaving(true)
+    let scanSaved = false
     try {
+      if (scanChanged) {
+        await api.updateScanInterval(scanInterval, controller.signal)
+        scanSaved = true
+      }
       const saved = await api.updateSettings(payload, controller.signal, account?.id)
       latestSettings.current = saved
       setDraft(toDraft(saved))
       setDirty(false)
       setErrors({})
-      toast({ title: '参数已保存', description: `当前账户${account ? `「${account.name}」` : ''}的策略与两个场所参数已提交；其他账户不受影响。`, variant: 'success' })
+      toast({
+        title: '参数已保存',
+        description: scanChanged
+          ? `当前账户${account ? `「${account.name}」` : ''}的策略与两个场所参数已提交；扫描间隔已更新为全局 ${scanInterval} 秒。`
+          : `当前账户${account ? `「${account.name}」` : ''}的策略与两个场所参数已提交；其他账户不受影响。`,
+        variant: 'success',
+      })
       settingsQuery.refresh()
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
-      toast({ title: '保存失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
+      const message = caught instanceof Error ? caught.message : '请稍后重试。'
+      toast({
+        title: '保存失败',
+        description: scanSaved ? `扫描间隔已改为 ${scanInterval} 秒，但账户参数未保存：${message}` : message,
+        variant: 'error',
+      })
     } finally {
       if (saveController.current === controller) setSaving(false)
     }
@@ -736,7 +793,7 @@ export function SettingsView() {
         {dashboardQuery.error && !engine && <div className="break-words border-t border-white/10 bg-white/5 px-5 py-3 text-xs text-rose-300">{dashboardQuery.error}</div>}
       </Card>
 
-      {account && <div className="mb-4"><AccountSection key={account.id} account={account} accounts={accounts} /></div>}
+      {account && <div className="mb-4"><AccountSection key={account.id} account={account} accounts={accounts} defaultBankroll={settingsQuery.data ? String(settingsQuery.data.initial_bankroll) : ''} /></div>}
 
       {settingsQuery.isLoading ? <Card><div className="grid gap-5 p-6 sm:grid-cols-2"><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /></div></Card> : settingsQuery.error && !settingsQuery.data ? <Card><ErrorState message={settingsQuery.error} onRetry={settingsQuery.refresh} /></Card> : !draft ? <Card><div className="grid gap-5 p-6 sm:grid-cols-2"><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /></div></Card> : (
         <form id="settings-form" onSubmit={(event) => { event.preventDefault(); void save() }} className="space-y-4">
@@ -772,29 +829,34 @@ export function SettingsView() {
 
               <SettingsSection icon={ShieldCheck} title="资金与风控（当前账户）" description="这里的金额属于当前账户，单位随场所变化（Polymarket = USDC、Predict.fun = USDT）。需要不同的单笔金额或敞口时，在对应场所页签填写覆写值；其他账户不受影响。">
                 <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
-                  <NumberField id="initial_bankroll" label="新建模拟账户初始资金" description="仅用于尚未初始化基准权益的模拟账户；已有基准权益的账户不会因修改此值而重算历史。" value={draft.shared.initial_bankroll} unit="场所币" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
+                  <NumberField id="initial_bankroll" label="新建模拟账户默认资金" description="只作为「新建账户」弹窗的预填值；弹窗里填写的金额直接写入新账户的基准权益，已有基准权益的账户不会因修改此值而重算历史。" value={draft.shared.initial_bankroll} unit="场所币" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
                   <NumberField id="order_size" label="单笔金额（默认）" description="每次自动买入的目标名义金额；机会雷达的「真实收益」也按该场所的金额报价。" value={draft.shared.order_size} unit="场所币" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
                   <NumberField id="max_position" label="单市场持仓上限（默认）" description="不得低于单笔金额。" value={draft.shared.max_position} unit="场所币" min={0} error={errors.max_position} onChange={(value) => update('max_position', value)} />
                   <NumberField id="max_exposure" label="总敞口上限（默认）" description="单个场所全部未平仓头寸的风险预算上限；不得低于单市场持仓上限。绝不跨场所合并。" value={draft.shared.max_exposure} unit="场所币" min={0} error={errors.max_exposure} onChange={(value) => update('max_exposure', value)} />
+                  <NumberField id="max_event_exposure" label="单事件敞口上限（默认）" description="同一事件下全部市场的合计成本上限。一场选举或一场比赛的所有盘口共用同一个结果，逐个买入等于同一注押很多次；0 表示不限。" value={draft.shared.max_event_exposure} unit="场所币" min={0} error={errors.max_event_exposure} onChange={(value) => update('max_event_exposure', value)} />
                 </div>
               </SettingsSection>
 
               <SettingsSection icon={Clock} title="尾盘下单窗口" description="自动买入只会在市场收盘前的窗口内执行；窗口外只保留候选，不会下单。手动买入不受限制。">
-                <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2">
+                <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-3">
                   <NumberField id="entry_window_minutes" label="非体育类下单窗口" description="距收盘多少分钟开始允许自动买入；0 表示不限制。" value={draft.shared.entry_window_minutes} unit="分钟" min={0} max={1440} step="1" error={errors.entry_window_minutes} onChange={(value) => update('entry_window_minutes', value)} />
                   <NumberField id="sports_entry_window_minutes" label="体育类下单窗口" description="体育分类使用更短的窗口，避开临场加时与赔率剧烈波动；0 表示不限制。" value={draft.shared.sports_entry_window_minutes} unit="分钟" min={0} max={1440} step="1" error={errors.sports_entry_window_minutes} onChange={(value) => update('sports_entry_window_minutes', value)} />
+                  <NumberField id="crypto_entry_window_seconds" label="加密类下单窗口" description="加密分类按秒计时，优先于上面的分钟窗口；默认 60 秒。0 表示不限制。" value={draft.shared.crypto_entry_window_seconds} unit="秒" min={0} max={86400} step="1" error={errors.crypto_entry_window_seconds} onChange={(value) => update('crypto_entry_window_seconds', value)} />
                 </div>
+                {draft.shared.crypto_entry_window_seconds !== '' && Number(draft.shared.crypto_entry_window_seconds) > 0 && Number(draft.shared.crypto_entry_window_seconds) <= Number(draft.shared.scan_interval_seconds) && (
+                  <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">加密类下单窗口（{draft.shared.crypto_entry_window_seconds} 秒）不长于扫描间隔（{draft.shared.scan_interval_seconds} 秒），后台扫描可能整轮错过该窗口。请把扫描间隔调到窗口长度以内，或改用「立即扫描」。</div>
+                )}
                 <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
                   <div className="rounded-xl bg-surface p-2.5 text-slate-500"><Info className="h-5 w-5" /></div>
                   <div className="flex-1"><p className="text-sm font-semibold text-slate-800">每个盘口只会自动下单一次</p><p className="mt-1 text-xs leading-5 text-slate-500">自动买入成功后会把该盘口标记为已下单；之后无论持仓是否已结算、盘口是否重新出现，都不会再次自动买入。窗口以市场到期时间为准，实际成交时点还受扫描间隔影响，可能晚于窗口起点最多一个扫描周期。</p></div>
                 </div>
               </SettingsSection>
 
-              <SettingsSection icon={ShieldAlert} title="止损保护" description="各场所都没有交易所原生止损单。开启后，扫描引擎会在每次扫描时检查当前账户未平仓头寸的参考价，跌到入场价的止损比例时自动提交市价卖出。">
+              <SettingsSection icon={ShieldAlert} title="止损保护" description={`各场所都没有交易所原生止损单。开启后，扫描引擎会在每次扫描时检查当前账户${account ? `「${account.name}」` : ''}未平仓头寸的参考价，跌到入场价的止损比例时自动提交市价卖出。止损开关与止损线随该账户保存，其他账户各自独立。`}>
                 <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex items-start gap-3">
                     <div className={cn('rounded-xl p-2.5', draft.shared.stop_loss_enabled ? 'bg-amber-50 text-amber-600' : 'bg-surface text-slate-400')}><ShieldAlert className="h-5 w-5" /></div>
-                    <div><p className="text-sm font-semibold text-slate-800">自动止损</p><p className="mt-1 text-xs leading-5 text-slate-500">扫描引擎运行时只检查当前账户的未平仓头寸，不要求开启自动交易；自动交易开关只控制新的自动买入。</p></div>
+                    <div><p className="text-sm font-semibold text-slate-800">自动止损</p><p className="mt-1 text-xs leading-5 text-slate-500">只对当前账户生效：扫描引擎运行时检查该账户的未平仓头寸，不要求开启自动交易，其他账户的止损开关不受影响；自动交易开关只控制新的自动买入。</p></div>
                   </div>
                   <div className="flex items-center gap-3 sm:flex-col sm:items-end">
                     <Switch checked={draft.shared.stop_loss_enabled} onCheckedChange={updateStopLoss} aria-label="开启或关闭自动止损" />
@@ -836,7 +898,7 @@ export function SettingsView() {
           </div>
 
           <div className="sticky bottom-4 z-10 flex flex-col gap-3 rounded-2xl border border-slate-200 bg-surface/95 p-4 shadow-float backdrop-blur sm:flex-row sm:items-center">
-            <div className="flex flex-1 items-start gap-2 text-xs leading-5 text-slate-500"><Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" /><span>{dirty ? `有尚未保存的更改${tab === 'shared' ? '（策略页）' : `（${venueMeta(tab).label} 页）`}，保存会同时提交当前账户的策略与两个场所的参数。` : '当前账户的参数已与后端同步。'} 每个账户独立保存策略；扫描间隔仍是全账户共用的后台节奏。</span></div>
+            <div className="flex flex-1 items-start gap-2 text-xs leading-5 text-slate-500"><Info className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" /><span>{dirty ? `有尚未保存的更改${tab === 'shared' ? '（策略页）' : `（${venueMeta(tab).label} 页）`}，保存会同时提交当前账户的策略与两个场所的参数。` : '当前账户的参数已与后端同步。'} 扫描间隔为全局；其余策略与场所参数按账户独立保存。</span></div>
             <div className="flex gap-2"><Button type="button" variant="secondary" onClick={reset} disabled={!dirty || saving}><RotateCcw className="h-4 w-4" />放弃更改</Button><Button type="submit" variant="primary" loading={saving} disabled={!dirty}>{saving ? '正在保存…' : <><Save className="h-4 w-4" />保存参数</>}</Button></div>
           </div>
         </form>

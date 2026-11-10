@@ -3,9 +3,15 @@ package engine
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"pennyharvester/backend/internal/market"
 )
+
+// eventTagTimeout bounds the fallback tag lookup. Tags are already included in
+// the market payload for Polymarket; this path only runs when a venue omits
+// them, and it must not consume the scan's trading budget.
+const eventTagTimeout = 2 * time.Second
 
 // classifyOpportunities enriches candidates with their category and sports
 // risk flags, then applies the configured sports policy. A venue normally
@@ -39,7 +45,10 @@ func (e *Engine) classifyOpportunities(ctx context.Context, opportunities []Oppo
 		if !ok || provider == nil || len(eventIDs) == 0 {
 			continue
 		}
-		if tags, err := provider.EventTags(ctx, eventIDs); err == nil {
+		tagCtx, cancel := context.WithTimeout(ctx, eventTagTimeout)
+		tags, err := provider.EventTags(tagCtx, eventIDs)
+		cancel()
+		if err == nil {
 			tagsByVenue[v] = tags
 		}
 	}
@@ -79,7 +88,10 @@ func (e *Engine) classifyMarket(ctx context.Context, item market.Market) market.
 	tags := item.Tags
 	if len(tags) == 0 {
 		if provider, ok := e.data(item.EffectiveVenue()).(market.EventTagProvider); ok && item.EventID != "" {
-			if byEvent, err := provider.EventTags(ctx, []string{item.EventID}); err == nil {
+			tagCtx, cancel := context.WithTimeout(ctx, eventTagTimeout)
+			byEvent, err := provider.EventTags(tagCtx, []string{item.EventID})
+			cancel()
+			if err == nil {
 				tags = byEvent[item.EventID]
 			}
 		}

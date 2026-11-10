@@ -369,6 +369,9 @@ func TestLegacySettingsPayloadUsesDefaultsForMissingFields(t *testing.T) {
 	if settings.EntryWindowMinutes != defaults.EntryWindowMinutes || settings.SportsEntryWindowMinutes != defaults.SportsEntryWindowMinutes {
 		t.Fatalf("missing entry windows should use the defaults: %+v", settings)
 	}
+	if settings.CryptoEntryWindowSeconds != defaults.CryptoEntryWindowSeconds {
+		t.Fatalf("missing crypto entry window should use the default: %+v", settings)
+	}
 	if settings.StopLossEnabled || settings.StopLossRatio != defaults.StopLossRatio {
 		t.Fatalf("missing stop-loss fields should use the defaults: %+v", settings)
 	}
@@ -650,6 +653,53 @@ func TestPositionVenueAndCurrencyRoundTrip(t *testing.T) {
 	}
 	if filtered, err = repository.ListPositions(ctx, account.ID, "all", market.VenuePolymarket); err != nil || len(filtered) != 0 {
 		t.Fatalf("polymarket position filter = %+v, err = %v", filtered, err)
+	}
+}
+
+// The per-event exposure cap counts open positions by event, so the id has to
+// survive the store round trip and be present on rows written before the
+// column existed (an empty string there means "cap by market only").
+func TestPositionEventIDRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, filepath.Join(t.TempDir(), "event-positions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	account, err := repository.DefaultAccount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := repository.CreatePosition(ctx, engine.Position{
+		AccountID: account.ID, MarketID: "with-event", ConditionID: "c1", Question: "event market",
+		Outcome: "Labour", TokenID: "t1", Side: "BUY", Kind: "auto", EventID: "event-nz",
+		EntryPrice: 0.5, CurrentPrice: 0.5, Shares: 20, Cost: 10, Fee: 0.01,
+		Status: "open", OpenedAt: now, EndDate: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreatePosition(ctx, engine.Position{
+		AccountID: account.ID, MarketID: "without-event", ConditionID: "c2", Question: "plain market",
+		Outcome: "Yes", TokenID: "t2", Side: "BUY", Kind: "manual",
+		EntryPrice: 0.5, CurrentPrice: 0.5, Shares: 20, Cost: 10, Fee: 0.01,
+		Status: "open", OpenedAt: now, EndDate: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	positions, err := repository.ListPositions(ctx, account.ID, "all", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byMarket := map[string]string{}
+	for _, position := range positions {
+		byMarket[position.MarketID] = position.EventID
+	}
+	if byMarket["with-event"] != "event-nz" {
+		t.Fatalf("event id did not round-trip: %+v", positions)
+	}
+	if event, ok := byMarket["without-event"]; !ok || event != "" {
+		t.Fatalf("position without an event = %q (present %v)", event, ok)
 	}
 }
 

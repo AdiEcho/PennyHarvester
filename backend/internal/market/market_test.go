@@ -5,6 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -16,13 +20,17 @@ func keysetBody(markets string) string {
 
 func TestGammaClientParsesEncodedArrays(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/events/keyset") {
+			_, _ = w.Write([]byte(`{"events":[]}`))
+			return
+		}
 		if r.URL.Path != "/markets/keyset" || r.URL.Query().Get("closed") != "false" {
 			t.Errorf("unexpected request: %s", r.URL.String())
 		}
 		if r.URL.Query().Get("offset") != "" {
 			t.Errorf("keyset rejects offset: %s", r.URL.String())
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(keysetBody(`[{
 			"id":"42","conditionId":"condition-42","question":"Will it resolve?","slug":"will-it-resolve",
 			"outcomes":"[\"Yes\",\"No\"]","outcomePrices":"[\"0.98\",\"0.02\"]",
@@ -42,11 +50,26 @@ func TestGammaClientParsesEncodedArrays(t *testing.T) {
 }
 
 func TestGammaClientListOpenFollowsKeysetCursor(t *testing.T) {
-	cursors := []string{}
+	var mu sync.Mutex
+	marketCursors := []string{}
+	eventCursors := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cursor := r.URL.Query().Get("after_cursor")
-		cursors = append(cursors, cursor)
 		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/events/keyset") {
+			mu.Lock()
+			eventCursors = append(eventCursors, cursor)
+			mu.Unlock()
+			if cursor == "" {
+				_, _ = w.Write([]byte(`{"events":[{"id":"ev-1","slug":"btc-updown-5m-1","title":"Bitcoin Up or Down","markets":[]}],"next_cursor":"event-2"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"events":[]}`))
+			return
+		}
+		mu.Lock()
+		marketCursors = append(marketCursors, cursor)
+		mu.Unlock()
 		body := `[{"id":"1","outcomes":"[\"Yes\",\"No\"]","outcomePrices":"[\"0.98\",\"0.02\"]","clobTokenIds":"[\"a\",\"b\"]","endDate":"2099-01-01T00:00:00Z","active":true}]`
 		if cursor == "" {
 			_, _ = w.Write([]byte(`{"markets":` + body + `,"next_cursor":"page-2"}`))
@@ -60,19 +83,96 @@ func TestGammaClientListOpenFollowsKeysetCursor(t *testing.T) {
 	if _, err := client.ListOpen(context.Background(), 30); err != nil {
 		t.Fatal(err)
 	}
-	// Three views, two pages each: the second page must carry the cursor the
-	// first response returned, and the walk must stop when next_cursor is empty.
-	seenCursor := false
-	for _, cursor := range cursors {
+	// Every view walks next_cursor and stops when the response has no cursor.
+	// The market views take two pages each; the event view takes two as well.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marketCursors) != 6 {
+		t.Fatalf("expected 3 market views x 2 pages, got %d requests: %v", len(marketCursors), marketCursors)
+	}
+	followed := false
+	for _, cursor := range marketCursors {
 		if cursor == "page-2" {
-			seenCursor = true
+			followed = true
 		}
 	}
-	if !seenCursor {
-		t.Fatalf("cursor was never followed: %v", cursors)
+	if !followed {
+		t.Fatalf("the market views never followed their cursor: %v", marketCursors)
 	}
-	if len(cursors) != 6 {
-		t.Fatalf("expected 3 views x 2 pages, got %d requests: %v", len(cursors), cursors)
+	if len(eventCursors) != 2 || eventCursors[0] != "" || eventCursors[1] != "event-2" {
+		t.Fatalf("the event view did not follow its cursor: %v", eventCursors)
+	}
+}
+
+// The tail view exists because a settlement boundary ties hundreds of markets on
+// endDate. A market-ordered page then spends every row on the tie group, and the
+// five-minute crypto window that settles at the same instant never reaches the
+// radar. Reading events first keeps it on page one.
+func TestGammaClientListOpenKeepsTailMarketsThroughEventView(t *testing.T) {
+	var mu sync.Mutex
+	var tailQuery url.URL
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/events/keyset") {
+			mu.Lock()
+			tailQuery = *r.URL
+			mu.Unlock()
+			// The nested market carries neither its event stamp nor its tags,
+			// exactly like the upstream payload.
+			_, _ = w.Write([]byte(`{"events":[{
+				"id":"ev-btc","slug":"btc-updown-5m-1794078000","title":"Bitcoin Up or Down",
+				"tags":[{"id":"21","label":"Crypto","slug":"crypto"},{"id":"235","label":"Bitcoin","slug":"bitcoin"}],
+				"markets":[{
+					"id":"6757729","conditionId":"condition-6757729",
+					"question":"Bitcoin Up or Down - 1:55PM-2:00PM ET","slug":"btc-updown-5m-1794078000",
+					"outcomes":"[\"Up\",\"Down\"]","outcomePrices":"[\"0.025\",\"0.975\"]",
+					"clobTokenIds":"[\"up-token\",\"down-token\"]","endDate":"2099-01-01T00:00:00Z",
+					"acceptingOrders":true,"active":true,"closed":false,"liquidityNum":8113.9
+				}]
+			}]}`))
+			return
+		}
+		// The market views are entirely consumed by one endDate tie group, which
+		// is what the tail view has to route around.
+		_, _ = w.Write([]byte(keysetBody(`[{
+			"id":"9","question":"Tie group","slug":"tie-group","outcomes":"[\"Yes\",\"No\"]",
+			"outcomePrices":"[\"0.97\",\"0.03\"]","clobTokenIds":"[\"t1\",\"t2\"]",
+			"endDate":"2099-01-01T00:00:00Z","active":true,"closed":false
+		}]`)))
+	}))
+	defer server.Close()
+
+	items, err := NewGammaClient(server.URL, nil).ListOpen(context.Background(), 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tail *Market
+	for i := range items {
+		if items[i].ID == "6757729" {
+			tail = &items[i]
+		}
+	}
+	if tail == nil {
+		t.Fatalf("the crypto tail market was crowded out: %+v", items)
+	}
+	if tail.EventID != "ev-btc" || tail.EventTitle != "Bitcoin Up or Down" {
+		t.Fatalf("nested market lost its event stamp: %+v", tail)
+	}
+	if len(tail.Tags) != 2 || tail.Tags[0].Slug != "crypto" || tail.Tags[1].Slug != "bitcoin" {
+		t.Fatalf("nested market lost its event tags: %+v", tail.Tags)
+	}
+	mu.Lock()
+	query := tailQuery.Query()
+	mu.Unlock()
+	if query.Get("order") != "endDate" || query.Get("ascending") != "true" {
+		t.Fatalf("tail view must read the earliest events first: %v", query)
+	}
+	endMax, err := time.Parse(time.RFC3339, query.Get("end_date_max"))
+	if err != nil {
+		t.Fatalf("tail view end_date_max: %v", err)
+	}
+	if remaining := time.Until(endMax); remaining > tailHorizon+time.Minute || remaining < tailHorizon-time.Minute {
+		t.Fatalf("tail view must cover %s, got %s", tailHorizon, remaining)
 	}
 }
 
@@ -155,9 +255,12 @@ func TestGammaClientParsesAcceptingOrders(t *testing.T) {
 }
 
 func TestGammaClientListOpenUsesBalancedViews(t *testing.T) {
+	var mu sync.Mutex
 	orders := map[string]bool{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		orders[r.URL.Query().Get("order")] = true
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(keysetBody(`[]`)))
 	}))
@@ -166,6 +269,8 @@ func TestGammaClientListOpenUsesBalancedViews(t *testing.T) {
 	if _, err := client.ListOpen(context.Background(), 30); err != nil {
 		t.Fatal(err)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	for _, order := range []string{"endDate", "volume24hr", "liquidity"} {
 		if !orders[order] {
 			t.Fatalf("ListOpen did not request the %s view: %v", order, orders)
@@ -173,12 +278,58 @@ func TestGammaClientListOpenUsesBalancedViews(t *testing.T) {
 	}
 }
 
+func TestGammaClientListOpenCachesBroadViews(t *testing.T) {
+	var mu sync.Mutex
+	counts := map[string]int{}
+	var tailRequests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/events/keyset") {
+			atomic.AddInt32(&tailRequests, 1)
+			_, _ = w.Write([]byte(`{"events":[]}`))
+			return
+		}
+		mu.Lock()
+		counts[r.URL.Query().Get("order")]++
+		mu.Unlock()
+		_, _ = w.Write([]byte(keysetBody(`[]`)))
+	}))
+	defer server.Close()
+
+	client := NewGammaClient(server.URL, nil)
+	for i := 0; i < 2; i++ {
+		if _, err := client.ListOpen(context.Background(), 30); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if counts["endDate"] != 2 {
+		t.Fatalf("the near-end view must be fresh on every scan, got %d requests", counts["endDate"])
+	}
+	for _, order := range []string{"volume24hr", "liquidity"} {
+		if counts[order] != 1 {
+			t.Fatalf("the %s view should be cached after its first scan, got %d requests", order, counts[order])
+		}
+	}
+	if got := atomic.LoadInt32(&tailRequests); got != 2 {
+		t.Fatalf("the tail view must be fresh on every scan, got %d requests", got)
+	}
+}
+
 func TestGammaClientParsesCategorySignals(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/events/keyset") {
+			// The tail view reads tags from the parent event, so the market view
+			// is the only one that asks Gamma to inline them.
+			_, _ = w.Write([]byte(`{"events":[]}`))
+			return
+		}
 		if r.URL.Query().Get("include_tag") != "true" {
 			t.Errorf("include_tag missing: %s", r.URL.String())
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(keysetBody(`[{
 			"id":"42","conditionId":"condition-42","question":"Will the Mavericks beat the Grizzlies?",
 			"slug":"nba-dal-mem-2026-12-04","outcomes":["Yes","No"],"outcomePrices":["0.98","0.02"],
@@ -315,6 +466,30 @@ func TestDecodeFloatArraySupportsNumericJSON(t *testing.T) {
 	}
 	if len(values) != 2 || values[0] != 0.95 || values[1] != 0.99 {
 		t.Fatalf("unexpected values: %v", values)
+	}
+}
+
+func TestGammaClientListMarketsKeepsFirstPageOnCursorTimeout(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(`{"markets":[{"id":"42","conditionId":"condition-42","question":"Will it resolve?","slug":"will-it-resolve","outcomes":["Yes","No"],"outcomePrices":["0.98","0.02"],"clobTokenIds":["token-yes","token-no"],"endDate":"2099-01-01T00:00:00Z","liquidity":"25000","active":true,"closed":false}],"next_cursor":"next"}`))
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := NewGammaClient(server.URL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	items, err := client.listMarkets(ctx, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().AddDate(0, 0, 1).Format(time.RFC3339), "endDate", "true", 2)
+	if err != nil {
+		t.Fatalf("a timed-out cursor page should keep the first page: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "42" {
+		t.Fatalf("first page lost: %+v", items)
 	}
 }
 

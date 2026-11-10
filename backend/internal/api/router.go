@@ -51,6 +51,7 @@ func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Auth
 		protected.GET("/orders", h.orders)
 		protected.GET("/settings", h.settings)
 		protected.PUT("/settings", h.updateSettings)
+		protected.PUT("/settings/scan-interval", h.updateScanInterval)
 		protected.GET("/system", h.systemSettings)
 		protected.PUT("/system", h.updateSystemSettings)
 		protected.POST("/system/proxy/test", h.testProxy)
@@ -114,15 +115,20 @@ func (h *Handler) accounts(c *gin.Context) {
 
 func (h *Handler) createAccount(c *gin.Context) {
 	var request struct {
-		Name  string             `json:"name" binding:"required"`
-		Mode  engine.AccountMode `json:"mode" binding:"required"`
-		Venue market.Venue       `json:"venue"`
+		Name            string             `json:"name" binding:"required"`
+		Mode            engine.AccountMode `json:"mode" binding:"required"`
+		Venue           market.Venue       `json:"venue"`
+		InitialBankroll *float64           `json:"initial_bankroll"`
 	}
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账户字段无效: " + err.Error()})
 		return
 	}
-	account, err := h.engine.CreateAccount(c.Request.Context(), request.Name, request.Mode, request.Venue)
+	var bankroll float64
+	if request.InitialBankroll != nil {
+		bankroll = *request.InitialBankroll
+	}
+	account, err := h.engine.CreateAccountWithBankroll(c.Request.Context(), request.Name, request.Mode, request.Venue, bankroll)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -378,6 +384,31 @@ func (h *Handler) updateSettings(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, saved)
+}
+
+// updateScanInterval changes only the process-wide scan cadence. The account
+// settings endpoint must not be used for this: it writes an account block that
+// the scheduler never reads. Keeping the update narrow also means a settings
+// page save cannot accidentally overwrite unrelated global strategy values.
+func (h *Handler) updateScanInterval(c *gin.Context) {
+	var request struct {
+		ScanIntervalSeconds int `json:"scan_interval_seconds" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "扫描间隔 JSON 无效: " + err.Error()})
+		return
+	}
+	settings := h.engine.Settings()
+	settings.ScanIntervalSeconds = request.ScanIntervalSeconds
+	if err := settings.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.engine.UpdateSettings(c.Request.Context(), settings); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"scan_interval_seconds": settings.ScanIntervalSeconds})
 }
 
 func (h *Handler) toggleEngine(c *gin.Context) {

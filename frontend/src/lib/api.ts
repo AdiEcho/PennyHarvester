@@ -101,7 +101,7 @@ function withVenue(path: string, venue?: Venue | null): string {
 export const api = {
   health: (signal?: AbortSignal) => request<Health>('/health', { signal }),
   accounts: (signal?: AbortSignal) => request<AccountsResponse>('/accounts', { signal }),
-  createAccount: (body: { name: string; mode: AccountMode; venue?: Venue }, signal?: AbortSignal) =>
+  createAccount: (body: { name: string; mode: AccountMode; venue?: Venue; initial_bankroll?: number }, signal?: AbortSignal) =>
     request<Account>('/accounts', { method: 'POST', body, signal }),
   updateAccount: (id: number, body: { name?: string; auto_trade?: boolean; is_default?: boolean }, signal?: AbortSignal) =>
     request<Account>(`/accounts/${id}`, { method: 'PATCH', body, signal }),
@@ -142,6 +142,12 @@ export const api = {
     request<Settings>(withAccount('/settings', accountId), { signal }),
   updateSettings: (settings: Settings, signal?: AbortSignal, accountId?: number) =>
     request<Settings>(withAccount('/settings', accountId), { method: 'PUT', body: settings, signal }),
+  updateScanInterval: (seconds: number, signal?: AbortSignal) =>
+    request<{ scan_interval_seconds: number }>('/settings/scan-interval', {
+      method: 'PUT',
+      body: { scan_interval_seconds: seconds },
+      signal,
+    }),
   authStatus: (signal?: AbortSignal) => request<AuthStatus>('/auth/status', { signal }),
   login: (password: string, signal?: AbortSignal) =>
     request<void>('/auth/login', { method: 'POST', body: { password }, signal }),

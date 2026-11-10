@@ -93,6 +93,11 @@ export interface Metrics {
   split_positions: number
   stopped_positions: number
   win_rate: number
+  // auto_trade_started_at is the account's first automatic buy: the start of the
+  // strategy window that annualized_return is extrapolated over.
+  auto_trade_started_at: string | null
+  annualized_return: number
+  annualized_days: number
   total_orders: number
 }
 
@@ -286,6 +291,8 @@ export interface Settings {
   order_size: number
   max_position: number
   max_exposure: number
+  /** 0 = 不限；同一事件下全部未平仓头寸的合计成本上限。 */
+  max_event_exposure: number
   scan_interval_seconds: number
   slippage_bps: number
   fee_bps: number
@@ -295,6 +302,8 @@ export interface Settings {
   max_price_change_24h: number
   entry_window_minutes: number
   sports_entry_window_minutes: number
+  /** 加密分类的尾盘窗口，单位秒；优先于上面的分钟窗口。 */
+  crypto_entry_window_seconds: number
   stop_loss_enabled: boolean
   stop_loss_ratio: number
   /** 服务端管理，前端只读并原样回传。 */

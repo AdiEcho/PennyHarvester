@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -13,6 +14,16 @@ import (
 	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
 	"pennyharvester/backend/internal/venue"
+)
+
+const (
+	localizationTimeout    = 2 * time.Second
+	positionRefreshTimeout = 3 * time.Second
+	// liveBalanceTimeout bounds the wallet read a dashboard request makes against
+	// the venue. The dashboard is polled by the web UI, so an unreachable venue
+	// must report stale cash instead of holding the request open until the HTTP
+	// client gives up.
+	liveBalanceTimeout = 5 * time.Second
 )
 
 type Engine struct {
@@ -42,6 +53,9 @@ type Engine struct {
 	startOnce sync.Once
 	cancel    context.CancelFunc
 	done      chan struct{}
+	// scanReset wakes the scheduler after a settings change so a shorter
+	// interval starts now instead of after the old, longer sleep.
+	scanReset chan struct{}
 }
 
 func New(ctx context.Context, repo Repository, venues *venue.Registry, proxy *netproxy.Manager) (*Engine, error) {
@@ -84,7 +98,7 @@ func New(ctx context.Context, repo Repository, venues *venue.Registry, proxy *ne
 	instance := &Engine{
 		repo: repo, venues: venues, proxy: proxy, settings: settings, system: system,
 		opportunities: []Opportunity{}, opportunitiesByAccount: map[int64][]Opportunity{},
-		running: true, done: make(chan struct{}),
+		running: true, done: make(chan struct{}), scanReset: make(chan struct{}, 1),
 	}
 	// Apply web-managed runtime settings on top of the process environment. A
 	// row written by an older build has empty fields and therefore inherits the
@@ -175,6 +189,17 @@ func marketKey(v market.Venue, id string) string {
 	return string(effectiveVenue(v)) + "\x00" + id
 }
 
+// eventKey groups the markets that settle together. The venue prefix is
+// required because an event id is only meaningful inside its own venue. An
+// empty key means the market carries no event, and such rows are capped by
+// market alone.
+func eventKey(v market.Venue, eventID string) string {
+	if eventID == "" {
+		return ""
+	}
+	return string(effectiveVenue(v)) + "\x00" + eventID
+}
+
 // venueList returns the venues a scan should visit for the given options.
 func (e *Engine) venueList(settings Settings, only market.Venue) []market.Venue {
 	if only != "" && !only.Valid() {
@@ -234,22 +259,67 @@ func (e *Engine) Stop() {
 func (e *Engine) run(ctx context.Context) {
 	defer close(e.done)
 	for {
+		started := time.Now()
+		settings := e.Settings()
+		interval := time.Duration(settings.ScanIntervalSeconds) * time.Second
 		if e.isRunning() {
-			scanCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			scanCtx, cancel := context.WithTimeout(ctx, scanBudget(interval))
 			_ = e.Scan(scanCtx)
 			cancel()
 		}
-		settings := e.Settings()
-		timer := time.NewTimer(time.Duration(settings.ScanIntervalSeconds) * time.Second)
+		elapsed := time.Since(started)
+		wait := waitForNextScan(interval, elapsed)
+		if elapsed > interval {
+			log.Printf("扫描耗时 %s，超过 %s 的扫描间隔；下一轮在 %s 后开始", elapsed.Round(time.Millisecond), interval, wait.Round(time.Millisecond))
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C
 			}
 			return
+		case <-e.scanReset:
+			if !timer.Stop() {
+				<-timer.C
+			}
 		case <-timer.C:
 		}
 	}
+}
+
+// scanBudget leaves one second of the interval for scheduling and the next
+// timer, so a stalled upstream cannot push the following scan past the
+// configured cadence. Long intervals keep the previous 90s ceiling; manual
+// scans do not use this path and keep their longer request context.
+func scanBudget(interval time.Duration) time.Duration {
+	const maxScanBudget = 90 * time.Second
+	if interval <= 0 {
+		return maxScanBudget
+	}
+	budget := interval - time.Second
+	if budget < time.Second {
+		budget = time.Second
+	}
+	if budget > maxScanBudget {
+		budget = maxScanBudget
+	}
+	return budget
+}
+
+// waitForNextScan returns the pause after a scan so the next start lands on the
+// configured cadence. If a scan overruns the interval, waiting a full interval
+// would halve the effective rate; waiting nothing would turn a slow upstream
+// into a busy retry. One second is the floor.
+func waitForNextScan(interval, elapsed time.Duration) time.Duration {
+	if interval <= 0 {
+		return time.Second
+	}
+	wait := interval - elapsed
+	if wait < time.Second {
+		return time.Second
+	}
+	return wait
 }
 
 func (e *Engine) Settings() Settings {
@@ -332,6 +402,11 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings Settings) error {
 	e.mu.Lock()
 	e.settings = settings
 	e.mu.Unlock()
+	// A shorter cadence should apply before the old sleep expires.
+	select {
+	case e.scanReset <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -346,7 +421,16 @@ func (e *Engine) settingsForAccount(ctx context.Context, accountID int64) (Setti
 	if accountID <= 0 {
 		return e.Settings(), nil
 	}
-	return e.repo.LoadAccountSettings(ctx, accountID)
+	settings, err := e.repo.LoadAccountSettings(ctx, accountID)
+	if err != nil {
+		return Settings{}, err
+	}
+	// Scanning is a process-wide scheduler, not account state. Accounts may
+	// still carry a scan interval from older builds, but the value the engine
+	// actually uses is the global one. Returning the effective value keeps the
+	// settings page from showing a number that has no effect.
+	settings.ScanIntervalSeconds = e.Settings().ScanIntervalSeconds
+	return settings, nil
 }
 
 // UpdateAccountSettings validates and persists one account's strategy block.
@@ -367,6 +451,9 @@ func (e *Engine) UpdateAccountSettings(ctx context.Context, accountID int64, set
 		return err
 	}
 	settings = mergeVenueSettings(previous, settings)
+	// The scan interval is global. Keep the account row consistent with the
+	// scheduler so a later read cannot surface a stale per-account value.
+	settings.ScanIntervalSeconds = previous.ScanIntervalSeconds
 	if err := settings.Validate(); err != nil {
 		return err
 	}
@@ -1185,6 +1272,15 @@ func (e *Engine) LiveStatusFor(v market.Venue) (configured, ready bool, message 
 }
 
 func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMode, v market.Venue) (Account, error) {
+	return e.CreateAccountWithBankroll(ctx, name, mode, v, 0)
+}
+
+// CreateAccountWithBankroll creates an account with an explicit paper baseline.
+// A non-positive initialBankroll keeps the historical behaviour and falls back
+// to the strategy block's InitialBankroll, so existing callers are unaffected.
+// The value is only meaningful for paper accounts: a live baseline is synced
+// from the wallet balance, never from a form field.
+func (e *Engine) CreateAccountWithBankroll(ctx context.Context, name string, mode AccountMode, v market.Venue, initialBankroll float64) (Account, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return Account{}, fmt.Errorf("%w: 账户名称不能为空", ErrInvalidOrder)
@@ -1198,6 +1294,12 @@ func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMod
 	v = effectiveVenue(v)
 	if !v.Valid() {
 		return Account{}, fmt.Errorf("%w: 未知场所", ErrInvalidOrder)
+	}
+	if math.IsNaN(initialBankroll) || math.IsInf(initialBankroll, 0) || initialBankroll < 0 {
+		return Account{}, fmt.Errorf("%w: 模拟初始资金必须是大于 0 的有限数字", ErrInvalidOrder)
+	}
+	if mode != AccountModePaper {
+		initialBankroll = 0
 	}
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
@@ -1216,7 +1318,16 @@ func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMod
 		Name: name, Mode: mode, Venue: v, Currency: currencyForVenue(v), AutoTrade: false, CreatedAt: time.Now().UTC(),
 	}
 	if mode == AccountModePaper {
-		account.BaselineEquity = e.Settings().InitialBankroll
+		// The form value wins; an empty field keeps the account's strategy
+		// default so the two entry points never disagree in silence.
+		bankroll := initialBankroll
+		if bankroll <= 0 {
+			bankroll = e.Settings().InitialBankroll
+		}
+		if bankroll <= 0 {
+			return Account{}, fmt.Errorf("%w: 模拟初始资金必须大于 0", ErrInvalidOrder)
+		}
+		account.BaselineEquity = roundForVenue(v, bankroll)
 	}
 	account, err = e.repo.CreateAccount(ctx, account)
 	if err != nil {
@@ -1603,7 +1714,7 @@ func (e *Engine) localizeOpportunities(ctx context.Context, opportunities []Oppo
 		if !ok || provider == nil {
 			continue
 		}
-		localized, err := provider.MarketsLocale(ctx, ids, "zh")
+		localized, err := e.marketsLocale(ctx, provider, ids, "zh")
 		if err != nil {
 			continue
 		}
@@ -1634,6 +1745,14 @@ func (e *Engine) localizeOpportunities(ctx context.Context, opportunities []Oppo
 		}
 	}
 	return opportunities
+}
+
+// marketsLocale gives translation its own short deadline. A stalled locale
+// request must not delay price discovery or an automatic entry.
+func (e *Engine) marketsLocale(ctx context.Context, provider market.LocalizedProvider, ids []string, locale string) ([]market.Market, error) {
+	localeCtx, cancel := context.WithTimeout(ctx, localizationTimeout)
+	defer cancel()
+	return provider.MarketsLocale(localeCtx, ids, locale)
 }
 
 // sortOpportunities orders the radar the way the UI renders it: soonest to
@@ -1743,7 +1862,9 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 				errs = append(errs, fmt.Sprintf("%s: 未注册 %s 行情源", position.MarketID, v.Label()))
 				continue
 			}
-			item, err = source.Get(ctx, position.MarketID)
+			getCtx, cancel := context.WithTimeout(ctx, positionRefreshTimeout)
+			item, err = source.Get(getCtx, position.MarketID)
+			cancel()
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", position.MarketID, err))
 				continue
@@ -1849,9 +1970,16 @@ func paperFee(opportunity Opportunity, settings Settings, shares, price float64)
 }
 
 // autoEntryWindow returns the configured pre-close entry window for an
-// opportunity. Sports markets use their own, usually shorter, window because
-// overtime and late-game swings can still change the result.
+// opportunity. Crypto markets use their own window in seconds: they are often
+// hourly and settle on a price print, so a minutes window is too coarse for
+// them. Sports markets use a shorter minutes window because overtime and
+// late-game swings can still change the result.
 func autoEntryWindow(opportunity Opportunity, settings Settings) time.Duration {
+	// Crypto wins over the generic window: a market classified as Crypto is
+	// never a sports game in this taxonomy, so the two branches cannot conflict.
+	if opportunity.Category == string(market.CategoryCrypto) {
+		return time.Duration(settings.CryptoEntryWindowSeconds) * time.Second
+	}
 	minutes := settings.EntryWindowMinutes
 	if opportunity.SportsGame || opportunity.Category == string(market.CategorySports) {
 		minutes = settings.SportsEntryWindowMinutes
@@ -1859,9 +1987,10 @@ func autoEntryWindow(opportunity Opportunity, settings Settings) time.Duration {
 	return time.Duration(minutes) * time.Minute
 }
 
-// withinAutoEntryWindow keeps automatic entries inside the last minutes before
-// a market closes, when a 0.95–0.99 tail price has little time left to reverse.
-// A zero window disables the gate. Manual orders are never gated.
+// withinAutoEntryWindow keeps automatic entries inside the last configured
+// window before a market closes, when a 0.95–0.99 tail price has little time
+// left to reverse. A zero window disables the gate. Manual orders are never
+// gated.
 func withinAutoEntryWindow(opportunity Opportunity, settings Settings, now time.Time) bool {
 	window := autoEntryWindow(opportunity, settings)
 	if window <= 0 {
@@ -1890,6 +2019,7 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	skippedMarkets := make(map[string]bool)
 	defer func() { outcome.SkippedHeld = len(skippedMarkets) }()
 	marketExposure := make(map[string]float64)
+	eventExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
 		key := marketKey(position.EffectiveVenue(), position.MarketID)
@@ -1900,6 +2030,9 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 			continue
 		}
 		marketExposure[key] += position.Cost
+		if event := eventKey(position.EffectiveVenue(), position.EventID); event != "" {
+			eventExposure[event] += position.Cost
+		}
 		totalExposure += position.Cost
 	}
 	baseline := account.BaselineEquity
@@ -1936,6 +2069,14 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		if marketExposure[key]+cost > effective.MaxPosition+1e-9 {
 			continue
 		}
+		// Every market of one event settles on the same outcome, so a cap per
+		// event keeps one election or game from absorbing the whole bankroll in
+		// a single scan.
+		event := eventKey(opportunity.EffectiveVenue(), opportunity.EventID)
+		if event != "" && settings.MaxEventExposure > 0 &&
+			eventExposure[event]+cost > settings.MaxEventExposure+1e-9 {
+			continue
+		}
 		position, err := e.executePaperBuy(ctx, account, opportunity, "auto", amount, settings)
 		if err != nil {
 			// A risk rejection is already logged as an order; it must not stop
@@ -1948,6 +2089,9 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		outcome.Placed++
 		orderedMarkets[key] = true
 		marketExposure[key] += position.Cost
+		if event != "" {
+			eventExposure[event] += position.Cost
+		}
 		totalExposure += position.Cost
 		cash -= position.Cost
 	}
@@ -1978,6 +2122,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	skippedMarkets := make(map[string]bool)
 	defer func() { outcome.SkippedHeld = len(skippedMarkets) }()
 	marketExposure := make(map[string]float64)
+	eventExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
 	for _, position := range positions {
 		key := marketKey(position.EffectiveVenue(), position.MarketID)
@@ -1986,6 +2131,9 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		realized += position.RealizedPNL
 		if position.Status == "open" {
 			marketExposure[key] += position.Cost
+			if event := eventKey(position.EffectiveVenue(), position.EventID); event != "" {
+				eventExposure[event] += position.Cost
+			}
 			totalExposure += position.Cost
 		}
 	}
@@ -2037,6 +2185,11 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		if marketExposure[key]+cost > effective.MaxPosition+1e-9 {
 			continue
 		}
+		event := eventKey(opportunity.EffectiveVenue(), opportunity.EventID)
+		if event != "" && settings.MaxEventExposure > 0 &&
+			eventExposure[event]+cost > settings.MaxEventExposure+1e-9 {
+			continue
+		}
 		if cost > cash+1e-9 {
 			return outcome, fmt.Errorf("%w: 实盘策略资金不足（含预估手续费）", ErrInvalidOrder)
 		}
@@ -2053,6 +2206,9 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		outcome.Placed++
 		orderedMarkets[key] = true
 		marketExposure[key] += position.Cost
+		if event != "" {
+			eventExposure[event] += position.Cost
+		}
 		totalExposure += position.Cost
 		cash -= position.Cost
 	}
@@ -2369,14 +2525,18 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	if err != nil {
 		return Position{}, err
 	}
-	marketExposure, totalExposure, realized := 0.0, 0.0, 0.0
+	marketExposure, eventExposure, totalExposure, realized := 0.0, 0.0, 0.0, 0.0
 	key := marketKey(opportunity.EffectiveVenue(), opportunity.MarketID)
+	event := eventKey(opportunity.EffectiveVenue(), opportunity.EventID)
 	for _, position := range positions {
 		realized += position.RealizedPNL
 		if position.Status == "open" {
 			totalExposure += position.Cost
 			if marketKey(position.EffectiveVenue(), position.MarketID) == key {
 				marketExposure += position.Cost
+			}
+			if event != "" && eventKey(position.EffectiveVenue(), position.EventID) == event {
+				eventExposure += position.Cost
 			}
 		}
 	}
@@ -2393,6 +2553,10 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 		reason = "超过总敞口上限"
 	case marketExposure+cost > effective.MaxPosition+1e-9:
 		reason = "超过单市场敞口上限"
+	case event != "" && settings.MaxEventExposure > 0 && eventExposure+cost > settings.MaxEventExposure+1e-9:
+		// One event settles as a single bet; a batch of its markets must not
+		// consume more than its share of the bankroll.
+		reason = "超过单事件敞口上限"
 	}
 	if reason != "" {
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, reason, "")
@@ -2401,7 +2565,7 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	now := time.Now().UTC()
 	position := Position{
 		AccountID: account.ID, Venue: opportunity.EffectiveVenue(), Currency: opportunity.EffectiveCurrency(),
-		MarketID: opportunity.MarketID, ConditionID: opportunity.ConditionID,
+		MarketID: opportunity.MarketID, EventID: opportunity.EventID, ConditionID: opportunity.ConditionID,
 		Question: opportunity.Question, Outcome: opportunity.Outcome, TokenID: opportunity.TokenID,
 		Side: "BUY", Kind: kind, EntryPrice: fillPrice, CurrentPrice: opportunity.Price,
 		Shares: shares, Cost: cost, Fee: fee, Status: "open", OpenedAt: now,
@@ -2548,7 +2712,7 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	fill.Cost += fill.Fee
 	position := Position{
 		AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
-		MarketID: opportunity.MarketID, ConditionID: opportunity.ConditionID,
+		MarketID: opportunity.MarketID, EventID: opportunity.EventID, ConditionID: opportunity.ConditionID,
 		Question: opportunity.Question, Outcome: opportunity.Outcome, TokenID: opportunity.TokenID,
 		Side: "BUY", Kind: kind, EntryPrice: fill.Price, CurrentPrice: opportunity.Price,
 		Shares: fill.Shares, Cost: fill.Cost, Fee: fill.Fee, Status: "open", OpenedAt: now,
@@ -2823,7 +2987,11 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 			metrics.TotalReturn = metrics.TotalPNL / metrics.InitialBankroll
 		}
 	} else {
-		account = e.ensureLiveBaseline(ctx, account, metrics.OpenExposure, metrics.RealizedPNL)
+		// One bounded context covers the baseline and the wallet read: both are
+		// venue calls, and neither may outlive the dashboard's own budget.
+		liveCtx, cancelLive := context.WithTimeout(ctx, liveBalanceTimeout)
+		defer cancelLive()
+		account = e.ensureLiveBaseline(liveCtx, account, metrics.OpenExposure, metrics.RealizedPNL)
 		if account.BaselineEquity <= 0 {
 			metrics.InitialBankroll = 0
 		} else {
@@ -2836,7 +3004,7 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 		}
 		exec, execErr := e.executor(account.EffectiveVenue())
 		if execErr == nil && exec.Configured() {
-			snapshot, cashErr := exec.Collateral(ctx)
+			snapshot, cashErr := exec.Collateral(liveCtx)
 			if cashErr != nil {
 				metrics.WalletCashStale = true
 				if account.LiveError == "" {
@@ -2850,9 +3018,21 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 			metrics.WalletCashStale = true
 		}
 	}
-	decided := metrics.SettledPositions - metrics.SplitPositions - metrics.StoppedPositions
+	// A stop-loss exit is a decided outcome: it settles for cash and lost money,
+	// so it must sit in the win-rate denominator as a loss. Excluding it would
+	// report a 100% win rate for a book that contains losing trades.
+	decided := metrics.SettledPositions - metrics.SplitPositions
 	if decided > 0 {
 		metrics.WinRate = float64(wins) / float64(decided)
+	}
+	startedAt, err := e.repo.EarliestAutoBuyAt(ctx, account.ID)
+	if err != nil {
+		return Dashboard{}, err
+	}
+	if startedAt != nil {
+		metrics.AutoTradeStartedAt = startedAt
+		metrics.AnnualizedDays = math.Round(time.Since(*startedAt).Hours()/24*100) / 100
+		metrics.AnnualizedReturn = annualizedReturn(metrics.TotalReturn, metrics.AnnualizedDays)
 	}
 	metrics.TotalOrders, err = e.repo.CountOrders(ctx, account.ID, "all", "")
 	if err != nil {
@@ -2978,6 +3158,20 @@ func sanitizeEquityPoint(p EquityPoint) EquityPoint {
 	}
 	p.Value = roundForVenue(p.Venue, p.Value)
 	return p
+}
+
+// annualizedReturn compounds a period return over the elapsed days. Below one
+// day it returns 0 instead of amplifying hours of noise into a three-digit
+// number, and a wiped-out book reports -100% rather than a NaN root.
+func annualizedReturn(totalReturn, days float64) float64 {
+	if days < 1 {
+		return 0
+	}
+	growth := 1 + totalReturn
+	if growth <= 0 {
+		return -1
+	}
+	return math.Pow(growth, 365/days) - 1
 }
 
 func sanitizeMetrics(m Metrics) Metrics {

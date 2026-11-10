@@ -17,12 +17,64 @@ import (
 
 const maxResponseBytes = 8 << 20
 
+// Broad views (volume and liquidity) describe the whole book and change far
+// more slowly than the near-end view. Reusing them for a minute removes four of
+// the six requests a steady-state scan used to make, which is what lets a 10s
+// cadence fit inside the upstream latency.
+const (
+	broadViewTTL        = 60 * time.Second
+	maxViewCacheEntries = 64
+	// One view has at most two sequential keyset pages. A cap below the scan
+	// budget keeps a stalled upstream from consuming the whole cycle; the
+	// near-end view then retries on the next tick instead of blocking it.
+	viewTimeout = 5 * time.Second
+	// The tail view reads events rather than markets, so it carries every
+	// market nested inside an event. Its payload is larger and its pages are
+	// the ones that must survive a busy settlement boundary.
+	tailViewTimeout = 8 * time.Second
+	// tailHorizon bounds the tail view. Every settlement boundary creates a
+	// tie group of hundreds of markets that share one endDate (sports props and
+	// exact-score lines), and the 5-minute crypto up/down markets settle at the
+	// same instant. Ordering markets by endDate therefore lets that crowd fill
+	// every page of the near-end view, which is why the tail view reads events
+	// ordered by endDate: the same crowd is a few dozen events, and the crypto
+	// windows stay on page one.
+	tailHorizon = 20 * time.Minute
+	tailPages   = 4
+	// An event page carries every nested market, so a page of 100 events can
+	// exceed the 8MB response cap at a settlement boundary. Half that keeps each
+	// page well under the cap while four pages still cover the horizon.
+	tailPageSize = 50
+)
+
+type gammaView struct {
+	order     string
+	ascending string
+	pages     int
+	cache     bool
+	// events reads /events/keyset and keeps the nested markets. Only the tail
+	// view sets it, because that is the only view that must survive an endDate
+	// tie group crowding out the markets it was built to find.
+	events bool
+	// horizon, when set, replaces the maxDays end_date_max so the view covers a
+	// fixed window instead of the whole radar horizon.
+	horizon time.Duration
+}
+
+type gammaViewCache struct {
+	at      time.Time
+	markets []Market
+}
+
 type GammaClient struct {
 	mu             sync.RWMutex
 	baseURL        string
 	defaultBaseURL string
 	proxy          *netproxy.Manager
 	client         *http.Client
+
+	cacheMu   sync.Mutex
+	viewCache map[string]gammaViewCache
 }
 
 // NewGammaClient keeps the public Gamma API on the outbound egress configured
@@ -36,6 +88,7 @@ func NewGammaClient(baseURL string, proxy *netproxy.Manager) *GammaClient {
 		defaultBaseURL: normalized,
 		proxy:          proxy,
 		client:         &http.Client{Timeout: 15 * time.Second},
+		viewCache:      make(map[string]gammaViewCache),
 	}
 }
 
@@ -79,6 +132,9 @@ func (g *GammaClient) SetBaseURL(raw string) error {
 	g.mu.Lock()
 	g.baseURL = normalized
 	g.mu.Unlock()
+	g.cacheMu.Lock()
+	g.viewCache = make(map[string]gammaViewCache)
+	g.cacheMu.Unlock()
 	return nil
 }
 
@@ -131,13 +187,30 @@ type gammaMarket struct {
 	// NegRisk and OrderPriceMinTickSize are venue metadata the trading layer
 	// needs: negative-risk markets settle through a different flow, and the
 	// tick size decides how a price must be rounded before signing.
-	NegRisk               bool     `json:"negRisk"`
-	OrderPriceMinTickSize *float64 `json:"orderPriceMinTickSize"`
-	Events                []struct {
-		ID    string `json:"id"`
-		Slug  string `json:"slug"`
-		Title string `json:"title"`
-	} `json:"events"`
+	NegRisk               bool            `json:"negRisk"`
+	OrderPriceMinTickSize *float64        `json:"orderPriceMinTickSize"`
+	Events                []gammaEventRef `json:"events"`
+}
+
+// gammaEventRef is the event stamp on a market. A market read through
+// /events/keyset carries no events field, so the tail view re-stamps it from
+// its parent event; the engine needs the event ID for tag lookups and the
+// event slug is what the archive keys markets on.
+type gammaEventRef struct {
+	ID    string `json:"id"`
+	Slug  string `json:"slug"`
+	Title string `json:"title"`
+}
+
+// gammaEvent is the subset of /events/keyset this client reads. Nested markets
+// are the reason the tail view exists: one row per event instead of one row per
+// market keeps a settlement boundary from crowding out the crypto windows.
+type gammaEvent struct {
+	ID      string        `json:"id"`
+	Slug    string        `json:"slug"`
+	Title   string        `json:"title"`
+	Tags    []Tag         `json:"tags"`
+	Markets []gammaMarket `json:"markets"`
 }
 
 type gammaEventTags struct {
@@ -156,26 +229,81 @@ func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, erro
 	// near-end markets for the tail strategy, plus the most active and deepest
 	// books for cross-category coverage. Tags are included in each payload so
 	// classification does not need one request per event.
-	views := []struct {
-		order     string
-		ascending string
-		pages     int
-	}{
+	//
+	// The near-end view must be fresh on every scan. The two broad views only
+	// provide cross-category coverage, so they are cached for broadViewTTL and
+	// fetched concurrently with the near-end view. A cold scan still visits all
+	// six pages; a warm scan visits only the near-end pages plus the tail view.
+	views := []gammaView{
 		{order: "endDate", ascending: "true", pages: 2},
-		{order: "volume24hr", ascending: "false", pages: 2},
-		{order: "liquidity", ascending: "false", pages: 2},
+		{order: "endDate", ascending: "true", pages: tailPages, horizon: tailHorizon, events: true},
+		{order: "volume24hr", ascending: "false", pages: 2, cache: true},
+		{order: "liquidity", ascending: "false", pages: 2, cache: true},
 	}
+
+	baseURL := g.BaseURL()
+	cacheKey := func(view gammaView) string {
+		return fmt.Sprintf("%s|%d|%s|%s|%d|%s", baseURL, maxDays, view.order, view.ascending, view.pages, view.horizon)
+	}
+
+	type viewResult struct {
+		items []Market
+		err   error
+	}
+	results := make([]viewResult, len(views))
+	var wait sync.WaitGroup
+	for i, view := range views {
+		if view.cache {
+			if items, ok := g.cachedView(cacheKey(view), broadViewTTL); ok {
+				results[i] = viewResult{items: items}
+				continue
+			}
+		}
+		wait.Add(1)
+		go func(index int, view gammaView) {
+			defer wait.Done()
+			viewEnd := endMax
+			if view.horizon > 0 {
+				viewEnd = now.Add(view.horizon).Format(time.RFC3339)
+			}
+			timeout := viewTimeout
+			if view.events {
+				timeout = tailViewTimeout
+			}
+			viewCtx, cancel := context.WithTimeout(ctx, timeout)
+			var items []Market
+			var err error
+			if view.events {
+				items, err = g.listEventMarkets(viewCtx, endMin, viewEnd, view.order, view.ascending, view.pages)
+			} else {
+				items, err = g.listMarkets(viewCtx, endMin, viewEnd, view.order, view.ascending, view.pages)
+			}
+			cancel()
+			if err != nil && view.cache {
+				// A failed broad refresh must not blank the radar. Use the last
+				// good copy if one exists; the near-end view still reports fresh
+				// trading candidates.
+				if stale, ok := g.cachedView(cacheKey(view), 0); ok {
+					items, err = stale, nil
+				}
+			}
+			if err == nil && view.cache {
+				g.storeView(cacheKey(view), items)
+			}
+			results[index] = viewResult{items: items, err: err}
+		}(i, view)
+	}
+	wait.Wait()
 
 	seen := make(map[string]bool)
 	markets := make([]Market, 0, 800)
 	var failures []string
-	for _, view := range views {
-		items, err := g.listMarkets(ctx, endMin, endMax, view.order, view.ascending, view.pages)
-		if err != nil {
-			failures = append(failures, err.Error())
+	for _, result := range results {
+		if result.err != nil {
+			failures = append(failures, result.err.Error())
 			continue
 		}
-		for _, item := range items {
+		for _, item := range result.items {
 			if seen[item.ID] {
 				continue
 			}
@@ -187,6 +315,30 @@ func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, erro
 		return nil, fmt.Errorf("%s", strings.Join(failures, "; "))
 	}
 	return markets, nil
+}
+
+// cachedView returns a cached view. A zero ttl accepts a stale entry, which is
+// the fallback used when a broad refresh fails.
+func (g *GammaClient) cachedView(key string, ttl time.Duration) ([]Market, bool) {
+	g.cacheMu.Lock()
+	defer g.cacheMu.Unlock()
+	entry, ok := g.viewCache[key]
+	if !ok {
+		return nil, false
+	}
+	if ttl > 0 && time.Since(entry.at) > ttl {
+		return nil, false
+	}
+	return entry.markets, true
+}
+
+func (g *GammaClient) storeView(key string, markets []Market) {
+	g.cacheMu.Lock()
+	defer g.cacheMu.Unlock()
+	if len(g.viewCache) >= maxViewCacheEntries {
+		g.viewCache = make(map[string]gammaViewCache)
+	}
+	g.viewCache[key] = gammaViewCache{at: time.Now(), markets: markets}
 }
 
 // listMarkets pages one Gamma view with /markets/keyset. Polymarket replaced
@@ -215,6 +367,11 @@ func (g *GammaClient) listMarkets(ctx context.Context, endMin, endMax, order, as
 			NextCursor string        `json:"next_cursor"`
 		}
 		if err := g.getJSON(ctx, "/markets/keyset?"+query.Encode(), &response); err != nil {
+			// Page one is still useful when the cursor page stalls. Returning
+			// the parsed rows keeps the near-end view populated for this scan.
+			if len(markets) > 0 {
+				return markets, nil
+			}
 			return nil, err
 		}
 		for _, item := range response.Markets {
@@ -223,6 +380,66 @@ func (g *GammaClient) listMarkets(ctx context.Context, endMin, endMax, order, as
 			}
 		}
 		if response.NextCursor == "" || response.NextCursor == cursor || len(response.Markets) == 0 {
+			break
+		}
+		cursor = response.NextCursor
+	}
+	return markets, nil
+}
+
+// listEventMarkets pages /events/keyset and keeps the markets nested in each
+// event. Polymarket sorts markets by endDate alone, so at a settlement
+// boundary the first pages are hundreds of sports props that all end at the same
+// instant; the crypto up/down windows that settle then are pushed past the page
+// cap and the tail strategy never sees them. Grouping by event first turns that
+// crowd into a few dozen rows, so the same window stays on page one.
+//
+// A market nested in an event omits both its events stamp and its tags, so the
+// parent event supplies them before parsing. Without the stamp the engine
+// cannot resolve event tags, and without the tags the crypto window falls back
+// to the much wider default entry window.
+func (g *GammaClient) listEventMarkets(ctx context.Context, endMin, endMax, order, ascending string, pages int) ([]Market, error) {
+	markets := make([]Market, 0, pages*200)
+	cursor := ""
+	for page := 0; page < pages; page++ {
+		query := url.Values{
+			"closed":       {"false"},
+			"limit":        {strconv.Itoa(tailPageSize)},
+			"order":        {order},
+			"ascending":    {ascending},
+			"end_date_min": {endMin},
+			"end_date_max": {endMax},
+		}
+		if cursor != "" {
+			query.Set("after_cursor", cursor)
+		}
+		var response struct {
+			Events     []gammaEvent `json:"events"`
+			NextCursor string       `json:"next_cursor"`
+		}
+		if err := g.getJSON(ctx, "/events/keyset?"+query.Encode(), &response); err != nil {
+			// Page one is still useful when the cursor page stalls, exactly as in
+			// listMarkets: keep whatever arrived rather than blanking the view.
+			if len(markets) > 0 {
+				return markets, nil
+			}
+			return nil, err
+		}
+		for _, event := range response.Events {
+			stamp := gammaEventRef{ID: event.ID, Slug: event.Slug, Title: event.Title}
+			for _, item := range event.Markets {
+				if len(item.Events) == 0 {
+					item.Events = []gammaEventRef{stamp}
+				}
+				if len(item.Tags) == 0 {
+					item.Tags = event.Tags
+				}
+				if parsed, err := parseGammaMarket(item); err == nil {
+					markets = append(markets, parsed)
+				}
+			}
+		}
+		if response.NextCursor == "" || response.NextCursor == cursor || len(response.Events) == 0 {
 			break
 		}
 		cursor = response.NextCursor

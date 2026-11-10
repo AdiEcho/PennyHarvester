@@ -633,6 +633,205 @@ func TestPaperStopLossClosesPositionAtRatio(t *testing.T) {
 	}
 }
 
+// TestWinRateCountsStopLossAsLoss pins the reporting rule behind the dashboard
+// win rate: a stop-loss exit is a decided, losing outcome, so one win plus one
+// stop-out reports 50%, not a 100% rate that erases the losing trade.
+func TestWinRateCountsStopLossAsLoss(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"win":  binary("win", 0.98, 20000, 2),
+		"stop": binary("stop", 0.98, 20000, 2),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	for _, id := range []string{"win", "stop"} {
+		if _, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+			MarketID: id, Outcome: "Yes", TokenID: id + "-yes", Amount: 100,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settings := instance.Settings()
+	settings.StopLossEnabled = true
+	settings.StopLossRatio = 0.80
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	crash := provider.markets["stop"]
+	crash.Outcomes[0].Price = 0.75
+	crash.Outcomes[1].Price = 0.25
+	provider.markets["stop"] = crash
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolved := provider.markets["win"]
+	resolved.Closed = true
+	resolved.Active = false
+	resolved.ResolutionStatus = "resolved"
+	resolved.Outcomes[0].Price = 1
+	resolved.Outcomes[1].Price = 0
+	provider.markets["win"] = resolved
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err := instance.Dashboard(ctx, paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.Metrics.SettledPositions != 2 || dashboard.Metrics.StoppedPositions != 1 ||
+		dashboard.Metrics.SplitPositions != 0 || math.Abs(dashboard.Metrics.WinRate-0.5) > 1e-9 {
+		t.Fatalf("stop-loss must count as a decided loss: %+v", dashboard.Metrics)
+	}
+}
+
+// TestDashboardReportsAutoTradeStartAndAnnualizedReturn pins the two performance
+// read-outs: the account's first automatic buy marks the start of the strategy
+// window, and the annualized estimate compounds the booked return over it.
+func TestDashboardReportsAutoTradeStartAndAnnualizedReturn(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"manual": nearClose(binary("manual", 0.98, 20000, 2), 10*time.Minute),
+		"auto":   nearClose(binary("auto", 0.98, 20000, 2), 10*time.Minute),
+	}}
+	instance, repository := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+		MarketID: "manual", Outcome: "Yes", TokenID: "manual-yes", Amount: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A manually traded account has no auto entry, so it must not claim a
+	// strategy start time and cannot publish an annualized figure.
+	dashboard, err := instance.Dashboard(ctx, paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.Metrics.AutoTradeStartedAt != nil || dashboard.Metrics.AnnualizedDays != 0 || dashboard.Metrics.AnnualizedReturn != 0 {
+		t.Fatalf("manual orders must not start the strategy window: %+v", dashboard.Metrics)
+	}
+
+	if _, err := instance.UpdateAccount(ctx, paper.ID, nil, boolPointer(true), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err = instance.Dashboard(ctx, paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first auto buy just happened, so the window is minutes old: the start
+	// time is published and the annualized estimate stays parked at 0.
+	if dashboard.Metrics.AutoTradeStartedAt == nil || dashboard.Metrics.AnnualizedDays >= 1 || dashboard.Metrics.AnnualizedReturn != 0 {
+		t.Fatalf("a fresh auto entry must not be annualized: %+v", dashboard.Metrics)
+	}
+
+	// Settle that entry as a win so the booked return is non-zero, then plant an
+	// older automatic buy to open a thirty-day window.
+	resolved := provider.markets["auto"]
+	resolved.Closed = true
+	resolved.Active = false
+	resolved.ResolutionStatus = "resolved"
+	resolved.Outcomes[0].Price = 1
+	resolved.Outcomes[1].Price = 0
+	provider.markets["auto"] = resolved
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	if _, err := repository.CreateOrder(ctx, engine.Order{
+		AccountID: paper.ID, MarketID: "backdated", Question: "backdated", Outcome: "Yes",
+		TokenID: "backdated-yes", Kind: "auto", Type: "buy", Amount: 100, Price: 0.98,
+		Shares: 102, Status: "filled", Reason: "auto", CreatedAt: startedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err = instance.Dashboard(ctx, paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := dashboard.Metrics
+	if metrics.AutoTradeStartedAt == nil || !metrics.AutoTradeStartedAt.Equal(startedAt) {
+		t.Fatalf("strategy window must start at the first automatic buy: %+v", metrics)
+	}
+	if math.Abs(metrics.AnnualizedDays-30) > 0.02 {
+		t.Fatalf("strategy window should be about thirty days: %+v", metrics)
+	}
+	if metrics.TotalReturn <= 0 {
+		t.Fatalf("the settled win must produce a positive return: %+v", metrics)
+	}
+	want := math.Pow(1+metrics.TotalReturn, 365/metrics.AnnualizedDays) - 1
+	if math.Abs(metrics.AnnualizedReturn-want) > 1e-9 {
+		t.Fatalf("annualized return = %v, want %v (total return %v over %v days)",
+			metrics.AnnualizedReturn, want, metrics.TotalReturn, metrics.AnnualizedDays)
+	}
+}
+
+// TestStopLossIsScopedToAccount pins the isolation rule: the stop-loss switch
+// and ratio live in each account's own strategy block, so arming one account
+// must neither arm another account nor sell a position it does not own.
+func TestStopLossIsScopedToAccount(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	instance, _ := newTestEngine(t, provider, nil)
+	armed := accountByMode(t, instance, engine.AccountModePaper)
+	idle, err := instance.CreateAccount(ctx, "闲置模拟账户", engine.AccountModePaper, market.VenuePolymarket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []engine.Account{armed, idle} {
+		if _, err := instance.PlaceOrder(ctx, account.ID, engine.OrderRequest{
+			MarketID: "one", Outcome: "Yes", TokenID: "one-yes", Amount: 100,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	settings, err := instance.SettingsFor(ctx, armed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.StopLossEnabled = true
+	settings.StopLossRatio = 0.80
+	if err := instance.UpdateAccountSettings(ctx, armed.ID, settings); err != nil {
+		t.Fatal(err)
+	}
+	// Saving one account must leave the other account's block untouched, which
+	// is what makes the switch follow the account instead of the installation.
+	idleSettings, err := instance.SettingsFor(ctx, idle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idleSettings.StopLossEnabled || idleSettings.StopLossRatio != engine.DefaultStopLossRatio {
+		t.Fatalf("另一账户的止损参数被改动: enabled=%v ratio=%v", idleSettings.StopLossEnabled, idleSettings.StopLossRatio)
+	}
+	armedSettings, err := instance.SettingsFor(ctx, armed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !armedSettings.StopLossEnabled || armedSettings.StopLossRatio != 0.80 {
+		t.Fatalf("当前账户的止损参数未保存: enabled=%v ratio=%v", armedSettings.StopLossEnabled, armedSettings.StopLossRatio)
+	}
+
+	drop := provider.markets["one"]
+	drop.Outcomes[0].Price = 0.75
+	drop.Outcomes[1].Price = 0.25
+	provider.markets["one"] = drop
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	stopped, err := instance.Positions(ctx, armed.ID, "sold", "")
+	if err != nil || stopped.Total != 1 {
+		t.Fatalf("开启止损的账户没有卖出: total=%d err=%v", stopped.Total, err)
+	}
+	open, err := instance.Positions(ctx, idle.ID, "open", "")
+	if err != nil || open.Total != 1 {
+		t.Fatalf("未开启止损的账户被误卖: total=%d err=%v", open.Total, err)
+	}
+}
+
 func TestLiveStopLossSellsThroughExecutor(t *testing.T) {
 	ctx := context.Background()
 	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
@@ -968,6 +1167,49 @@ func TestAutoPaperTradeHonorsExposureAndDoesNotDuplicate(t *testing.T) {
 	}
 }
 
+// One election or one game lists many markets that all settle on the same
+// outcome. Filling every one of them inside a single entry window is one
+// correlated bet, so the per-event cap has to bind before the total cap does.
+func TestAutoPaperTradeCapsExposurePerEvent(t *testing.T) {
+	shared := func(id string, price float64) market.Market {
+		item := nearClose(binary(id, price, 20000, 2), 10*time.Minute)
+		item.EventID = "event-nz"
+		return item
+	}
+	other := nearClose(binary("other", 0.98, 20000, 2), 10*time.Minute)
+	other.EventID = "event-other"
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"a":     shared("a", 0.98),
+		"b":     shared("b", 0.97),
+		"c":     shared("c", 0.96),
+		"other": other,
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	settings := instance.Settings()
+	settings.MaxEventExposure = 150
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	perEvent := map[string]int{}
+	for _, position := range positions.Items {
+		perEvent[position.EventID]++
+	}
+	if perEvent["event-nz"] != 1 || perEvent["event-other"] != 1 || positions.Total != 2 {
+		t.Fatalf("expected one entry per event, got %+v", positions.Items)
+	}
+}
+
 func TestAutoTradeWithInsufficientCashSkipsWithoutSpam(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{
 		"one": nearClose(binary("one", 0.98, 20000, 2), 10*time.Minute),
@@ -1067,6 +1309,42 @@ func TestAutoTradeUsesShorterSportsEntryWindow(t *testing.T) {
 	}
 	if positions.Total != 1 {
 		t.Fatalf("sports markets should enter inside their 5-minute window: %+v", positions.Items)
+	}
+}
+
+func TestAutoTradeUsesCryptoEntryWindowSeconds(t *testing.T) {
+	item := nearClose(binary("crypto-hourly", 0.98, 20000, 2), 5*time.Minute)
+	item.Tags = []market.Tag{{ID: "crypto", Label: "Crypto", Slug: "crypto"}}
+	provider := &fakeProvider{markets: map[string]market.Market{"crypto-hourly": item}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.UpdateAccount(context.Background(), paper.ID, nil, boolPointer(true), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 0 {
+		t.Fatalf("crypto markets must wait until the 60-second window: %+v", positions.Items)
+	}
+
+	// Five minutes is inside the 20-minute generic window but far outside the
+	// crypto window, so only the seconds gate keeps this row out.
+	item.EndDate = time.Now().UTC().Add(30 * time.Second)
+	provider.markets["crypto-hourly"] = item
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	positions, err = instance.Positions(context.Background(), paper.ID, "open", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("crypto markets should enter inside their 60-second window: %+v", positions.Items)
 	}
 }
 
