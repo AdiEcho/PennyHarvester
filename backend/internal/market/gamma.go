@@ -494,6 +494,51 @@ func (g *GammaClient) Get(ctx context.Context, id string) (Market, error) {
 	return parseGammaMarket(raw)
 }
 
+// GetMany resolves market ids in chunks through the list route. The public
+// book is marked from a scan view that only carries markets ending in the
+// future, so every position in a market that already ended needs its own read.
+// Batching turns that from one GET per position (which blew the scan deadline
+// on a 10s cadence) into one request per chunk. A failed chunk keeps the rows
+// already parsed and reports the error once.
+func (g *GammaClient) GetMany(ctx context.Context, ids []string) (map[string]Market, error) {
+	result := make(map[string]Market, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	const batchSize = 50
+	var failures []string
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		query := url.Values{"include_tag": {"true"}, "limit": {strconv.Itoa(end - start)}}
+		for _, id := range ids[start:end] {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				query.Add("id", id)
+			}
+		}
+		var raw []gammaMarket
+		if err := g.getJSON(ctx, "/markets?"+query.Encode(), &raw); err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		for _, item := range raw {
+			parsed, err := parseGammaMarket(item)
+			if err != nil {
+				failures = append(failures, err.Error())
+				continue
+			}
+			result[parsed.ID] = parsed
+		}
+	}
+	if len(failures) > 0 {
+		return result, fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	return result, nil
+}
+
 // EventTags resolves Polymarket event tags in batches. The engine uses tags to
 // classify opportunities and to identify sports games whose result can change
 // in overtime. The endpoint returns full event objects, so callers should only

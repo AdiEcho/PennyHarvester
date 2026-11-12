@@ -226,6 +226,15 @@ type Provider interface {
 	Name() string
 }
 
+// BatchProvider is implemented by providers that can resolve several market
+// ids in one round trip. A position book full of markets that already ended
+// but are still open upstream never appears in the open-market scan, so the
+// engine marks them from a batch call instead of one GET per position. The
+// fallback to Get keeps providers without a batch route working.
+type BatchProvider interface {
+	GetMany(ctx context.Context, ids []string) (map[string]Market, error)
+}
+
 // Tag is a Polymarket event tag. Categories are derived from these tags when
 // the provider can supply them; otherwise the engine falls back to local
 // heuristics (game start time, question text and slug).

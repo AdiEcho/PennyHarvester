@@ -35,6 +35,14 @@ func Open(ctx context.Context, path string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("初始化 SQLite: %w", err)
 	}
+	// WAL frames are reused instead of shrunk by default, so a burst of writes
+	// (a backfill or a long catch-up) leaves a file far larger than the database
+	// itself: the scan writes a mark for every open position each cycle. Capping
+	// the retained WAL keeps ./data honest after the burst is checkpointed.
+	if _, err := db.ExecContext(ctx, "PRAGMA journal_size_limit=16777216"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("初始化 SQLite: %w", err)
+	}
 	store := &SQLite{db: db, secrets: secrets}
 	if err := store.migrate(ctx); err != nil {
 		db.Close()

@@ -493,6 +493,45 @@ func TestGammaClientListMarketsKeepsFirstPageOnCursorTimeout(t *testing.T) {
 	}
 }
 
+func TestGammaClientGetManyBatchesIDs(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/markets" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			return
+		}
+		requests++
+		ids := r.URL.Query()["id"]
+		if len(ids) != 2 || ids[0] != "one" || ids[1] != "two" {
+			t.Errorf("batch ids not forwarded: %v", ids)
+		}
+		_, _ = w.Write([]byte(`[{
+			"id":"one","conditionId":"c-one","question":"Ended market one?","slug":"one",
+			"outcomes":["Yes","No"],"outcomePrices":["0.98","0.02"],
+			"clobTokenIds":["one-yes","one-no"],"endDate":"2026-11-08T04:59:00Z",
+			"liquidity":"25000","volume":"90000","active":true,"closed":false
+		},{
+			"id":"two","conditionId":"c-two","question":"Ended market two?","slug":"two",
+			"outcomes":["Yes","No"],"outcomePrices":["0.4","0.6"],
+			"clobTokenIds":["two-yes","two-no"],"endDate":"2026-11-08T04:59:00Z",
+			"liquidity":"25000","volume":"90000","active":true,"closed":false
+		}]`))
+	}))
+	defer server.Close()
+	client := NewGammaClient(server.URL, nil)
+	items, err := client.GetMany(context.Background(), []string{"one", "two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("two ids must cost one request, got %d", requests)
+	}
+	if len(items) != 2 || items["one"].Outcomes[0].Price != 0.98 || items["two"].ID != "two" {
+		t.Fatalf("batch not parsed: %+v", items)
+	}
+}
+
 func TestMarketRejectsInvalidEndDate(t *testing.T) {
 	raw := gammaMarket{ID: "1", Version: "v1", Outcomes: json.RawMessage(`["Yes","No"]`), OutcomePrices: json.RawMessage(`[0.9,0.1]`), ClobTokenIDs: json.RawMessage(`["a","b"]`), EndDate: time.Time{}.Format(time.RFC3339)}
 	// Zero time is valid RFC3339, so this verifies parsing rather than silently

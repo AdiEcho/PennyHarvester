@@ -44,3 +44,6 @@ frontend/tsconfig.tsbuildinfo
 # SQLite encryption key for web-managed live credentials
 *.db.key
 .DS_Store
+
+# Local database backups
+backend/backups/

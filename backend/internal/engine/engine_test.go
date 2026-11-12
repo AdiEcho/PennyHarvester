@@ -356,6 +356,77 @@ func TestScanFiltersAndSettlesPaperPosition(t *testing.T) {
 	}
 }
 
+func TestScanRefreshesMissingPositionMarketsInOneBatch(t *testing.T) {
+	provider := &batchProvider{fakeProvider: fakeProvider{markets: map[string]market.Market{
+		"eligible": binary("eligible", 0.98, 20000, 2),
+	}}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{
+		MarketID: "eligible", Outcome: "Yes", TokenID: "eligible-yes", Amount: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A resolved market drops out of ListOpen, so its position has to be marked
+	// from a direct read. The batch route must answer that read in one call; one
+	// GET per position is what expired the scan deadline on a 10s cadence.
+	provider.getCalls = 0
+	provider.batchCalls = 0
+	resolved := provider.markets["eligible"]
+	resolved.Closed = true
+	resolved.Active = false
+	resolved.ResolutionStatus = "resolved"
+	resolved.Outcomes[0].Price = 1
+	resolved.Outcomes[1].Price = 0
+	provider.markets["eligible"] = resolved
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.batchCalls != 1 || provider.getCalls != 0 {
+		t.Fatalf("missing position markets must be batched, batches=%d gets=%d", provider.batchCalls, provider.getCalls)
+	}
+	if len(provider.batchIDs) != 1 || provider.batchIDs[0] != "eligible" {
+		t.Fatalf("batch asked for the wrong ids: %v", provider.batchIDs)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "won", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("batched market was not settled: %+v", positions.Items)
+	}
+}
+
+type batchProvider struct {
+	fakeProvider
+	getCalls   int
+	batchCalls int
+	batchIDs   []string
+}
+
+func (b *batchProvider) Get(ctx context.Context, id string) (market.Market, error) {
+	b.getCalls++
+	return b.fakeProvider.Get(ctx, id)
+}
+
+func (b *batchProvider) GetMany(ctx context.Context, ids []string) (map[string]market.Market, error) {
+	b.batchCalls++
+	b.batchIDs = append(b.batchIDs, ids...)
+	items := make(map[string]market.Market, len(ids))
+	for _, id := range ids {
+		item, err := b.fakeProvider.Get(ctx, id)
+		if err != nil {
+			return items, err
+		}
+		items[id] = item
+	}
+	return items, nil
+}
+
 func TestScanAppliesSportsPolicyAndVolatilityGuard(t *testing.T) {
 	start := time.Now().UTC().Add(time.Hour)
 	sportsGame := binary("sports-game", 0.98, 20000, 2)

@@ -19,6 +19,11 @@ import (
 const (
 	localizationTimeout    = 2 * time.Second
 	positionRefreshTimeout = 3 * time.Second
+	// positionBatchTimeout bounds the one batched read that resolves every
+	// position market the scan view did not carry. Marking runs even when the
+	// market-list budget is already spent, because a stale mark must not hide
+	// behind a slow radar refresh.
+	positionBatchTimeout = 8 * time.Second
 	// liveBalanceTimeout bounds the wallet read a dashboard request makes against
 	// the venue. The dashboard is polled by the web UI, so an unreachable venue
 	// must report stale cash instead of holding the request open until the HTTP
@@ -1852,27 +1857,80 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 	if err != nil {
 		return err
 	}
-	var errs []string
+	// Resolve the markets the scan view did not carry in one batch per venue. A
+	// position in a market that already ended but is still open upstream never
+	// appears in the open-market scan, so the old code spent one GET per
+	// position inside the scan deadline. On a 10s cadence that deadline expired
+	// mid-loop and every remaining position reported the same "context deadline
+	// exceeded", which also blocked stop-loss and entries for the account.
+	// Marking is independent of radar freshness, so the batch gets its own
+	// budget instead of whatever the list views left over.
+	prefetched := make(map[string]market.Market, len(positions))
+	missing := make(map[market.Venue][]string)
+	seen := make(map[string]bool, len(positions))
 	for _, position := range positions {
 		v := position.EffectiveVenue()
-		item, ok := markets[marketKey(v, position.MarketID)]
-		if !ok {
-			source := e.data(v)
-			if source == nil {
-				errs = append(errs, fmt.Sprintf("%s: 未注册 %s 行情源", position.MarketID, v.Label()))
-				continue
-			}
-			getCtx, cancel := context.WithTimeout(ctx, positionRefreshTimeout)
-			item, err = source.Get(getCtx, position.MarketID)
+		key := marketKey(v, position.MarketID)
+		if _, ok := markets[key]; ok || seen[key] {
+			continue
+		}
+		seen[key] = true
+		missing[v] = append(missing[v], position.MarketID)
+	}
+	var errs []string
+	for v, ids := range missing {
+		source := e.data(v)
+		if source == nil {
+			errs = append(errs, fmt.Sprintf("%s: 未注册 %s 行情源", strings.Join(ids, ","), v.Label()))
+			continue
+		}
+		sort.Strings(ids)
+		if batch, ok := source.(market.BatchProvider); ok {
+			batchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), positionBatchTimeout)
+			items, batchErr := batch.GetMany(batchCtx, ids)
 			cancel()
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", position.MarketID, err))
+			for _, id := range ids {
+				item, ok := items[id]
+				if !ok {
+					continue
+				}
+				item.Venue = v
+				if item.Currency == "" {
+					item.Currency = currencyForVenue(v)
+				}
+				prefetched[marketKey(v, id)] = item
+			}
+			if batchErr != nil {
+				errs = append(errs, fmt.Sprintf("%s 持仓行情: %v", v.Label(), batchErr))
+			}
+			continue
+		}
+		for _, id := range ids {
+			getCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), positionRefreshTimeout)
+			item, getErr := source.Get(getCtx, id)
+			cancel()
+			if getErr != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", id, getErr))
 				continue
 			}
 			item.Venue = v
 			if item.Currency == "" {
 				item.Currency = currencyForVenue(v)
 			}
+			prefetched[marketKey(v, id)] = item
+		}
+	}
+	for _, position := range positions {
+		v := position.EffectiveVenue()
+		item, ok := markets[marketKey(v, position.MarketID)]
+		if !ok {
+			item, ok = prefetched[marketKey(v, position.MarketID)]
+		}
+		if !ok {
+			// The batch already reported why this market is unavailable, so a
+			// book of stale positions keeps one error line per market instead of
+			// one per position.
+			continue
 		}
 		if item.EffectiveVenue() != v {
 			// A position must never be marked or settled with another venue's
