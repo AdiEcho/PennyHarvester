@@ -245,7 +245,7 @@ export const api = {
   },
   createOrder: (
     accountId: number,
-    body: { market_id: string; outcome: string; token_id: string; amount: number },
+    body: { market_id: string; outcome: string; token_id: string; amount: number; venue?: string },
     signal?: AbortSignal,
   ) => request<Position>(`/accounts/${accountId}/orders`, { method: 'POST', body, signal }),
 }

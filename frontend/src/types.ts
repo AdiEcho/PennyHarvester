@@ -439,6 +439,12 @@ export interface FunderDiscoveryResult {
   wallets?: string[]
   candidates?: WalletCandidate[]
   notes?: string[]
+  /** Evidence required before a proxy/deposit wallet may be treated as usable. */
+  verified?: boolean
+  chain_id?: number
+  implementation?: string
+  owner?: string
+  evidence?: string
 }
 
 export interface LiveEnvironment {

@@ -20,9 +20,10 @@ import {
 import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
-import type { Account, AccountMode, Engine, Settings, Venue, VenueSettings } from '@/types'
+import type { Account, AccountMode, Settings, Venue, VenueSettings } from '@/types'
 import type { Currency } from '@/lib/venue'
 import { fmtMoney, VENUES, venueLabel, venueMeta, venueOf } from '@/lib/venue'
+import { bumpSettingsRevision } from '@/lib/settings-revision'
 import { cn } from '@/lib/utils'
 import { useToast } from '@/components/toast'
 import { Badge } from '@/components/ui/badge'
@@ -355,9 +356,17 @@ function AccountSection({ account, accounts, defaultBankroll }: { account: Accou
   const isLive = account.mode === 'live'
   const venue = venueOf(account)
   const meta = venueMeta(venue)
-  // The uniqueness rule is per venue: one live Polymarket account and one live
-  // Predict.fun account may coexist.
-  const hasLive = accounts.some((item) => item.mode === 'live' && venueOf(item) === venue)
+  // Uniqueness is per target venue, not the currently selected account's venue.
+  // A live Predict.fun account may be created while the selected account is a
+  // live Polymarket one; only an existing live account on the target blocks it.
+  const liveVenues = new Set(accounts.filter((item) => item.mode === 'live').map(venueOf))
+  const hasLive = liveVenues.has(newVenue)
+  const changeNewVenue = (next: Venue) => {
+    setNewVenue(next)
+    // Keep the mode valid when the operator switches to a venue that already
+    // has a live account, instead of leaving a disabled "live" option selected.
+    if (liveVenues.has(next)) setNewMode('paper')
+  }
 
   useEffect(() => { setName(account.name) }, [account.id, account.name])
   useEffect(() => { setNewVenue(venueOf(account)) }, [account.id, account.venue])
@@ -386,6 +395,10 @@ function AccountSection({ account, accounts, defaultBankroll }: { account: Accou
   const createAccount = async () => {
     if (!newName.trim()) {
       toast({ title: '请输入账户名称', variant: 'error' })
+      return
+    }
+    if (newMode === 'live' && hasLive) {
+      toast({ title: '该场所已有实盘账户', description: `${venueMeta(newVenue).label} 只能有一个实盘账户。`, variant: 'error' })
       return
     }
     const bankroll = Number(newBankroll)
@@ -435,7 +448,7 @@ function AccountSection({ account, accounts, defaultBankroll }: { account: Accou
             <div className={cn('rounded-xl p-2.5', isLive ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700')}>{isLive ? <Radio className="h-[18px] w-[18px]" /> : <FlaskConical className="h-[18px] w-[18px]" />}</div>
             <div>
               <CardTitle>账户管理</CardTitle>
-              <CardDescription className="mt-1">实盘与模拟是完全隔离的账户，且每个账户只属于一个场所。后台自动交易按账户单独开启；雷达「立即扫描」也可按次选择自动下单。</CardDescription>
+              <CardDescription className="mt-1">实盘与模拟是完全隔离的账户，且每个账户只属于一个场所。后台自动交易按账户单独开启；雷达「立即扫描」也可按次选择执行自动交易（含止损卖出）。</CardDescription>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2"><VenueChip venue={venue} full /><ModeBadge mode={account.mode} /></div>
@@ -518,7 +531,7 @@ function AccountSection({ account, accounts, defaultBankroll }: { account: Accou
           </div>
           <div>
             <label htmlFor="new-account-venue" className="text-sm font-medium text-slate-700">所属场所</label>
-            <Select value={newVenue} onValueChange={(value) => setNewVenue(value as Venue)}>
+            <Select value={newVenue} onValueChange={(value) => changeNewVenue(value as Venue)}>
               <SelectTrigger id="new-account-venue" className="mt-2">
                 <SelectValue />
               </SelectTrigger>
@@ -599,7 +612,7 @@ function VenueSettingsSection({ venue, draft, shared, errors, onChange }: {
 
       <div className="mt-6 grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
         <NumberField id={`${venue}-min-liquidity`} label="最低流动性" description={venue === 'predictfun' ? `低于此值的市场不进入雷达。Predict.fun 的盘口深度通常远低于 Polymarket（实测 $90–$315k），建议设一个更低的门槛。留空继承账户策略值（当前 ${inheritLiquidity}）。` : `低于此值的市场不进入雷达。留空继承账户策略值（当前 ${inheritLiquidity}）。`} value={draft.min_liquidity} unit={meta.currency} min={0} placeholder={placeholder('min_liquidity')} error={errors[`${venue}.min_liquidity`]} onChange={(value) => onChange({ min_liquidity: value })} />
-        <NumberField id={`${venue}-order-size`} label="单笔金额" description={`该场所每次自动买入的目标名义金额。雷达「真实收益」也按此金额报价。单位 ${meta.currency}。`} value={draft.order_size} unit={meta.currency} min={0} placeholder={placeholder('order_size')} error={errors[`${venue}.order_size`]} onChange={(value) => onChange({ order_size: value })} />
+        <NumberField id={`${venue}-order-size`} label="单笔金额" description={`该场所每次自动买入的目标名义金额。雷达「盘口估算净收益」也按此金额报价。单位 ${meta.currency}。`} value={draft.order_size} unit={meta.currency} min={0} placeholder={placeholder('order_size')} error={errors[`${venue}.order_size`]} onChange={(value) => onChange({ order_size: value })} />
         <NumberField id={`${venue}-max-position`} label="单市场持仓上限" description={`不得低于该场所生效的单笔金额。单位 ${meta.currency}。`} value={draft.max_position} unit={meta.currency} min={0} placeholder={placeholder('max_position')} error={errors[`${venue}.max_position`]} onChange={(value) => onChange({ max_position: value })} />
         <NumberField id={`${venue}-max-exposure`} label="总敞口上限" description={`该场所全部未平仓头寸的风险预算上限，不得低于单市场上限。单位 ${meta.currency}，绝不与其他场所相加。`} value={draft.max_exposure} unit={meta.currency} min={0} placeholder={placeholder('max_exposure')} error={errors[`${venue}.max_exposure`]} onChange={(value) => onChange({ max_exposure: value })} />
         <NumberField id={`${venue}-fee-bps`} label="Paper 费用" description={venue === 'predictfun' ? '0–1000 bps，仅用于模拟成交；Predict.fun 实际按 费率 × min(p,1−p) × 份额 收取，maker 0 费。留空继承账户策略值。' : '0–1000 bps，仅用于模拟成交；留空继承账户策略值。'} value={draft.fee_bps} unit="bps" min={0} max={1000} placeholder={placeholder('fee_bps')} error={errors[`${venue}.fee_bps`]} onChange={(value) => onChange({ fee_bps: value })} />
@@ -626,7 +639,6 @@ export function SettingsView() {
   const [errors, setErrors] = useState<FieldErrors>({})
   const [saving, setSaving] = useState(false)
   const [toggling, setToggling] = useState(false)
-  const [engineOverride, setEngineOverride] = useState<Engine | null>(null)
   const saveController = useRef<AbortController | null>(null)
   const latestSettings = useRef<Settings | null>(null)
   const draftAccount = useRef<number | undefined>(undefined)
@@ -639,7 +651,7 @@ export function SettingsView() {
   const fetchDashboard = useCallback((signal: AbortSignal) => api.dashboard(account?.id, signal), [account?.id])
   const settingsQuery = usePolling(fetchSettings, { interval: 30000, enabled: Boolean(account?.id) })
   const dashboardQuery = usePolling(fetchDashboard, { enabled: Boolean(account?.id) })
-  const engine = engineOverride || dashboardQuery.data?.engine || null
+  const engine = dashboardQuery.data?.engine || null
   const isLive = account?.mode === 'live'
   const accountVenue = venueOf(account)
 
@@ -742,6 +754,7 @@ export function SettingsView() {
       }
       const saved = await api.updateSettings(payload, controller.signal, account?.id)
       latestSettings.current = saved
+      bumpSettingsRevision(account.id)
       setDraft(toDraft(saved))
       setDirty(false)
       setErrors({})
@@ -770,7 +783,11 @@ export function SettingsView() {
     setToggling(true)
     try {
       const next = await api.toggleEngine(running)
-      setEngineOverride(next)
+      // Update the accepted dashboard snapshot instead of keeping a local
+      // override. The polling response remains authoritative, so an external
+      // pause/start is reflected on the next poll instead of being masked
+      // forever by this mutation's result.
+      dashboardQuery.mutate((current) => current ? { ...current, engine: next } : current)
       toast({ title: running ? '扫描引擎已启动' : '扫描引擎已暂停', description: running ? '将按设置间隔扫描各已启用场所；后台自动下单按账户开关执行。' : '后台不再定时扫描；雷达「立即扫描」仍可手动触发。已有持仓保持不变。', variant: 'success' })
       dashboardQuery.refresh()
     } catch (caught) {
@@ -787,10 +804,10 @@ export function SettingsView() {
       <Card className="mb-4 overflow-hidden border-navy bg-navy text-white">
         <div className="flex flex-col gap-5 p-5 sm:flex-row sm:items-center sm:p-6">
           <div className={cn('rounded-2xl p-3', engine?.running ? 'bg-brand-lime text-navy' : 'bg-white/10 text-slate-400')}><Activity className="h-6 w-6" /></div>
-          <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h2 className="text-base font-semibold">扫描引擎</h2>{engine && <Badge variant={engine.running ? 'lime' : 'navy'}>{engine.running ? '运行中' : '已暂停'}</Badge>}</div><p className="mt-1.5 text-sm leading-6 text-slate-400">控制后台定时扫描；后台自动下单由各账户的「自动交易」开关独立决定，雷达「立即扫描」可按次选择自动下单。</p>{engine?.last_error && <p className="mt-2 break-words text-xs leading-5 text-rose-300">最近错误：{engine.last_error}</p>}</div>
+          <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h2 className="text-base font-semibold">扫描引擎</h2>{engine && <Badge variant={engine.running ? 'lime' : 'navy'}>{engine.running ? '运行中' : '已暂停'}</Badge>}</div><p className="mt-1.5 text-sm leading-6 text-slate-400">控制后台定时扫描；后台自动下单由各账户的「自动交易」开关独立决定，雷达「立即扫描」可按次选择执行自动交易（含止损卖出）。</p>{engine?.last_error && <p className="mt-2 break-words text-xs leading-5 text-rose-300">最近错误：{engine.last_error}</p>}</div>
           <div className="flex items-center gap-3 sm:flex-col sm:items-end"><Switch checked={engine?.running || false} onCheckedChange={toggleEngine} disabled={!engine || toggling || dashboardQuery.isLoading} aria-label="启动或暂停扫描引擎" className="data-[state=checked]:bg-emerald-500" /><span className="text-xs text-slate-400">{toggling ? '正在切换…' : engine?.running ? '点击暂停' : '点击启动'}</span></div>
         </div>
-        {dashboardQuery.error && !engine && <div className="break-words border-t border-white/10 bg-white/5 px-5 py-3 text-xs text-rose-300">{dashboardQuery.error}</div>}
+        {dashboardQuery.error && <div className="break-words border-t border-white/10 bg-white/5 px-5 py-3 text-xs text-rose-300">{engine ? `权威状态刷新失败，当前显示上一轮开关状态：${dashboardQuery.error}` : dashboardQuery.error}</div>}
       </Card>
 
       {account && <div className="mb-4"><AccountSection key={account.id} account={account} accounts={accounts} defaultBankroll={settingsQuery.data ? String(settingsQuery.data.initial_bankroll) : ''} /></div>}
@@ -830,7 +847,7 @@ export function SettingsView() {
               <SettingsSection icon={ShieldCheck} title="资金与风控（当前账户）" description="这里的金额属于当前账户，单位随场所变化（Polymarket = USDC、Predict.fun = USDT）。需要不同的单笔金额或敞口时，在对应场所页签填写覆写值；其他账户不受影响。">
                 <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
                   <NumberField id="initial_bankroll" label="新建模拟账户默认资金" description="只作为「新建账户」弹窗的预填值；弹窗里填写的金额直接写入新账户的基准权益，已有基准权益的账户不会因修改此值而重算历史。" value={draft.shared.initial_bankroll} unit="场所币" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
-                  <NumberField id="order_size" label="单笔金额（默认）" description="每次自动买入的目标名义金额；机会雷达的「真实收益」也按该场所的金额报价。" value={draft.shared.order_size} unit="场所币" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
+                  <NumberField id="order_size" label="单笔金额（默认）" description="每次自动买入的目标名义金额；机会雷达的「盘口估算净收益」也按该场所的金额报价。" value={draft.shared.order_size} unit="场所币" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
                   <NumberField id="max_position" label="单市场持仓上限（默认）" description="不得低于单笔金额。" value={draft.shared.max_position} unit="场所币" min={0} error={errors.max_position} onChange={(value) => update('max_position', value)} />
                   <NumberField id="max_exposure" label="总敞口上限（默认）" description="单个场所全部未平仓头寸的风险预算上限；不得低于单市场持仓上限。绝不跨场所合并。" value={draft.shared.max_exposure} unit="场所币" min={0} error={errors.max_exposure} onChange={(value) => update('max_exposure', value)} />
                   <NumberField id="max_event_exposure" label="单事件敞口上限（默认）" description="同一事件下全部市场的合计成本上限。一场选举或一场比赛的所有盘口共用同一个结果，逐个买入等于同一注押很多次；0 表示不限。" value={draft.shared.max_event_exposure} unit="场所币" min={0} error={errors.max_event_exposure} onChange={(value) => update('max_event_exposure', value)} />
@@ -888,7 +905,7 @@ export function SettingsView() {
                 )}
                 <div className="mt-6 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
                   <div className="rounded-xl bg-surface p-2.5 text-slate-500"><UserCog className="h-5 w-5" /></div>
-                  <div className="flex-1"><p className="text-sm font-semibold text-slate-800">自动交易开关已移到账户管理</p><p className="mt-1 text-xs leading-5 text-slate-500">实盘与模拟账户可以分别开启后台自动交易。雷达「立即扫描」可按次选择是否自动下单；实盘账户开启后台自动交易时需要二次确认。</p></div>
+                  <div className="flex-1"><p className="text-sm font-semibold text-slate-800">自动交易开关已移到账户管理</p><p className="mt-1 text-xs leading-5 text-slate-500">实盘与模拟账户可以分别开启后台自动交易。雷达「立即扫描」可按次选择是否执行自动交易（含止损卖出）；实盘账户开启后台自动交易时需要二次确认。</p></div>
                 </div>
               </SettingsSection>
             </>

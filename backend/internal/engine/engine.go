@@ -645,6 +645,7 @@ func (e *Engine) VenueApproval(ctx context.Context, v market.Venue) (venue.Appro
 // It holds the trade mutex: an approval transaction must not interleave with an
 // order that is being signed against the old allowance.
 func (e *Engine) ApproveVenue(ctx context.Context, v market.Venue) (venue.Approval, error) {
+	v = effectiveVenue(v)
 	approver, label, err := e.approver(v)
 	if err != nil {
 		return venue.Approval{}, err
@@ -654,10 +655,25 @@ func (e *Engine) ApproveVenue(ctx context.Context, v market.Venue) (venue.Approv
 	if err := e.requireConfiguration(); err != nil {
 		return venue.Approval{}, err
 	}
-	approval, err := approver.GrantApprovals(ctx)
-	if err != nil {
-		return venue.Approval{}, fmt.Errorf("%w: %s 链上授权失败: %w", ErrUpstream, label, err)
+	// A signed approval that has not resolved yet owns this wallet's nonce. A
+	// second grant would sign different nonces against an unknown chain state,
+	// so refuse until scan recovery has classified the first transaction.
+	if _, ok, err := e.repo.ActiveChainOperation(ctx, venueApprovalAccountID, v, "approve", nil); err != nil {
+		return venue.Approval{}, err
+	} else if ok {
+		return venue.Approval{}, ErrChainOperationActive
 	}
+	exec, err := e.executor(v)
+	if err != nil {
+		return venue.Approval{}, fmt.Errorf("%w: %s 只读运行，无法执行链上授权", ErrVenueReadOnly, label)
+	}
+	journal := newApprovalJournal(ctx, e, v, exec)
+	approval, err := approver.GrantApprovals(ctx, journal.recorder)
+	if err != nil {
+		hash := journal.fail(err)
+		return venue.Approval{}, fmt.Errorf("%w: %s 链上授权失败: %w", ErrUpstream, label, withTransactionHash(err, hash))
+	}
+	journal.succeed()
 	return approval, nil
 }
 
@@ -727,10 +743,19 @@ func (e *Engine) RedeemPosition(ctx context.Context, accountID, positionID int64
 	// transaction would burn nothing and still cost gas. The chain stays the
 	// real authority, but the intent row is the local guard. The orders table
 	// stores a redemption as a settle action named "redeem".
+	if _, ok, err := e.repo.ActiveChainOperation(ctx, accountID, v, "redeem", &position.ID); err != nil {
+		return venue.RedeemResult{}, err
+	} else if ok {
+		return venue.RedeemResult{}, ErrChainOperationActive
+	}
 	if existing, ok, err := e.repo.RedeemIntent(ctx, accountID, position.ID); err != nil {
 		return venue.RedeemResult{}, err
 	} else if ok {
 		return venue.RedeemResult{}, fmt.Errorf("%w: 该仓位已经提交过赎回（工单 %d）", ErrInvalidOrder, existing.ID)
+	}
+	op, err := e.beginChainOperation(ctx, accountID, v, chainIDOf(exec), "redeem", exec.Signer(), &position.ID, position.MarketID, position.TokenID)
+	if err != nil {
+		return venue.RedeemResult{}, err
 	}
 	intent, err := e.repo.CreateOrder(ctx, Order{
 		AccountID: accountID, Venue: v, Currency: position.EffectiveCurrency(),
@@ -742,31 +767,76 @@ func (e *Engine) RedeemPosition(ctx context.Context, accountID, positionID int64
 		CreatedAt: time.Now().UTC(),
 	})
 	if err != nil {
+		_ = e.finishChainOperation(ctx, op.ID, "reverted", "创建赎回工单失败，交易未发送")
 		return venue.RedeemResult{}, err
+	}
+	signedHash := ""
+	recorder := func(tx venue.ChainTxSigned) error {
+		from := strings.TrimSpace(tx.From)
+		if from == "" {
+			from = op.FromAddress
+		}
+		chainID := tx.ChainID
+		if chainID == 0 {
+			chainID = op.ChainID
+		}
+		nonce := tx.Nonce
+		if err := e.recordChainHash(ctx, op.ID, tx.Hash, from, &nonce, chainID); err != nil {
+			return err
+		}
+		signedHash = tx.Hash
+		return nil
 	}
 	result, err := redeemer.Redeem(ctx, venue.RedeemRequest{
 		MarketID:    position.MarketID,
 		ConditionID: position.ConditionID,
 		TokenID:     position.TokenID,
 		Shares:      position.Shares,
-	})
-	if err != nil {
-		// A signed transaction whose broadcast or receipt is uncertain must not
-		// become a rejection: that would invite a second transaction with a new
-		// nonce while the first may still land. Keep the row unresolved and
-		// return the hash so an operator can check the chain.
-		status := "rejected"
-		reason := clampReason(err.Error())
-		if txHash := transactionHashOf(err); txHash != "" {
-			status = "unknown"
-			reason = clampReason("广播或回执结果未知，交易 " + txHash + "，请先核对链上状态")
-			result.TxHash = txHash
-		}
-		_ = e.repo.MarkOrderStatus(ctx, intent.ID, status, reason)
-		return result, fmt.Errorf("%w: %s 赎回失败: %w", ErrUpstream, label, err)
+	}, recorder)
+	txHash := transactionHashOf(err)
+	if txHash == "" {
+		txHash = signedHash
 	}
-	_ = e.repo.MarkOrderStatus(ctx, intent.ID, "filled", "链上赎回交易已提交 "+result.TxHash)
-	return result, nil
+	if txHash == "" {
+		txHash = result.TxHash
+	}
+	if signedHash == "" && txHash != "" {
+		// A venue adapter must journal before broadcast, but keep the engine's
+		// own crash identity even if an older adapter only returns the hash on
+		// its result or error.
+		_ = e.recordChainHash(ctx, op.ID, txHash, exec.Signer(), nil, chainIDOf(exec))
+	}
+	if result.TxHash == "" {
+		result.TxHash = txHash
+	}
+	if err == nil {
+		_ = e.repo.MarkOrderStatus(ctx, intent.ID, "filled", clampReason("链上赎回交易已提交 "+txHash))
+		_ = e.finishChainOperation(ctx, op.ID, "confirmed", "链上赎回交易已确认 "+txHash)
+		return result, nil
+	}
+	// A signed transaction whose broadcast or receipt is uncertain must not
+	// become a rejection: that would invite a second transaction with a new
+	// nonce while the first may still land. Keep the row unresolved and
+	// return the hash so an operator can check the chain.
+	status := "rejected"
+	reason := clampReason(err.Error())
+	opStatus := "reverted"
+	opReason := "签名或广播前失败，赎回交易未发送"
+	switch {
+	case transactionRevertedOf(err):
+		opReason = "链上赎回交易已回滚 " + txHash
+		if txHash != "" {
+			reason = clampReason("链上赎回交易已回滚，交易 " + txHash)
+		}
+	case txHash != "":
+		status = "unknown"
+		opStatus = "unknown"
+		reason = clampReason("广播或回执结果未知，交易 " + txHash + "，请先核对链上状态")
+		opReason = reason
+	}
+	_ = e.repo.MarkOrderStatus(ctx, intent.ID, status, reason)
+	_ = e.finishChainOperation(ctx, op.ID, opStatus, opReason)
+	return result, withTransactionHash(fmt.Errorf("%w: %s 赎回失败: %w", ErrUpstream, label, err), txHash)
 }
 
 // transactionHashOf reads the signed hash from a chain adapter error without
@@ -1560,6 +1630,10 @@ func (e *Engine) ManualScan(ctx context.Context, accountID int64, execute bool, 
 
 func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, error) {
 	summary := ScanSummary{AccountID: options.AccountID, Execute: options.Execute}
+	// Resolve durable chain operations before taking the trade lock. Recovery
+	// makes bounded RPC calls and must never block a redemption UI request; a
+	// failed lookup leaves the operation active for the next scan.
+	e.recoverChainOperations(ctx)
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
 
@@ -1784,7 +1858,7 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 				// Stop-loss is independent of the auto-entry switch: an operator
 				// who only buys manually still needs an automatic exit. It runs
 				// before new entries so a breached position is reduced first.
-				stopErr := e.runStopLoss(ctx, account, plan.settings, staleMarkets)
+				stopErr := e.runStopLoss(ctx, account, plan.settings, staleMarkets, byID)
 				if stopErr != nil {
 					appendError(fmt.Sprintf("%s 止损: %v", account.Name, stopErr))
 				}
@@ -2452,7 +2526,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 // interval bounds how quickly a breach is noticed, and a gap can fill far below
 // the trigger. Only accounts with automatic trading enabled are allowed to sell
 // without an explicit click.
-func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Settings, staleMarkets map[string]bool) error {
+func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Settings, staleMarkets map[string]bool, markets map[string]market.Market) error {
 	if !settings.StopLossEnabled {
 		return nil
 	}
@@ -2490,7 +2564,14 @@ func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Sett
 		if account.Mode == AccountModeLive {
 			_, sellErr = e.executeLiveSell(ctx, account, position, reason)
 		} else {
-			_, sellErr = e.executePaperSell(ctx, account, position, reason, settings)
+			// Prefer the fee schedule from this scan, including markets that no
+			// longer sit on the radar. The radar only holds rows that pass the
+			// strategy filters; a position can fall out of it while still open.
+			rate := 0.0
+			if item, ok := markets[marketKey(position.EffectiveVenue(), position.MarketID)]; ok {
+				rate = item.FeeRateBPS
+			}
+			_, sellErr = e.executePaperSell(ctx, account, position, reason, settings, rate)
 		}
 		if sellErr != nil {
 			errs = append(errs, fmt.Sprintf("持仓 %d: %v", position.ID, sellErr))
@@ -2558,7 +2639,7 @@ func (e *Engine) reportedFeeRate(v market.Venue, tokenID string) float64 {
 	return 0
 }
 
-func (e *Engine) executePaperSell(ctx context.Context, account Account, position Position, reason string, settings Settings) (Position, error) {
+func (e *Engine) executePaperSell(ctx context.Context, account Account, position Position, reason string, settings Settings, scanRate float64) (Position, error) {
 	fillPrice := position.CurrentPrice * (1 - settings.SlippageBPS/10000)
 	if fillPrice <= 0 || fillPrice >= 1 {
 		return Position{}, e.rejectSellOrder(ctx, account.ID, position, "模拟止损卖出价无效")
@@ -2568,7 +2649,10 @@ func (e *Engine) executePaperSell(ctx context.Context, account Account, position
 	// the market is still on the radar, otherwise the settings default. Charging
 	// the default on the way out would price a Predict.fun exit ~13x cheaper than
 	// its entry and inflate every simulated stop-loss.
-	rate := e.reportedFeeRate(position.EffectiveVenue(), position.TokenID)
+	rate := scanRate
+	if rate <= 0 {
+		rate = e.reportedFeeRate(position.EffectiveVenue(), position.TokenID)
+	}
 	if rate <= 0 {
 		rate = effective.FeeBPS
 	}

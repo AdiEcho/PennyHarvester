@@ -147,6 +147,23 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		currency TEXT NOT NULL DEFAULT 'USDC',
 		time TEXT NOT NULL,
 		value REAL NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS chain_operations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account_id INTEGER NOT NULL,
+		venue TEXT NOT NULL,
+		chain_id INTEGER NOT NULL,
+		kind TEXT NOT NULL CHECK(kind IN ('approve', 'redeem')),
+		position_id INTEGER,
+		market_id TEXT,
+		token_id TEXT,
+		from_address TEXT NOT NULL,
+		nonce INTEGER,
+		tx_hash TEXT,
+		status TEXT NOT NULL CHECK(status IN ('intent', 'signed', 'broadcast', 'confirmed', 'reverted', 'unknown')),
+		reason TEXT,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
 	);`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return err
@@ -237,7 +254,11 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_orders_account_created ON orders(account_id, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_orders_account_event ON orders(account_id, event_id);
 	CREATE INDEX IF NOT EXISTS idx_orders_venue_created ON orders(venue, created_at DESC);
-	CREATE INDEX IF NOT EXISTS idx_snapshots_account_id ON equity_snapshots(account_id, id DESC);`
+	CREATE INDEX IF NOT EXISTS idx_orders_unresolved_account ON orders(account_id, id) WHERE status IN ('pending', 'unknown');
+	CREATE INDEX IF NOT EXISTS idx_snapshots_account_id ON equity_snapshots(account_id, id DESC);
+	CREATE INDEX IF NOT EXISTS idx_chain_operations_status_id ON chain_operations(status, id);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_operations_active_redeem ON chain_operations(account_id, position_id) WHERE kind = 'redeem' AND status IN ('intent', 'signed', 'broadcast', 'unknown');
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_operations_active_approve ON chain_operations(account_id, venue) WHERE kind = 'approve' AND status IN ('intent', 'signed', 'broadcast', 'unknown');`
 	if _, err := s.db.ExecContext(ctx, indexes); err != nil {
 		return err
 	}
@@ -1091,8 +1112,11 @@ func (s *SQLite) CountOrders(ctx context.Context, accountID int64, status string
 // cannot move an annualized figure.
 func (s *SQLite) EarliestAutoBuyAt(ctx context.Context, accountID int64) (*time.Time, error) {
 	var createdAt string
+	// Only a filled entry starts the strategy clock. Rejected or still-pending
+	// attempts must not make an account look older (and its return lower) than
+	// the first position it actually opened.
 	err := s.db.QueryRowContext(ctx, `SELECT created_at FROM orders
-		WHERE account_id = ? AND kind = 'auto' AND type = 'buy'
+		WHERE account_id = ? AND kind = 'auto' AND type = 'buy' AND status = 'filled'
 		ORDER BY created_at ASC, id ASC LIMIT 1`, accountID).Scan(&createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

@@ -4,8 +4,8 @@ import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import { useVenues } from '@/hooks/useVenues'
-import type { Order, OrderStatusFilter } from '@/types'
-import { formatDate, formatNumber, formatPrice } from '@/lib/format'
+import type { Order, OrderStatusFilter, OrdersResponse } from '@/types'
+import { formatDate, formatFullDate, formatNumber, formatPrice } from '@/lib/format'
 import { fmtMoney, venueMeta, venueOf } from '@/lib/venue'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -13,9 +13,15 @@ import { Card } from '@/components/ui/card'
 import { EmptyState, ErrorState, LoadingBlock } from '@/components/ui/feedback'
 import { InlineError, PageHeader } from '@/components/page-header'
 import { OrderModeBadge, OrderStatusBadge, VenueChip } from '@/components/status-badges'
-import { VenueFilter, useVenueScope } from '@/components/venue-filter'
+import { VenueFilter, useVenueScope, type VenueScope } from '@/components/venue-filter'
 
 const PAGE_SIZE = 100
+
+interface OrdersSnapshot {
+  response: OrdersResponse
+  query: { status: OrderStatusFilter; offset: number; scope: VenueScope }
+  observedAt: number
+}
 
 const filters: { value: OrderStatusFilter; label: string }[] = [
   { value: 'all', label: '全部订单' },
@@ -88,10 +94,14 @@ export function OrdersView() {
   const statusRef = useRef(status)
   const offsetRef = useRef(offset)
   const fetchOrders = useCallback(
-    (signal: AbortSignal) => api.orders(accountId, statusRef.current, PAGE_SIZE, offsetRef.current, scopeRef.current === 'all' ? null : scopeRef.current, signal),
+    async (signal: AbortSignal): Promise<OrdersSnapshot> => {
+      const query = { status: statusRef.current, offset: offsetRef.current, scope: scopeRef.current }
+      const response = await api.orders(accountId, query.status, PAGE_SIZE, query.offset, query.scope === 'all' ? null : query.scope, signal)
+      return { response, query, observedAt: Date.now() }
+    },
     [accountId, scopeRef],
   )
-  const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchOrders, { enabled: Boolean(accountId) })
+  const { data: snapshot, error, isLoading, isRefreshing, refresh } = usePolling(fetchOrders, { enabled: Boolean(accountId) })
   const appliedQuery = useRef({ status, offset, scope })
   useEffect(() => {
     const previous = appliedQuery.current
@@ -116,32 +126,55 @@ export function OrdersView() {
     setOffset(0)
   }
   const changeOffset = (next: number) => {
+    // A failed page change leaves the old accepted snapshot on screen while the
+    // requested offset stays pending. Clicking that same target must retry it
+    // instead of being swallowed by an identical setState.
+    if (offsetRef.current === next) {
+      refresh()
+      return
+    }
     offsetRef.current = next
     setOffset(next)
   }
-  const items = data?.items || []
+  const accepted = snapshot?.query
+  const shownStatus = accepted?.status ?? status
+  const shownScope = accepted?.scope ?? scope
+  const items = snapshot?.response.items || []
+  const outOfRange = Boolean(snapshot && accepted && accepted.offset > 0 && accepted.offset >= snapshot.response.total)
+  const statusLabel = (value: OrderStatusFilter) => filters.find((filter) => filter.value === value)?.label || value
+  const scopeLabel = (value: VenueScope) => value === 'all' ? '全部场所' : venueMeta(value).label
+  const staleLabel = snapshot ? `${statusLabel(snapshot.query.status)} · ${scopeLabel(snapshot.query.scope)} · 观察于 ${formatFullDate(new Date(snapshot.observedAt).toISOString())}` : ''
 
   return (
     <>
       <PageHeader eyebrow={isLive ? 'LIVE ORDER LOG' : 'PAPER ORDER LOG'} title="订单记录" description={isLive ? '审计手动与自动实盘订单，包括各场所订单号、成交、结算以及风控拒绝原因。' : '审计手动与自动模拟订单，包括成交、结算以及风控拒绝原因。'} actions={<Button variant="secondary" onClick={refresh} disabled={isRefreshing}><RefreshCw className={cn('h-4 w-4', isRefreshing && 'animate-spin')} />刷新记录</Button>} />
-      {error && data && <InlineError message={error} onRetry={refresh} />}
+      {error && snapshot && <InlineError message={`${error}（当前展示 ${staleLabel}）`} onRetry={refresh} />}
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex w-full gap-1 overflow-x-auto rounded-xl border border-slate-200 bg-surface p-1 sm:w-auto" role="tablist" aria-label="订单状态筛选">
           {filters.map((filter) => <button key={filter.value} role="tab" aria-selected={status === filter.value} onClick={() => changeStatus(filter.value)} className={cn('h-8 flex-1 whitespace-nowrap rounded-lg px-3 text-xs font-medium transition sm:flex-none', status === filter.value ? 'bg-navy text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800')}>{filter.label}</button>)}
         </div>
-        <p className="text-xs text-slate-500">显示 <span className="font-semibold tabular-nums text-slate-800">{formatNumber(items.length, 0)}</span> 条{data ? ` / 共 ${formatNumber(data.total, 0)} 条` : ''}</p>
+        <p className="text-xs text-slate-500">显示 <span className="font-semibold tabular-nums text-slate-800">{formatNumber(items.length, 0)}</span> 条{snapshot ? ` / 共 ${formatNumber(snapshot.response.total, 0)} 条` : ''}{snapshot && <span className="ml-1 text-slate-400">（{staleLabel}）</span>}</p>
       </div>
       <div className="mb-4">
         <VenueFilter available={venues} value={scope} onChange={setScope} />
       </div>
 
-      {accountLoading || isLoading ? <Card><LoadingBlock rows={6} /></Card> : error && !data ? <Card><ErrorState message={error} onRetry={refresh} /></Card> : !items.length ? (
+      {accountLoading || isLoading ? <Card><LoadingBlock rows={6} /></Card> : error && !snapshot ? <Card><ErrorState message={error} onRetry={refresh} /></Card> : outOfRange && snapshot && accepted ? (
         <Card>
           <EmptyState
             icon={BookOpenCheck}
-            title={status === 'all' ? '暂无订单记录' : '此状态下暂无订单'}
-            description={status === 'all' ? (isLive ? `手动实盘买入和自动策略订单都会完整记录在这里，并附${venueMeta(scope === 'all' ? account?.venue : scope).externalIdLabel} 订单号。` : '手动模拟买入和自动策略订单都会完整记录在这里。') : '切换其他状态，或查看全部订单。'}
-            action={status !== 'all' ? <Button variant="secondary" onClick={() => changeStatus('all')}>查看全部订单</Button> : undefined}
+            title="当前页码超出订单范围"
+            description={`${statusLabel(accepted.status)} · ${scopeLabel(accepted.scope)} 共 ${formatNumber(snapshot.response.total, 0)} 条，当前页从第 ${formatNumber(accepted.offset + 1, 0)} 条开始。`}
+            action={<Button variant="secondary" onClick={() => changeOffset(Math.max(0, accepted.offset - PAGE_SIZE))}>返回上一页</Button>}
+          />
+        </Card>
+      ) : !items.length ? (
+        <Card>
+          <EmptyState
+            icon={BookOpenCheck}
+            title={shownStatus === 'all' ? '暂无订单记录' : '此状态下暂无订单'}
+            description={shownStatus === 'all' ? (isLive ? `手动实盘买入和自动策略订单都会完整记录在这里，并附${venueMeta(shownScope === 'all' ? account?.venue : shownScope).externalIdLabel} 订单号。` : '手动模拟买入和自动策略订单都会完整记录在这里。') : '切换其他状态，或查看全部订单。'}
+            action={shownStatus !== 'all' ? <Button variant="secondary" onClick={() => changeStatus('all')}>查看全部订单</Button> : undefined}
           />
         </Card>
       ) : (
@@ -181,12 +214,12 @@ export function OrdersView() {
             </div>
           </Card>
           <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{items.map((order) => <OrderCard key={order.id} order={order} isLive={isLive} />)}</div>
-          {data && data.total > PAGE_SIZE && (
+          {snapshot && snapshot.response.total > PAGE_SIZE && accepted && (
             <div className="mt-4 flex flex-col items-center justify-between gap-3 text-xs text-slate-400 sm:flex-row">
-              <p>当前显示第 {formatNumber(offset + 1, 0)}–{formatNumber(offset + items.length, 0)} 条，共 {formatNumber(data.total, 0)} 条记录</p>
+              <p>当前显示第 {formatNumber(accepted.offset + 1, 0)}–{formatNumber(accepted.offset + items.length, 0)} 条，共 {formatNumber(snapshot.response.total, 0)} 条记录 <span className="text-slate-300">·</span> {staleLabel}</p>
               <div className="flex gap-2">
-                <Button variant="secondary" size="sm" disabled={offset === 0 || isRefreshing} onClick={() => changeOffset(Math.max(0, offset - PAGE_SIZE))}>上一页</Button>
-                <Button variant="secondary" size="sm" disabled={offset + items.length >= data.total || isRefreshing} onClick={() => changeOffset(offset + PAGE_SIZE)}>下一页</Button>
+                <Button variant="secondary" size="sm" disabled={accepted.offset === 0 || isRefreshing} onClick={() => changeOffset(Math.max(0, accepted.offset - PAGE_SIZE))}>上一页</Button>
+                <Button variant="secondary" size="sm" disabled={accepted.offset + items.length >= snapshot.response.total || isRefreshing} onClick={() => changeOffset(accepted.offset + PAGE_SIZE)}>下一页</Button>
               </div>
             </div>
           )}

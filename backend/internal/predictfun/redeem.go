@@ -31,6 +31,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+
+	"pennyharvester/backend/internal/venue"
 )
 
 // RedeemMethod names the contract path taken, for the API response and support.
@@ -186,7 +188,7 @@ type RedeemTx struct {
 // Redeem burns the resolved shares held for one condition and waits for the
 // receipt. It refuses before signing when the signer cannot pay for gas, because
 // a transaction stuck in the mempool is worse than a clear error.
-func (o *OnChain) Redeem(ctx context.Context, request RedeemRequest) (RedeemTx, error) {
+func (o *OnChain) Redeem(ctx context.Context, request RedeemRequest, onSigned venue.ChainTxRecorder) (RedeemTx, error) {
 	conditionID, err := parseConditionID(request.ConditionID)
 	if err != nil {
 		return RedeemTx{}, err
@@ -244,10 +246,12 @@ func (o *OnChain) Redeem(ctx context.Context, request RedeemRequest) (RedeemTx, 
 		action:           "赎回 " + plan.method,
 		gasLimitFallback: redeemGasLimitFallback,
 	}
-	hash, err := o.sendCall(ctx, client, nonce, gasPrice, call)
+	hash, err := o.sendCall(ctx, client, nonce, gasPrice, call, onSigned)
 	if err != nil {
-		// Hash is set as soon as signing succeeds; keep it so callers can
-		// report an unknown broadcast instead of an anonymous failure.
+		// A hash is returned only after signing and the journal callback
+		// accepted it; keep it so callers can report an unknown broadcast
+		// instead of an anonymous failure. A callback rejection returns no
+		// hash because nothing was broadcast.
 		return RedeemTx{Hash: hash, Method: plan.method}, err
 	}
 	return RedeemTx{Hash: hash, Method: plan.method}, nil

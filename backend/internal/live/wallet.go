@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"pennyharvester/backend/internal/engine"
@@ -160,9 +161,14 @@ const (
 
 // walletCandidate is an address that belongs to the signer, in discovery order.
 type walletCandidate struct {
-	address  common.Address
-	source   walletSource
-	deployed bool
+	address        common.Address
+	source         walletSource
+	deployed       bool
+	kind           int
+	verified       bool
+	owner          common.Address
+	implementation string
+	evidence       string
 }
 
 // rpcClient is a tiny JSON-RPC caller used for read-only Polygon calls. It
@@ -244,6 +250,23 @@ func (c *rpcClient) code(ctx context.Context, address common.Address) ([]byte, e
 }
 
 // callContract performs an eth_call and returns the raw return data.
+// chainID reads eth_chainId so wallet evidence can pin the deployment chain.
+func (c *rpcClient) chainID(ctx context.Context) (int64, error) {
+	result, err := c.call(ctx, "eth_chainId", []any{})
+	if err != nil {
+		return 0, err
+	}
+	var raw string
+	if err := json.Unmarshal(result, &raw); err != nil {
+		return 0, fmt.Errorf("解析 eth_chainId 结果: %w", err)
+	}
+	value, err := hexutil.DecodeUint64(raw)
+	if err != nil {
+		return 0, fmt.Errorf("解析 eth_chainId: %w", err)
+	}
+	return int64(value), nil
+}
+
 func (c *rpcClient) callContract(ctx context.Context, to common.Address, selector string) ([]byte, error) {
 	result, err := c.call(ctx, "eth_call", []any{
 		map[string]any{"to": to.Hex(), "data": selector}, "latest",
@@ -384,6 +407,19 @@ func (e *Executor) DiscoverWallet(ctx context.Context, settings engine.LiveSetti
 	// Order matters: the deposit wallet is the current account type, so it wins
 	// over a legacy Proxy/Safe that may still be deployed for a migrated account.
 	rpc := newRPCClient(cfg)
+	chainID, chainErr := rpc.chainID(ctx)
+	chainOK := chainErr == nil && chainID == 137
+	if chainErr != nil {
+		result.Notes = append(result.Notes, "链上校验不可用："+chainErr.Error())
+	} else if chainID != 137 {
+		result.Notes = append(result.Notes, fmt.Sprintf("当前 Polygon RPC 的 chainId 为 %d，不是 Polygon 主网 137；已拒绝把检测结果当作已验证。", chainID))
+	}
+	result.ChainID = chainID
+	rpcAvailable := chainOK
+
+	// 2) CREATE2 derivation of the deterministic wallets, verified on-chain.
+	// Order matters: the deposit wallet is the current account type, so it wins
+	// over a legacy Proxy/Safe that may still be deployed for a migrated account.
 	derived := []struct {
 		address common.Address
 		kind    int
@@ -392,8 +428,14 @@ func (e *Executor) DiscoverWallet(ctx context.Context, settings engine.LiveSetti
 		{address: DeriveSafeAddress(signer), kind: WalletTypeSafe},
 		{address: DeriveProxyAddress(signer), kind: WalletTypeProxy},
 	}
-	rpcAvailable := true
+	derivedKinds := map[common.Address]int{}
 	for _, candidate := range derived {
+		derivedKinds[candidate.address] = candidate.kind
+	}
+	for _, candidate := range derived {
+		if !rpcAvailable {
+			break
+		}
 		deployed, err := rpc.hasCode(ctx, candidate.address)
 		if err != nil {
 			if rpcAvailable {
@@ -415,86 +457,159 @@ func (e *Executor) DiscoverWallet(ctx context.Context, settings engine.LiveSetti
 		return result, fmt.Errorf("未能自动找到 Funder：Polymarket 公开资料中没有该地址，链上也没有可识别的代理钱包")
 	}
 
-	// Resolve deployment state after de-duplication so the reported wallet has
-	// an authoritative answer even when it came from the profile.
-	if rpcAvailable {
-		for i := range candidates {
-			deployed, err := rpc.hasCode(ctx, candidates[i].address)
-			if err != nil {
-				continue
+	// Read bytecode once per candidate for deployment, type and implementation
+	// evidence. A profile address is not trusted until the chain agrees.
+	codes := map[common.Address][]byte{}
+	for i := range candidates {
+		if !rpcAvailable {
+			break
+		}
+		code, err := rpc.code(ctx, candidates[i].address)
+		if err != nil {
+			continue
+		}
+		codes[candidates[i].address] = code
+		candidates[i].deployed = len(code) > 0
+	}
+
+	for i := range candidates {
+		candidate := &candidates[i]
+		candidate.kind = -1
+		if kind, ok := derivedKinds[candidate.address]; ok {
+			candidate.kind = kind
+			candidate.owner = signer
+			candidate.verified = candidate.deployed && rpcAvailable
+			candidate.evidence = "create2-derivation"
+			switch kind {
+			case WalletTypeDeposit:
+				candidate.implementation = depositImplementation
+			case WalletTypeProxy:
+				candidate.implementation = eip1167Implementation(codes[candidate.address]).Hex()
 			}
-			candidates[i].deployed = deployed
+			continue
+		}
+		code := codes[candidate.address]
+		if len(code) == 0 {
+			continue
+		}
+		candidate.kind = detectWalletType(ctx, rpc, signer, candidate.address, code)
+		switch candidate.kind {
+		case WalletTypeSafe:
+			owner, ok := safeOwner(ctx, rpc, candidate.address)
+			if ok && strings.EqualFold(owner.Hex(), signer.Hex()) {
+				candidate.verified = true
+				candidate.owner = owner
+				candidate.evidence = "safe-owner"
+			}
+		case WalletTypeDeposit:
+			owner, ok := depositOwner(ctx, rpc, candidate.address)
+			if ok && strings.EqualFold(owner.Hex(), signer.Hex()) {
+				candidate.verified = true
+				candidate.owner = owner
+				candidate.evidence = "owner-signer"
+			}
+		case WalletTypeProxy:
+			candidate.implementation = eip1167Implementation(code).Hex()
 		}
 	}
 
-	primary := candidates[0]
-	result.Funder = primary.address.Hex()
-	result.Source = string(primary.source)
-	result.Deployed = primary.deployed
-
-	// Classify: a derivation match is exact, otherwise read the bytecode.
-	walletType := -1
-	if primary.address == signer {
-		walletType = WalletTypeEOA
-	}
-	for _, candidate := range derived {
-		if primary.address == candidate.address {
-			walletType = candidate.kind
+	// Prefer the first candidate that carries explicit evidence; a profile
+	// mapping alone is only a candidate, never proof of ownership.
+	primaryIndex := 0
+	for i := range candidates {
+		if candidates[i].verified {
+			primaryIndex = i
 			break
 		}
 	}
-	codeChecked := false
-	if walletType < 0 && rpcAvailable {
-		if code, err := rpc.code(ctx, primary.address); err == nil {
-			codeChecked = len(code) > 0
-			walletType = detectWalletType(ctx, rpc, signer, primary.address, code)
-		}
+	primary := candidates[primaryIndex]
+	result.Funder = primary.address.Hex()
+	result.Source = string(primary.source)
+	result.Deployed = primary.deployed
+	result.Verified = primary.verified
+	result.Evidence = primary.evidence
+	if primary.owner != (common.Address{}) {
+		result.Owner = primary.owner.Hex()
 	}
-	if walletType < 0 {
-		// Every Polymarket account wallet is a smart wallet; new accounts get a
-		// Deposit Wallet and the profile service only lists existing accounts.
-		walletType = WalletTypeDeposit
-		if codeChecked {
-			result.Notes = append(result.Notes, "链上字节码不是已知的钱包形态，已按默认的 Deposit Wallet（3）处理；如果订单被拒，请手动选择正确的代理钱包类型。")
-		}
-	}
-	if len(candidates) > 1 && walletType != WalletTypeEOA {
-		result.Notes = append(result.Notes, "该私钥关联了多个钱包，已按优先级填入第一个（Polymarket 公开资料优先）；如果订单被拒，请改用 polymarket.com 个人菜单里显示的账户钱包地址。")
-	}
-	result.WalletType = walletType
-	result.WalletName = walletTypeName(walletType)
+	result.Implementation = primary.implementation
+	result.WalletType = primary.kind
+	result.WalletName = walletTypeNameForCandidate(primary.kind)
 
-	if walletType == WalletTypeEOA {
+	if primary.address == signer {
+		result.WalletType = WalletTypeEOA
+		result.WalletName = walletTypeName(WalletTypeEOA)
+		result.Verified = true
+		result.Evidence = "eoa-signer"
+	}
+	if !primary.verified && result.WalletType != WalletTypeEOA && rpcAvailable {
+		result.Notes = append(result.Notes, "该钱包只有候选证据（公开资料或字节码形态），没有命中已知工厂推导或 owner/signer 核对；已标记为未验证，不能用于实盘。")
+	}
+	if len(candidates) > 1 && result.WalletType != WalletTypeEOA {
+		result.Notes = append(result.Notes, "该私钥关联了多个钱包，已优先填入有验证证据的第一个；如果订单被拒，请改用 polymarket.com 个人菜单里显示的账户钱包地址。")
+	}
+
+	if result.WalletType == WalletTypeEOA {
 		result.Funder = ""
 		result.Wallets = nil
+		result.Verified = true
+		result.Evidence = "eoa-signer"
 	} else {
 		for _, candidate := range candidates {
 			result.Wallets = append(result.Wallets, candidate.address.Hex())
-			kind := -1
-			for _, known := range derived {
-				if candidate.address == known.address {
-					kind = known.kind
-					break
-				}
-			}
-			if kind < 0 && rpcAvailable {
-				if code, err := rpc.code(ctx, candidate.address); err == nil {
-					kind = detectWalletType(ctx, rpc, signer, candidate.address, code)
-				}
+			owner := ""
+			if candidate.owner != (common.Address{}) {
+				owner = candidate.owner.Hex()
 			}
 			result.Candidates = append(result.Candidates, engine.WalletCandidate{
-				Address:    candidate.address.Hex(),
-				WalletType: kind,
-				WalletName: walletTypeNameForCandidate(kind),
-				Deployed:   candidate.deployed,
-				Source:     string(candidate.source),
+				Address:        candidate.address.Hex(),
+				WalletType:     candidate.kind,
+				WalletName:     walletTypeNameForCandidate(candidate.kind),
+				Deployed:       candidate.deployed,
+				Source:         string(candidate.source),
+				Verified:       candidate.verified,
+				Owner:          owner,
+				Implementation: candidate.implementation,
+				Evidence:       candidate.evidence,
 			})
 		}
 	}
-	if walletType == WalletTypeDeposit && !result.Deployed && rpcAvailable {
+	if result.WalletType == WalletTypeDeposit && !result.Deployed && rpcAvailable {
 		result.Notes = append(result.Notes, "Deposit 钱包尚未在链上部署：下单前需要在 polymarket.com 完成一次存款 / 交易，让平台部署该钱包。")
 	}
 	return result, nil
+}
+
+// eip1167Implementation extracts the implementation address from the minimal
+// proxy runtime code: prefix(10) | implementation(20) | ...
+func eip1167Implementation(code []byte) common.Address {
+	if len(code) < 30 {
+		return common.Address{}
+	}
+	return common.BytesToAddress(code[10:30])
+}
+
+// safeOwner decodes getOwners() and only accepts a 1-of-1 Safe whose sole owner
+// is the signer. A generic "owners bytecode present" answer is not evidence.
+func safeOwner(ctx context.Context, rpc *rpcClient, funder common.Address) (common.Address, bool) {
+	data, err := rpc.callContract(ctx, funder, "0xa0e67e2b")
+	if err != nil || len(data) < 96 {
+		return common.Address{}, false
+	}
+	count := new(big.Int).SetBytes(data[32:64]).Int64()
+	if count != 1 {
+		return common.Address{}, false
+	}
+	word := data[64:96]
+	return common.BytesToAddress(word[12:32]), true
+}
+
+// depositOwner decodes owner() and requires the signer to be the owner.
+func depositOwner(ctx context.Context, rpc *rpcClient, funder common.Address) (common.Address, bool) {
+	data, err := rpc.callContract(ctx, funder, "0x8da5cb5b")
+	if err != nil || len(data) < 32 {
+		return common.Address{}, false
+	}
+	return common.BytesToAddress(data[12:32]), true
 }
 
 func walletTypeNameForCandidate(signatureType int) string {

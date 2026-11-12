@@ -13,9 +13,11 @@ package predictfun
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +26,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+
+	"pennyharvester/backend/internal/venue"
 )
 
 const (
@@ -292,7 +296,7 @@ func (o *OnChain) Allowance(ctx context.Context) (ApprovalState, error) {
 // This is explicit and never called from an order path: a transaction costs
 // BNB, may take minutes, and an order must not be delayed or silently made
 // while the operator is waiting for a receipt.
-func (o *OnChain) EnsureApprovals(ctx context.Context) error {
+func (o *OnChain) EnsureApprovals(ctx context.Context, onSigned venue.ChainTxRecorder) error {
 	if o == nil {
 		return fmt.Errorf("Predict.fun 链上授权客户端未初始化")
 	}
@@ -395,7 +399,7 @@ func (o *OnChain) EnsureApprovals(ctx context.Context) error {
 	// next local nonce so a slow receipt cannot make two approvals reuse one
 	// nonce and replace each other in the mempool.
 	for index, call := range calls {
-		if err := o.sendApproval(ctx, client, nonce+uint64(index), gasPrice, call); err != nil {
+		if err := o.sendApproval(ctx, client, nonce+uint64(index), gasPrice, call, onSigned); err != nil {
 			return err
 		}
 	}
@@ -424,15 +428,15 @@ type approvalCall struct {
 }
 
 // sendApproval estimates, signs, sends and waits for one approval transaction.
-func (o *OnChain) sendApproval(ctx context.Context, client *ethclient.Client, nonce uint64, gasPrice *big.Int, call approvalCall) error {
-	_, err := o.sendCall(ctx, client, nonce, gasPrice, call)
+func (o *OnChain) sendApproval(ctx context.Context, client *ethclient.Client, nonce uint64, gasPrice *big.Int, call approvalCall, onSigned venue.ChainTxRecorder) error {
+	_, err := o.sendCall(ctx, client, nonce, gasPrice, call, onSigned)
 	return err
 }
 
 // sendCall estimates, signs, sends and waits for one transaction, returning its
 // hash. It never logs or returns the private key; the transaction hash is safe to
 // report and is included in receipt failures.
-func (o *OnChain) sendCall(ctx context.Context, client *ethclient.Client, nonce uint64, gasPrice *big.Int, call approvalCall) (common.Hash, error) {
+func (o *OnChain) sendCall(ctx context.Context, client *ethclient.Client, nonce uint64, gasPrice *big.Int, call approvalCall, onSigned venue.ChainTxRecorder) (common.Hash, error) {
 	if err := ctx.Err(); err != nil {
 		return common.Hash{}, fmt.Errorf("发送 %s 交易已取消: %w", call.action, err)
 	}
@@ -473,11 +477,24 @@ func (o *OnChain) sendCall(ctx context.Context, client *ethclient.Client, nonce 
 	// the node accepted and then dropped the connection, and the operator needs
 	// an identity to check before signing a replacement with a new nonce.
 	hash := signed.Hash()
+	// Persist the identity before the node can accept the transaction. If the
+	// journal cannot be written, broadcasting would create an unrecorded
+	// transaction, so the callback error stops the send instead.
+	if onSigned != nil {
+		if err := onSigned(venue.ChainTxSigned{
+			Hash:    hash.Hex(),
+			From:    o.settings.signer.Hex(),
+			Nonce:   nonce,
+			ChainID: o.settings.chainID,
+		}); err != nil {
+			return common.Hash{}, fmt.Errorf("记录 %s 交易签名失败，未广播: %w", call.action, err)
+		}
+	}
 	if err := client.SendTransaction(ctx, signed); err != nil {
 		return hash, &TxError{Hash: hash, Action: call.action, Phase: "broadcast", Err: err}
 	}
-	if err := o.waitForReceipt(ctx, client, hash); err != nil {
-		return hash, &TxError{Hash: hash, Action: call.action, Phase: "receipt", Err: err}
+	if reverted, err := o.waitForReceipt(ctx, client, hash); err != nil {
+		return hash, &TxError{Hash: hash, Action: call.action, Phase: "receipt", Reverted: reverted, Err: err}
 	}
 	return hash, nil
 }
@@ -486,10 +503,11 @@ func (o *OnChain) sendCall(ctx context.Context, client *ethclient.Client, nonce 
 // Callers must surface the hash and must not silently retry with a fresh nonce:
 // the transaction may already be in a block.
 type TxError struct {
-	Hash   common.Hash
-	Action string
-	Phase  string
-	Err    error
+	Hash     common.Hash
+	Action   string
+	Phase    string
+	Reverted bool
+	Err      error
 }
 
 func (e *TxError) Error() string {
@@ -513,6 +531,10 @@ func (e *TxError) TransactionHash() string {
 	return e.Hash.Hex()
 }
 
+// TransactionReverted distinguishes a mined failure from an unknown receipt.
+// Only a mined failure may be retried without first checking the nonce.
+func (e *TxError) TransactionReverted() bool { return e != nil && e.Reverted }
+
 // TxHashOf extracts the signed transaction hash from a chain error.
 func TxHashOf(err error) (common.Hash, bool) {
 	var txErr *TxError
@@ -527,7 +549,7 @@ func TxHashOf(err error) (common.Hash, bool) {
 // the timeout error carries the hash and the operator must check BscScan
 // before retrying, because a retry after silent inclusion would send a second
 // approval and spend gas again.
-func (o *OnChain) waitForReceipt(ctx context.Context, client *ethclient.Client, hash common.Hash) error {
+func (o *OnChain) waitForReceipt(ctx context.Context, client *ethclient.Client, hash common.Hash) (bool, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, approvalReceiptTimeout)
 	defer cancel()
 
@@ -536,21 +558,21 @@ func (o *OnChain) waitForReceipt(ctx context.Context, client *ethclient.Client, 
 		switch {
 		case err == nil:
 			if receipt == nil {
-				return fmt.Errorf("链上交易 %s 没有返回回执", hash.Hex())
+				return false, fmt.Errorf("链上交易 %s 没有返回回执", hash.Hex())
 			}
 			if receipt.Status == types.ReceiptStatusFailed {
-				return fmt.Errorf("链上交易回滚：交易 %s 已失败（status=0），授权未生效，请检查 BNB 余额与授权合约后重试", hash.Hex())
+				return true, fmt.Errorf("链上交易回滚：交易 %s 已失败（status=0），授权未生效，请检查 BNB 余额与授权合约后重试", hash.Hex())
 			}
-			return nil
+			return false, nil
 		case !errors.Is(err, ethereum.NotFound):
 			if waitCtx.Err() != nil {
-				return receiptWaitError(ctx, hash)
+				return false, receiptWaitError(ctx, hash)
 			}
-			return fmt.Errorf("查询链上交易 %s 回执失败: %w", hash.Hex(), err)
+			return false, fmt.Errorf("查询链上交易 %s 回执失败: %w", hash.Hex(), err)
 		}
 
 		if waitCtx.Err() != nil {
-			return receiptWaitError(ctx, hash)
+			return false, receiptWaitError(ctx, hash)
 		}
 		sleep := o.sleep
 		if sleep == nil {
@@ -558,6 +580,37 @@ func (o *OnChain) waitForReceipt(ctx context.Context, client *ethclient.Client, 
 		}
 		sleep(approvalPollInterval)
 	}
+}
+
+// TransactionStatus resolves a journaled hash without guessing. A missing
+// receipt or a transport failure is returned as an error so recovery keeps the
+// operation unknown; only a receipt can prove confirmed or reverted.
+func (o *OnChain) TransactionStatus(ctx context.Context, rawHash string) (confirmed bool, reverted bool, err error) {
+	hashText := strings.TrimSpace(rawHash)
+	if len(hashText) != 66 || !strings.HasPrefix(strings.ToLower(hashText), "0x") {
+		return false, false, fmt.Errorf("无效的链上交易哈希 %q", rawHash)
+	}
+	if _, decodeErr := hex.DecodeString(hashText[2:]); decodeErr != nil {
+		return false, false, fmt.Errorf("无效的链上交易哈希 %q: %w", rawHash, decodeErr)
+	}
+	client, err := o.ethClient(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	receipt, err := client.TransactionReceipt(ctx, common.HexToHash(hashText))
+	if err != nil {
+		if errors.Is(err, ethereum.NotFound) {
+			return false, false, fmt.Errorf("链上交易 %s 尚未找到回执: %w", hashText, err)
+		}
+		return false, false, fmt.Errorf("查询链上交易 %s 回执失败: %w", hashText, err)
+	}
+	if receipt == nil {
+		return false, false, fmt.Errorf("链上交易 %s 没有返回回执", hashText)
+	}
+	if receipt.Status == types.ReceiptStatusFailed {
+		return false, true, nil
+	}
+	return true, false, nil
 }
 
 // receiptWaitError distinguishes a caller cancellation from the fixed

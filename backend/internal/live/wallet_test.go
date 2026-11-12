@@ -93,6 +93,8 @@ func rpcServer(t *testing.T, codeFor map[string]string, calls map[string]string)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch request.Method {
+		case "eth_chainId":
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": "0x89"})
 		case "eth_getCode":
 			var address string
 			_ = json.Unmarshal(request.Params[0], &address)
@@ -267,4 +269,43 @@ func containsNote(notes []string, fragment string) bool {
 		}
 	}
 	return false
+}
+
+func TestDiscoverWalletRequiresOwnerEvidenceForProfileCandidates(t *testing.T) {
+	signer := testSignerAddress(t)
+	funder := common.HexToAddress("0x96CfCB0C30942cFCd1CDf76C7d408794D66B1aCb")
+	profile := profileServer(t, funder.Hex())
+	defer profile.Close()
+	code := "0x363d3d373d3d363d602036600436635c60da1b60e01b36527fa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50545afa5036515af43d6000803e604d573d6000fd5b3d6000f3"
+	ownerWord := "0x" + strings.Repeat("0", 24) + strings.TrimPrefix(strings.ToLower(signer.Hex()), "0x")
+	rpc := rpcServer(t, map[string]string{strings.ToLower(funder.Hex()): code}, map[string]string{
+		strings.ToLower(funder.Hex()) + "|0x8da5cb5b": ownerWord,
+	})
+	defer rpc.Close()
+
+	executor := New(Config{PrivateKey: testSignerKey, PolygonRPC: rpc.URL})
+	discovery, err := executor.DiscoverWallet(context.Background(), engine.LiveSettings{}, engine.WalletEndpoints{Gamma: profile.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !discovery.Verified || discovery.ChainID != 137 || !strings.EqualFold(discovery.Owner, signer.Hex()) {
+		t.Fatalf("verified=%v chain=%d owner=%q", discovery.Verified, discovery.ChainID, discovery.Owner)
+	}
+	if discovery.Evidence != "owner-signer" {
+		t.Fatalf("evidence = %q", discovery.Evidence)
+	}
+
+	mismatch := "0x" + strings.Repeat("0", 24) + "4444444444444444444444444444444444444444"
+	rpc2 := rpcServer(t, map[string]string{strings.ToLower(funder.Hex()): code}, map[string]string{
+		strings.ToLower(funder.Hex()) + "|0x8da5cb5b": mismatch,
+	})
+	defer rpc2.Close()
+	executor = New(Config{PrivateKey: testSignerKey, PolygonRPC: rpc2.URL})
+	discovery, err = executor.DiscoverWallet(context.Background(), engine.LiveSettings{}, engine.WalletEndpoints{Gamma: profile.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discovery.Verified {
+		t.Fatal("an owner mismatch must stay unverified")
+	}
 }

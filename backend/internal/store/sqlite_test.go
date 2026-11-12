@@ -866,3 +866,41 @@ func TestInitializeAccountBaselineIsCompareAndSet(t *testing.T) {
 		t.Fatalf("baseline = %v, want 1000", stored.BaselineEquity)
 	}
 }
+
+func TestEarliestAutoBuyIgnoresRejectedAttempts(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, filepath.Join(t.TempDir(), "start.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	account, err := repository.DefaultAccount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-2 * time.Hour)
+	rejected, err := repository.CreateOrder(ctx, engine.Order{
+		AccountID: account.ID, MarketID: "m", Question: "q", Outcome: "Yes", TokenID: "t",
+		Kind: "auto", Type: "buy", Amount: 10, Price: 0.5, Shares: 20, Status: "rejected", CreatedAt: base,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected.ID == 0 {
+		t.Fatal("rejected order was not created")
+	}
+	filledAt := base.Add(time.Hour)
+	if _, err := repository.CreateOrder(ctx, engine.Order{
+		AccountID: account.ID, MarketID: "m", Question: "q", Outcome: "Yes", TokenID: "t",
+		Kind: "auto", Type: "buy", Amount: 10, Price: 0.5, Shares: 20, Status: "filled", CreatedAt: filledAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, err := repository.EarliestAutoBuyAt(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started == nil || started.Sub(filledAt).Abs() > time.Millisecond {
+		t.Fatalf("started at %v, want first filled %v", started, filledAt)
+	}
+}

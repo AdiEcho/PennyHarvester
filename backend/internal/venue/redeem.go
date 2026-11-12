@@ -42,5 +42,9 @@ type RedeemResult struct {
 // funded). Keeping them apart lets the UI say which one is missing instead of
 // failing at the last step of a settlement the operator already trusts.
 type Redeemer interface {
-	Redeem(ctx context.Context, request RedeemRequest) (RedeemResult, error)
+	// Redeem signs and broadcasts one redemption. onSigned is called immediately
+	// after signing and before the broadcast; an error from it prevents the
+	// send. The returned result keeps the hash on a post-signing failure so the
+	// caller can report an unknown transaction instead of inviting a retry.
+	Redeem(ctx context.Context, request RedeemRequest, onSigned ChainTxRecorder) (RedeemResult, error)
 }

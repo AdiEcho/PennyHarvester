@@ -220,7 +220,7 @@ func (r *Registry) Register(caps Capabilities, data MarketData, exec Executor) e
 	if _, exists := r.data[caps.Venue]; exists {
 		return fmt.Errorf("venue: %s is already registered", caps.Venue)
 	}
-	r.caps[caps.Venue] = caps
+	r.caps[caps.Venue] = cloneCapabilities(caps)
 	r.data[caps.Venue] = data
 	if exec != nil {
 		r.execs[caps.Venue] = exec
@@ -255,23 +255,37 @@ func (r *Registry) Executor(v market.Venue) Executor {
 
 // Capabilities returns the registered fact sheet for one venue. An unknown
 // venue yields the zero value plus false so callers can 404 instead of
-// inventing a currency.
+// inventing a currency. The returned value is a deep copy: a caller may edit
+// OrderTypes without changing the registry's copy or another caller's result.
 func (r *Registry) Capabilities(v market.Venue) (Capabilities, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	caps, ok := r.caps[v]
-	return caps, ok
+	return cloneCapabilities(caps), ok
 }
 
-// All returns every registered fact sheet in presentation order.
+// All returns every registered fact sheet in presentation order. Each
+// Capabilities is deep-copied for the same reason as Capabilities.
 func (r *Registry) All() []Capabilities {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]Capabilities, 0, len(r.order))
 	for _, v := range r.order {
-		out = append(out, r.caps[v])
+		out = append(out, cloneCapabilities(r.caps[v]))
 	}
 	return out
+}
+
+// cloneCapabilities copies the slices a caller could otherwise mutate through
+// a shared backing array. Capabilities currently owns only OrderTypes, but the
+// helper keeps the invariant explicit if another slice is added.
+func cloneCapabilities(caps Capabilities) Capabilities {
+	if caps.OrderTypes != nil {
+		orderTypes := make([]string, len(caps.OrderTypes))
+		copy(orderTypes, caps.OrderTypes)
+		caps.OrderTypes = orderTypes
+	}
+	return caps
 }
 
 // ErrNoExecutor is returned when a venue is registered read-only but a caller

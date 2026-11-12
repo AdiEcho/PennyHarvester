@@ -156,3 +156,42 @@ func TestMarketDefaultsKeepLegacyRowsPolymarket(t *testing.T) {
 		t.Fatalf("link URL = %q", got)
 	}
 }
+
+func TestCapabilitiesOrderTypesAreDeepCopied(t *testing.T) {
+	orderTypes := []string{"FAK", "FOK"}
+	registry := NewRegistry()
+	if err := registry.Register(Capabilities{
+		Venue:      market.VenuePolymarket,
+		OrderTypes: orderTypes,
+	}, fakeData{venue: market.VenuePolymarket}, nil); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Register must copy the caller's slice, not retain its backing array.
+	orderTypes[0] = "CALLER_MUTATED"
+	first, ok := registry.Capabilities(market.VenuePolymarket)
+	if !ok {
+		t.Fatal("polymarket capabilities missing")
+	}
+	if len(first.OrderTypes) != 2 || first.OrderTypes[0] != "FAK" {
+		t.Fatalf("caller mutation reached the registry: %v", first.OrderTypes)
+	}
+
+	// Every accessor must hand out a copy so one caller cannot change what the
+	// next caller reads.
+	first.OrderTypes[0] = "RETURNED_MUTATED"
+	second, _ := registry.Capabilities(market.VenuePolymarket)
+	if second.OrderTypes[0] != "FAK" {
+		t.Fatalf("mutating Capabilities result changed the next read: %v", second.OrderTypes)
+	}
+
+	all := registry.All()
+	if len(all) != 1 || len(all[0].OrderTypes) != 2 {
+		t.Fatalf("All() = %#v", all)
+	}
+	all[0].OrderTypes[1] = "ALL_MUTATED"
+	again := registry.All()
+	if again[0].OrderTypes[1] != "FOK" {
+		t.Fatalf("mutating All result changed the next read: %v", again[0].OrderTypes)
+	}
+}

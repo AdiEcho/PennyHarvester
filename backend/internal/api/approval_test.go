@@ -36,7 +36,7 @@ func (a *approverLive) ApprovalState(context.Context) (venue.Approval, error) {
 	}, nil
 }
 
-func (a *approverLive) GrantApprovals(context.Context) (venue.Approval, error) {
+func (a *approverLive) GrantApprovals(context.Context, venue.ChainTxRecorder) (venue.Approval, error) {
 	a.granted++
 	approval, _ := a.ApprovalState(context.Background())
 	approval.Allowance = 12.5

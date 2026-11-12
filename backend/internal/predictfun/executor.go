@@ -112,6 +112,14 @@ func (e *Executor) Testnet() bool {
 	return e.client.Testnet()
 }
 
+// ChainID identifies the chain a journaled transaction belongs to.
+func (e *Executor) ChainID() int64 {
+	if e == nil || e.client == nil {
+		return 0
+	}
+	return e.client.ChainID()
+}
+
 // BaseURL reports the endpoint in use.
 func (e *Executor) BaseURL() string {
 	if e == nil || e.client == nil {
@@ -312,6 +320,10 @@ func (e *Executor) ReadyError() string {
 // is an explicit call: silently spending gas inside an order path would make a
 // trade fail differently depending on the wallet's history.
 func (e *Executor) EnsureApprovals(ctx context.Context) error {
+	return e.ensureApprovals(ctx, nil)
+}
+
+func (e *Executor) ensureApprovals(ctx context.Context, onSigned venue.ChainTxRecorder) error {
 	chain, err := e.chainNow()
 	if err != nil {
 		return err
@@ -319,7 +331,7 @@ func (e *Executor) EnsureApprovals(ctx context.Context) error {
 	if e.client.current().key == nil {
 		return fmt.Errorf("Predict.fun 实盘未配置：缺少 PREDICTFUN_PRIVATE_KEY")
 	}
-	if err := chain.EnsureApprovals(ctx); err != nil {
+	if err := chain.EnsureApprovals(ctx, onSigned); err != nil {
 		return err
 	}
 	// Re-read the state instead of only dropping the timestamp: ReadyError and
@@ -354,10 +366,20 @@ func (e *Executor) Approvals(ctx context.Context) (ApprovalState, error) {
 	return chain.Allowance(ctx)
 }
 
+// TransactionStatus resolves a journaled hash through the same RPC the chain
+// adapter uses. A missing receipt is an error, not a guess.
+func (e *Executor) TransactionStatus(ctx context.Context, hash string) (confirmed, reverted bool, err error) {
+	chain, err := e.chainNow()
+	if err != nil {
+		return false, false, err
+	}
+	return chain.TransactionStatus(ctx, hash)
+}
+
 // Redeem burns settled outcome shares back into USDT. It is the venue.Redeemer
 // capability: deliberately separate from Buying and Selling, because claiming is
 // a different permission (and a different gas bill) from trading.
-func (e *Executor) Redeem(ctx context.Context, request venue.RedeemRequest) (venue.RedeemResult, error) {
+func (e *Executor) Redeem(ctx context.Context, request venue.RedeemRequest, onSigned venue.ChainTxRecorder) (venue.RedeemResult, error) {
 	if err := e.requireLive(); err != nil {
 		return venue.RedeemResult{}, err
 	}
@@ -392,7 +414,7 @@ func (e *Executor) Redeem(ctx context.Context, request venue.RedeemRequest) (ven
 		// shows, so the value that reaches the chain is the checked one.
 		Shares:  venue.Scale(request.Shares, venue.USDTDecimals),
 		NegRisk: meta.NegRisk,
-	})
+	}, onSigned)
 	result := venue.RedeemResult{
 		Venue:  market.VenuePredictFun,
 		Method: tx.Method,
@@ -433,8 +455,8 @@ func (e *Executor) ApprovalState(ctx context.Context) (venue.Approval, error) {
 // GrantApprovals sends the missing approvals and reports the resulting state.
 // Every transaction is sent from the configured wallet, so the wallet needs BNB
 // for gas before live trading can work.
-func (e *Executor) GrantApprovals(ctx context.Context) (venue.Approval, error) {
-	if err := e.EnsureApprovals(ctx); err != nil {
+func (e *Executor) GrantApprovals(ctx context.Context, onSigned venue.ChainTxRecorder) (venue.Approval, error) {
+	if err := e.ensureApprovals(ctx, onSigned); err != nil {
 		return venue.Approval{}, err
 	}
 	return e.ApprovalState(ctx)
@@ -449,6 +471,7 @@ func (e *Executor) approvalFrom(state ApprovalState) venue.Approval {
 	// but never approved any USDT, which cannot place a single order. Requiring a
 	// non-zero allowance matches what a buy actually needs.
 	ready := sharesReady && state.CollateralAllowance().Sign() > 0
+	redemptionReady := state.RedemptionApproved()
 	missing := ""
 	switch {
 	case !sharesReady:
@@ -463,7 +486,10 @@ func (e *Executor) approvalFrom(state ApprovalState) venue.Approval {
 		Allowance:   allowance,
 		SharesReady: sharesReady,
 		Ready:       ready,
-		Missing:     missing,
+		// Recovery must not treat the trading allowance as proof that a
+		// pending adapter approval was mined.
+		RedemptionReady: &redemptionReady,
+		Missing:         missing,
 	}
 }
 

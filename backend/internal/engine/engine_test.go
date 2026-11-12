@@ -2730,14 +2730,38 @@ type redeemLive struct {
 	*fakeLive
 	redemptions []venue.RedeemRequest
 	err         error
+	hash        string
+	statusFn    func(hash string) (bool, bool, error)
+	statusCalls []string
+	skipSigned  bool
 }
 
-func (r *redeemLive) Redeem(_ context.Context, request venue.RedeemRequest) (venue.RedeemResult, error) {
+func (r *redeemLive) signedHash() string {
+	if r.hash != "" {
+		return r.hash
+	}
+	return "0xredeemed"
+}
+
+func (r *redeemLive) Redeem(_ context.Context, request venue.RedeemRequest, onSigned venue.ChainTxRecorder) (venue.RedeemResult, error) {
 	r.redemptions = append(r.redemptions, request)
+	if onSigned != nil && !r.skipSigned {
+		if err := onSigned(venue.ChainTxSigned{Hash: r.signedHash(), From: r.Signer(), Nonce: 1, ChainID: 97}); err != nil {
+			return venue.RedeemResult{}, err
+		}
+	}
 	if r.err != nil {
 		return venue.RedeemResult{}, r.err
 	}
-	return venue.RedeemResult{Venue: market.VenuePredictFun, TxHash: "0xredeemed", Method: "ctf"}, nil
+	return venue.RedeemResult{Venue: market.VenuePredictFun, TxHash: r.signedHash(), Method: "ctf"}, nil
+}
+
+func (r *redeemLive) TransactionStatus(_ context.Context, hash string) (bool, bool, error) {
+	r.statusCalls = append(r.statusCalls, hash)
+	if r.statusFn != nil {
+		return r.statusFn(hash)
+	}
+	return false, false, errors.New("receipt not found")
 }
 
 // TestRedeemPositionBurnsSettledSharesOnce covers the money path: a live position
@@ -3397,5 +3421,46 @@ func TestBatchMissingMarketIsExplicitError(t *testing.T) {
 	}
 	if positions.Total != 1 {
 		t.Fatalf("position was settled from a missing batch response: %+v", positions.Items)
+	}
+}
+
+// A position can leave the radar while still open. Stop-loss must use the fee
+// rate from the fresh scan instead of falling back to the account default.
+func TestPaperStopLossUsesScannedFeeRateAfterRadarDrop(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{"fee-market": binary("fee-market", 0.98, 20000, 2)}}
+	item := provider.markets["fee-market"]
+	item.FeeRateBPS = 200
+	provider.markets["fee-market"] = item
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	position, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+		MarketID: "fee-market", Outcome: "Yes", TokenID: "fee-market-yes", Amount: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	settings := instance.Settings()
+	settings.StopLossEnabled = true
+	settings.StopLossRatio = 0.80
+	if err := instance.UpdateSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	drop := provider.markets["fee-market"]
+	drop.Outcomes[0].Price = 0.70
+	drop.Outcomes[1].Price = 0.30
+	provider.markets["fee-market"] = drop
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sold, err := instance.Positions(ctx, paper.ID, "sold", "")
+	if err != nil || sold.Total != 1 {
+		t.Fatalf("stop-loss did not close: %+v err=%v", sold, err)
+	}
+	closed := sold.Items[0]
+	wantFee := closed.CurrentPrice * closed.Shares * 200 / 10000
+	if math.Abs(closed.Fee-(position.Fee+wantFee)) > 1e-9 {
+		t.Fatalf("sell fee = %v, want scanned 200bps fee %.6f (position fee %v)", closed.Fee, wantFee, position.Fee)
 	}
 }

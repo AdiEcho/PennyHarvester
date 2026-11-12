@@ -22,6 +22,11 @@ type Approval struct {
 	SharesReady bool `json:"shares_ready"`
 	// Ready is true when nothing has to be granted any more.
 	Ready bool `json:"ready"`
+	// RedemptionReady optionally reports whether the venue's redemption path is
+	// fully approved. Nil means the venue does not distinguish it from Ready.
+	// Recovery uses it to avoid treating a trading approval as proof that a
+	// pending redemption approval landed.
+	RedemptionReady *bool `json:"-"`
 	// Missing names what still has to be approved, in the user's language.
 	Missing string `json:"missing,omitempty"`
 }
@@ -33,6 +38,9 @@ type Approver interface {
 	// ApprovalState reads the current allowances. It is read-only.
 	ApprovalState(ctx context.Context) (Approval, error)
 	// GrantApprovals sends the missing approval transactions and returns the
-	// resulting state. It spends gas from the venue's own wallet.
-	GrantApprovals(ctx context.Context) (Approval, error)
+	// resulting state. It spends gas from the venue's own wallet. onSigned is
+	// called for every transaction immediately after signing and before the
+	// broadcast; a callback error aborts the batch before that transaction is
+	// sent. Earlier transactions in the batch stay confirmed.
+	GrantApprovals(ctx context.Context, onSigned ChainTxRecorder) (Approval, error)
 }

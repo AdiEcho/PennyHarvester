@@ -647,3 +647,23 @@ func TestExecutorRejectsSmartWalletMaker(t *testing.T) {
 		t.Fatal("expected the EOA-only guard to reject the order")
 	}
 }
+
+func TestApprovalFromKeepsRedemptionReadinessExplicit(t *testing.T) {
+	executor := &Executor{}
+	state := ApprovalState{
+		CollateralBalance: big.NewInt(0),
+		ExchangeAllowance: big.NewInt(1),
+		NegRiskAllowance:  big.NewInt(1),
+		ExchangeApproved:  true,
+		NegRiskApproved:   true,
+	}
+	approval := executor.approvalFrom(state)
+	if !approval.Ready || approval.RedemptionReady == nil || *approval.RedemptionReady {
+		t.Fatalf("trading readiness leaked into redemption readiness: %+v", approval)
+	}
+	state.AdapterApproved = true
+	approval = executor.approvalFrom(state)
+	if approval.RedemptionReady == nil || !*approval.RedemptionReady {
+		t.Fatalf("redemption readiness = %+v", approval.RedemptionReady)
+	}
+}

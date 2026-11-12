@@ -18,6 +18,17 @@ export function usePolling<T>(
   const previousFetcher = useRef(fetcher)
 
   const refresh = useCallback(() => setRefreshKey((key) => key + 1), [])
+  // Update the accepted response after a successful mutation so the UI does not
+  // keep a second, permanently permissive copy of server state. The next poll
+  // still replaces this value with the authoritative response.
+  const mutate = useCallback((update: T | ((current: T | null) => T | null)) => {
+    setData((current) => {
+      const next = typeof update === 'function' ? (update as (value: T | null) => T | null)(current) : update
+      if (next === null) return current
+      dataRef.current = next
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     if (previousFetcher.current !== fetcher) {
@@ -92,5 +103,5 @@ export function usePolling<T>(
     }
   }, [fetcher, interval, enabled, refreshKey])
 
-  return { data, error, isLoading, isRefreshing, refresh }
+  return { data, error, isLoading, isRefreshing, refresh, mutate }
 }

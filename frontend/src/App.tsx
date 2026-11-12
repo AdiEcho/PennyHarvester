@@ -1,13 +1,15 @@
-import { useState } from 'react'
+import { lazy, Suspense, useState } from 'react'
 import { AuthGate } from '@/components/auth-gate'
 import { AppShell, type View } from '@/components/app-shell'
 import { AccountProvider } from '@/lib/account-context'
-import { DashboardView } from '@/views/dashboard'
-import { OpportunitiesView } from '@/views/opportunities'
-import { PositionsView } from '@/views/positions'
-import { OrdersView } from '@/views/orders'
-import { SettingsView } from '@/views/settings'
-import { SystemView } from '@/views/system'
+import { LoadingBlock } from '@/components/ui/feedback'
+
+const DashboardView = lazy(() => import('@/views/dashboard').then((module) => ({ default: module.DashboardView })))
+const OpportunitiesView = lazy(() => import('@/views/opportunities').then((module) => ({ default: module.OpportunitiesView })))
+const PositionsView = lazy(() => import('@/views/positions').then((module) => ({ default: module.PositionsView })))
+const OrdersView = lazy(() => import('@/views/orders').then((module) => ({ default: module.OrdersView })))
+const SettingsView = lazy(() => import('@/views/settings').then((module) => ({ default: module.SettingsView })))
+const SystemView = lazy(() => import('@/views/system').then((module) => ({ default: module.SystemView })))
 
 export default function App() {
   const [view, setView] = useState<View>('dashboard')
@@ -21,12 +23,14 @@ export default function App() {
     <AuthGate>
       <AccountProvider>
         <AppShell view={view} onNavigate={navigate}>
-          {view === 'dashboard' && <DashboardView onOpenOrders={() => navigate('orders')} />}
-          {view === 'opportunities' && <OpportunitiesView onOrderCreated={() => navigate('positions')} />}
-          {view === 'positions' && <PositionsView />}
-          {view === 'orders' && <OrdersView />}
-          {view === 'settings' && <SettingsView />}
-          {view === 'system' && <SystemView />}
+          <Suspense fallback={<LoadingBlock />}>
+            {view === 'dashboard' && <DashboardView onOpenOrders={() => navigate('orders')} />}
+            {view === 'opportunities' && <OpportunitiesView onOrderCreated={() => navigate('positions')} />}
+            {view === 'positions' && <PositionsView />}
+            {view === 'orders' && <OrdersView />}
+            {view === 'settings' && <SettingsView />}
+            {view === 'system' && <SystemView />}
+          </Suspense>
         </AppShell>
       </AccountProvider>
     </AuthGate>

@@ -38,6 +38,7 @@ import type {
   VenueSystemPatch,
 } from '@/types'
 import { fmtMoney, VENUES, venueLabel, venueMeta } from '@/lib/venue'
+import { assessDetectedWallet, type WalletVerification } from '@/lib/wallet-verification'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -308,7 +309,7 @@ function EndpointSection({ system, draft, dirty, saving, busy, onChange, onDisca
   )
 }
 
-function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, revisionRef, onDraftEdit, onChange, onReset, onSave }: {
+function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, revisionRef, onDraftEdit, onChange, onReset, onSave, onWalletCheck }: {
   system: SystemSettings
   draft: LiveSettings
   dirty: boolean
@@ -320,6 +321,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
   onChange: (patch: Partial<LiveSettings>) => void
   onReset: () => void
   onSave: () => void
+  onWalletCheck: (check: WalletVerification) => void
 }) {
   // A stale request may finish after a newer one started. Revision suppresses
   // its data, but its finally must not clear the newer request's busy state.
@@ -352,6 +354,17 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
   const statusLabel = runtime.live_ready ? '凭据本地校验通过' : runtime.live_configured ? '已配置但未就绪' : '未配置实盘凭据'
   const mode = walletMode(draft, environment)
   const proxyType = effectiveSignatureType(draft, environment) === 0 ? 3 : effectiveSignatureType(draft, environment)
+  const walletCheck = assessDetectedWallet(
+    detection,
+    mode,
+    effectiveFunder(draft, environment),
+    effectiveSignatureType(draft, environment),
+  )
+  // The parent owns the save action, so it needs the same conservative
+  // verification result that this panel displays.
+  useEffect(() => {
+    onWalletCheck(walletCheck)
+  }, [onWalletCheck, walletCheck.canSubmit, walletCheck.label, walletCheck.reason, walletCheck.status])
   const clearCredentials = () => onChange({ api_key: '', api_secret: '', api_passphrase: '' })
   const environmentCredentialsSet = environment.api_key_set && environment.api_secret_set && environment.api_passphrase_set
   const environmentCredentialsPartial = (environment.api_key_set || environment.api_secret_set || environment.api_passphrase_set) && !environmentCredentialsSet
@@ -389,22 +402,27 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
         }
         return
       }
-      const nextType = result.wallet_type ?? 3
+      const nextType = result.wallet_type
       const nextFunder = result.funder ?? ''
       const currentType = draft.signature_type ?? environment.signature_type
       const currentFunder = draft.funder.trim()
+      const resultCheck = assessDetectedWallet(result, nextType === 0 ? 'eoa' : 'proxy', nextFunder || currentFunder, nextType ?? currentType)
       // Only touch the form when something actually differs, so an automatic
-      // check on page load cannot mark the section dirty.
-      if (nextType !== currentType || nextFunder.toLowerCase() !== currentFunder.toLowerCase()) {
+      // check on page load cannot mark the section dirty. An unresolved wallet
+      // type is not replaced with a guessed Deposit (3); the detection remains
+      // a candidate until the backend supplies explicit evidence.
+      if (nextType != null && (nextType !== currentType || nextFunder.toLowerCase() !== currentFunder.toLowerCase())) {
         onChange({ signature_type: nextType, funder: nextFunder })
       }
       if (!options.silent) {
         toast({
-          title: `已识别为${result.wallet_type_name || '代理钱包'}`,
-          description: nextFunder
+          title: resultCheck.status === 'verified' ? `钱包已验证：${result.wallet_type_name || '代理钱包'}` : resultCheck.status === 'not_required' ? '自托管 EOA 已识别' : '检测到候选钱包（未验证，请核对）',
+          description: resultCheck.status === 'verified'
             ? `${nextFunder}${result.deployed === false ? '（尚未在链上部署）' : ''}`
-            : '该私钥没有关联的 Polymarket 账户钱包，按自托管 EOA 处理，Funder 留空。',
-          variant: 'success',
+            : resultCheck.status === 'not_required'
+              ? '该私钥没有关联的 Polymarket 账户钱包，Funder 留空。'
+              : `${nextFunder || '未返回地址'}。${resultCheck.reason}`,
+          variant: resultCheck.status === 'verified' || resultCheck.status === 'not_required' ? 'success' : 'info',
         })
       }
     } catch (caught) {
@@ -428,10 +446,13 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
     || /^0x[0-9a-fA-F]{64}$/.test(privateKeyValue)
   const detectionKey = usingEnvironmentKey ? '__environment__' : privateKeyValue
   const previousKeyRef = useRef(detectionKey)
-  // Editing the key re-enables auto-detection even after a manual mode choice.
+  // Editing the key re-enables auto-detection even after a manual mode choice,
+  // and invalidates any previous signer/ownership evidence immediately. Until
+  // the new key is detected and verified, the save action stays blocked.
   useEffect(() => {
     if (previousKeyRef.current === detectionKey) return
     previousKeyRef.current = detectionKey
+    setDetection(null)
     setManualMode(false)
   }, [detectionKey])
   useEffect(() => {
@@ -587,7 +608,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
               <Button variant="secondary" size="sm" onClick={() => onChange({ private_key: '' })}>清除</Button>
             )}
           </div>
-          <p className="mt-1.5 text-xs leading-4 text-slate-400">填入完整私钥后会自动识别钱包类型（EOA / Proxy / Safe / Deposit）并填好 Funder，也可点「自动识别」重试。识别结果只填表，保存后才落库。</p>
+          <p className="mt-1.5 text-xs leading-4 text-slate-400">填入完整私钥后会自动识别候选钱包类型（EOA / Proxy / Safe / Deposit）并填好 Funder，也可点「自动识别」重试。字节码形态只是候选线索；未验证的候选钱包不能保存为实盘配置。</p>
           {draft.private_key === REDACTED_SECRET && <p className="mt-1.5 text-xs text-slate-400">已保存的私钥不会回显。直接输入新值会覆盖，点击「清除」可恢复环境变量。</p>}
         </div>
 
@@ -624,7 +645,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
               />
               <Button variant="secondary" size="sm" onClick={() => void detectWallet()} loading={detectingWallet} disabled={busy}>自动检测</Button>
             </div>
-            <p className="mt-1.5 text-xs leading-4 text-slate-400">「自动检测」先用 Polymarket 公开资料把私钥地址解析成账户钱包，再用链上字节码判断它是 Proxy / Safe / Deposit 钱包；查不到时用 CREATE2 推导旧版 Proxy / Safe 地址做链上校验。检测只读，不会保存、派生 L2 凭据或下单。链上校验使用 <code className="break-all rounded bg-slate-100 px-1">{environment.polygon_rpc_url || 'https://polygon-bor-rpc.publicnode.com'}</code>（可用环境变量 POLYGON_RPC_URL 覆盖）。</p>
+            <p className="mt-1.5 text-xs leading-4 text-slate-400">「自动检测」先用 Polymarket 公开资料把私钥地址解析成账户钱包，再读取链上字节码作为候选线索；查不到时用 CREATE2 推导旧版 Proxy / Safe 地址做链上校验。候选是否属于当前私钥、实现合约与 owner 必须由后端显式核对后才能保存；检测只读，不会保存、派生 L2 凭据或下单。链上校验使用 <code className="break-all rounded bg-slate-100 px-1">{environment.polygon_rpc_url || 'https://polygon-bor-rpc.publicnode.com'}</code>（可用环境变量 POLYGON_RPC_URL 覆盖）。</p>
           </div>
         ) : (
           <div className="lg:col-span-3 rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs leading-5 text-slate-500">
@@ -633,31 +654,48 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
         )}
       </div>
 
+      {!detection && mode === 'proxy' && (
+        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900" role="status">
+          <p className="font-medium">代理钱包未验证，请核对</p>
+          <p className="mt-1">请先自动检测钱包。后端必须返回链、已知实现合约、解码后的 owner 与 signer 证据后，才能保存实盘配置。</p>
+        </div>
+      )}
+
       {detection && (
         <div className={cn(
           'mt-4 rounded-xl border px-4 py-3 text-xs leading-5',
           detection.ok
-            ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+            ? walletCheck.status === 'verified' || walletCheck.status === 'not_required'
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+              : 'border-amber-200 bg-amber-50 text-amber-900'
             : mode === 'eoa'
               ? 'border-slate-200 bg-slate-50 text-slate-600'
               : 'border-amber-200 bg-amber-50 text-amber-900',
         )} role="status">
           {detection.ok ? (
             <div className="space-y-1">
-              <p className="font-medium">钱包自动识别：{detection.wallet_type_name || '代理钱包'} · 来源 {walletSourceLabels[detection.source ?? ''] || detection.source || '—'}{detection.deployed === false ? ' · 链上尚未部署' : ''}</p>
+              <p className="font-medium">
+                {walletCheck.status === 'verified'
+                  ? `钱包已验证：${detection.wallet_type_name || '代理钱包'}`
+                  : walletCheck.status === 'not_required'
+                    ? '自托管 EOA：无需验证代理钱包'
+                    : `候选钱包（${walletCheck.label}）：${detection.wallet_type_name || '未知类型'} · 来源 ${walletSourceLabels[detection.source ?? ''] || detection.source || '—'}${detection.deployed === false ? ' · 链上尚未部署' : ''}`}
+              </p>
+              {walletCheck.status !== 'verified' && walletCheck.status !== 'not_required' && <p>{walletCheck.reason}</p>}
+              {walletCheck.status === 'verified' && <p>Polygon 137 · implementation 与 owner/signer 已核对。</p>}
               {detection.signer && <p className="break-all font-mono">Signer {detection.signer}</p>}
               {detection.funder
                 ? <p className="break-all font-mono">Funder {detection.funder}</p>
                 : <p>该私钥没有关联的 Polymarket 账户钱包，按自托管 EOA 处理（Funder 留空）。</p>}
               {(detection.candidates ?? []).length > 1 && (
-                <p>共 {(detection.candidates ?? []).length} 个关联钱包，已填入第一个；其余：{(detection.candidates ?? []).slice(1).map((candidate) => `${candidate.address.slice(0, 6)}…${candidate.address.slice(-4)}（${candidate.wallet_type_name}）`).join('、')}</p>
+                <p>共 {(detection.candidates ?? []).length} 个关联钱包；其余：{(detection.candidates ?? []).slice(1).map((candidate) => `${candidate.address.slice(0, 6)}…${candidate.address.slice(-4)}（${candidate.wallet_type_name}）`).join('、')}</p>
               )}
               {(detection.notes ?? []).map((note) => <p key={note} className="text-amber-700">{note}</p>)}
             </div>
           ) : (
             <div className="space-y-1">
               <p className="font-medium">
-                {mode === 'eoa' ? '该私钥没有关联的 Polymarket 账户钱包' : '未能自动识别钱包'}
+                {mode === 'eoa' ? '该私钥没有关联的 Polymarket 账户钱包' : '未能自动识别钱包（未验证，请核对）'}
               </p>
               {mode === 'eoa' && <p>自托管 EOA 模式下这属于正常情况：资金与签名都在私钥地址上，Funder 留空即可。</p>}
               <p className="break-words">{detection.error || '请检查私钥、网络出口与 Polymarket 接口地址。'}</p>
@@ -1166,6 +1204,7 @@ export function SystemView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [savingSection, setSavingSection] = useState<SaveKey | null>(null)
+  const [liveWalletCheck, setLiveWalletCheck] = useState<WalletVerification | null>(null)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<ProxyTestResult | null>(null)
   const { capabilityOf } = useVenues()
@@ -1337,6 +1376,17 @@ export function SystemView() {
       toast({ title: '实盘设置未保存', description: validation, variant: 'error' })
       return
     }
+    // Detection is only a candidate until the backend returns chain,
+    // implementation, owner and signer evidence. Saving an unverified proxy
+    // wallet would make bytecode shape look like proof of ownership.
+    if (walletMode(pmLive, system.runtime.live_environment) === 'proxy' && liveWalletCheck?.status !== 'verified') {
+      toast({
+        title: '实盘设置未保存：代理钱包未验证，请核对',
+        description: liveWalletCheck?.reason || '请先自动检测钱包，并等待后端返回链、implementation、owner 与 signer 证据。',
+        variant: 'error',
+      })
+      return
+    }
     // Flat `live` only, for the same reason as the endpoint card: clearing a
     // credential has to clear it, and the backend dual-writes the venue entry.
     void saveSection('live:polymarket', { live: pmLive }, '实盘设置已保存', 'Polymarket CLOB 客户端已按新凭据重建。若状态未就绪，请查看上方错误提示。')
@@ -1504,6 +1554,7 @@ export function SystemView() {
                   onChange={updateLive}
                   onReset={resetLive}
                   onSave={saveLive}
+                  onWalletCheck={setLiveWalletCheck}
                 />
               )}
             </>

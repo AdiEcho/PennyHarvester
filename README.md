@@ -18,7 +18,7 @@
 系统内置「实盘」与「模拟」两套完全隔离的账本，首次启动时会自动创建默认账户：
 
 - **实盘账户（默认，`mode=live`）**
-  通过网页「系统设置」或服务端环境变量提供的私钥派生 CLOB L2 API 凭据，使用 EIP-712 签名向 Polymarket 提交真实订单。每个实例仅允许存在一个实盘账户，且不可删除。若未配置私钥，实盘下单会被明确拦截并提示原因，**绝不会静默回退到模拟盘**，避免误判交易状态。
+  通过网页「系统设置」或服务端环境变量提供的私钥派生 CLOB L2 API 凭据，使用 EIP-712 签名向 Polymarket 提交真实订单。**每个场所最多存在一个实盘账户**（Polymarket 与 Predict.fun 各一个，账本与凭据彼此独立），实盘账户不可删除。若未配置私钥，实盘下单会被明确拦截并提示原因，**绝不会静默回退到模拟盘**，避免误判交易状态。
 - **模拟账户（`mode=paper`）**
   实时同步 Polymarket 公开行情，但使用虚拟资金在本地 SQLite 中记账，按可配置的滑点、手续费与风控规则模拟撮合，不会发出任何真实订单。支持创建多个模拟账户以对比不同参数方案；删除模拟账户时会一并清理其持仓、订单和净值记录。
 - **独立隔离与安全开关**
@@ -32,11 +32,12 @@
 
 - **默认只启用 Polymarket**。Predict.fun 必须显式开启（`PREDICTFUN_ENABLED=1`，或在「系统设置 → Predict.fun」中启用）：一旦开启，注册表里没有条目的场所既不会被扫描也不会被下单，因此升级本身不会让系统开始交易新场所。
 - **账户绑定场所，创建后不可更改**。每个账户属于一个场所，持仓、订单、净值与指标都带 `venue` + `currency`，接口与界面均支持按场所筛选（`?venue=polymarket|predictfun`）。**不同场所的金额永不求和**：USDC（6 位小数）与 USDT（18 位小数）各自独立展示，跨场所加总只会得到没有意义的数字。
-- **币种与精度分离**。Polymarket 结算币为 USDC（6 位小数），Predict.fun 为 USDT（18 位小数）；Predict.fun 的下单金额在内部以 `big.Int` 按最小单位（wei）计算，绝不经过 `float64`，并根据市场 `decimalPrecision` 向下量化价位。
+- **币种与精度分离**。Polymarket 结算币为 USDC（6 位小数），Predict.fun 为 USDT（18 位小数）；Predict.fun 的金额、份额与签名价格均以最小单位整数计算，价格按 18 位小数（wei）传给下单接口，绝不把浮点数直接写入签名请求，并根据市场 `decimalPrecision` 量化价位。
 - **费用模型按场所分派**。Polymarket 沿用历史口径 `费率 × 名义额`；Predict.fun 按官方公式 `费率 × min(价格, 1 − 价格) × 份额`，因此低价盘口的真实成本远低于名义额比例。
 - **策略参数按账户独立，再按场所细分**。每个账户保存自己的一份参数（`account_settings` 表）：价格区间、流动性、分类与体育策略、尾盘窗口、止损、单笔金额与敞口都只作用于该账户，切换账户不会串用配置。每个场所还可单独覆写开关、单笔金额、单账户最大持仓、场所总敞口与费率；单事件敞口上限（`max_event_exposure`）只按账户设置，用于约束同一场选举或同一场比赛下所有盘口的合计投入；留空即继承该账户「策略」页的值。尚未保存过参数的账户实时继承全局默认模板（`settings` 表），新建账户也以该模板为起点。
-- **Predict.fun 当前支持**：只读行情与报价（无需任何凭据）、限价/市价买入、持仓与余额查询、按币种计价的手续费与收益测算、**自动结算**（Predict.fun 公布获胜结果后，引擎把胜方记 1.00、负方记 0.00、平局记 0.50 并关账）、**链上赎回**（对已结算仓位提交 `redeemPositions` 交易取回 USDT，见下文）、测试网（`PREDICTFUN_TESTNET=1`）。
+- **Predict.fun 当前支持**：只读行情与报价（无需任何凭据）、限价/市价买入、市价止损卖出、持仓与余额查询、按币种计价的手续费与收益测算、**自动结算**（Predict.fun 公布获胜结果后，引擎把胜方记 1.00、负方记 0.00、平局记 0.50 并关账）、**链上赎回**（对已结算仓位提交 `redeemPositions` 交易取回 USDT，见下文）、测试网（`PREDICTFUN_TESTNET=1`）。卖单同样受最小名义额、份额精度与止损份额门槛约束。
 - **Predict.fun 暂不支持**：代理钱包签名（当前要求 EOA 私钥与 maker 一致；Kernel 域包装的签名格式已有调研记录但未实现）、链上合并/转换（`merge`/`convert`）、WebSocket 盘口订阅（走轮询）。赎回由本系统**代发交易**，签名地址必须有 BNB 支付 gas；neg-risk 市场的赎回还需要先在「系统设置 → Predict.fun」执行一次链上授权（授权 NegRiskAdapter 划转结果份额）。
+- **链上操作身份**：授权与赎回在签名后、广播前写入 `chain_operations`（from、nonce、tx hash、状态）；广播/回执未知保持 `unknown` 并阻塞重试，系统不会用新 nonce 自动重发。需要人工按交易哈希核对链上结果。
 - **合约与签名**：Predict.fun 订单使用 EIP-712（域名为 `predict.fun CTF Exchange`，链 ID 56 / 测试网 97），合约地址由官方 SDK 的 `Constants.ts` 生成到 `backend/internal/predictfun/addresses.go`（**生成文件，请勿手改**）。首次实盘前需要为交易所合约授权 USDT 与 ERC1155（`EnsureApprovals`，当前通过代码/接口触发，不静默自动授权）。
 
 ---
@@ -80,8 +81,8 @@
 
 ### 5. 系统设置（接口、实盘凭据、网络代理与访问密码）
 - **行情与交易接口**：在「系统设置」页直接修改 Gamma 行情地址与 CLOB 交易地址，支持自建镜像或本地代理。保存后新的行情与交易请求立即使用新地址，无需重启；留空则继承环境变量或官方默认值。
-- **网页配置实盘凭据**：钱包私钥、签名类型、Funder 以及可选的 CLOB L2 API Key / Secret / Passphrase 都可以在网页中填写。网页值优先于启动环境变量；私钥与 L2 Secret 使用 AES-256-GCM 加密保存在 SQLite，读取时只返回 `******` 掩码，前端原样回传时后端自动还原。
-- **钱包类型自动识别**：填入私钥后系统会自动把地址解析成 Polymarket 账户钱包并判断钱包类型（`0` EOA / `1` Proxy / `2` Safe / `3` Deposit Wallet），同时填入 Funder，无需自己猜签名类型。识别来源依次为 Polymarket 公开资料（Gamma `/public-profile` 的 `proxyWallet`）与链上 CREATE2 推导（CLOB 的 `/auth/get-proxy-wallets` 已下线并返回 404，系统不再调用它）（旧版 Proxy / Safe / Deposit 地址逐个用 `eth_getCode` 校验），再用字节码特征（EIP-1167 克隆 → Proxy，ERC-1967 / Beacon 克隆或 EIP-7702 委托 → Deposit，`getOwners()` → Safe）确认类型。检测只读，不保存、不派生 L2 凭据、不下单。
+- **网页配置实盘凭据**：钱包私钥、签名类型、Funder 以及可选的 CLOB L2 API Key / Secret / Passphrase 都可以在网页中填写。网页值优先于启动环境变量；私钥、API Key、L2 Secret 与 Passphrase 均使用 AES-256-GCM 加密保存在 SQLite，读取时只返回 `******` 掩码，前端原样回传时后端自动还原。API Key 虽然是标识符，也按秘密处理。
+- **钱包类型自动识别**：填入私钥后系统会自动把地址解析成 Polymarket 账户钱包并判断钱包类型（`0` EOA / `1` Proxy / `2` Safe / `3` Deposit Wallet），同时填入 Funder，无需自己猜签名类型。识别来源依次为 Polymarket 公开资料（Gamma `/public-profile` 的 `proxyWallet`）与链上 CREATE2 推导（CLOB 的 `/auth/get-proxy-wallets` 已下线并返回 404，系统不再调用它）。只有命中已知工厂、链 ID 与 owner/signer 证据完整时才标记为**已验证**；仅凭 EIP-1167 / EIP-7702 / EIP-1967 字节码形状或无法解码的 Safe owners 数据只算**候选**，界面会提示「未验证，请核对」，不会据此放行实盘。检测只读，不保存、不派生 L2 凭据、不下单。
 - **网络出口代理**：在「系统设置」页统一配置后端访问 Polymarket 的出口，支持「跟随环境变量（`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`）」「自定义代理（http / https / socks5，支持 `NO_PROXY` 白名单）」「直连（忽略环境变量）」三种模式。修改后立即应用到 Gamma 行情与 CLOB 实盘请求，无需重启；配置保存在本机 SQLite 的 `system_settings` 表。
 - **代理连通性测试**：保存前可用「测试连接」按钮通过当前表单配置探测 `https://clob.polymarket.com/time`，返回状态码与耗时；测试不会保存设置。
 - **代理凭据保护**：代理地址中的密码在读取时以 `******` 掩码返回，前端原样回传时后端会自动还原，避免误清空密钥。
@@ -298,10 +299,10 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 `POST /system/live/funder`（网页「系统设置 → 实盘交易凭据 → 自动检测」）只需要私钥，不保存设置、不派生 L2 凭据、不下单：
 
-1. **Polymarket 公开资料**（首选）：`GET {Gamma}/public-profile?address=<私钥地址>` 返回该账户的 `proxyWallet`。这是官方索引的 账户 EOA → 账户钱包 映射，新注册的 Deposit 钱包也能直接查到。
-2. **CLOB 关联钱包接口**（已下线，仅兼容自建实例）：`GET /auth/get-proxy-wallets` 在官方 CLOB 上返回 `404 page not found`，因此该来源失败只作为提示，不再当作错误。
-3. **链上 CREATE2 推导**：用签名的 EOA 推导旧版 Proxy（`0xaB45…4052`，`salt = keccak256(abi.encodePacked(eoa))`）、Safe（`0xaacF…541b`，`salt = keccak256(abi.encode(eoa))`）与 Deposit 钱包（`0x0000…3Cc07`，`walletId = bytes32(eoa)`、`salt = keccak256(abi.encode(factory, walletId))`），再用 `eth_getCode` 确认哪个已部署。未命中时按官方默认（Deposit Wallet）处理。
-4. **类型确认**：EIP-1167 克隆 → Proxy（`1`）；ERC-1967 / Beacon 克隆或 EIP-7702 委托 → Deposit（`3`）；`getOwners()` 有返回 → Safe（`2`）；推导地址直接命中则以推导结果为准。
+1. **Polymarket 公开资料**：`GET {Gamma}/public-profile?address=<私钥地址>` 返回该账户的 `proxyWallet`。这是官方索引的 账户 EOA → 账户钱包 映射，但它只证明「平台这样映射」，不能单独证明链上合约归属。
+2. **链上 CREATE2 推导**：用签名的 EOA 推导旧版 Proxy（`0xaB45…4052`，`salt = keccak256(abi.encodePacked(eoa))`）、Safe（`0xaacF…541b`，`salt = keccak256(abi.encode(eoa))`）与 Deposit 钱包（`0x0000…3Cc07`，`walletId = bytes32(eoa)`、`salt = keccak256(abi.encode(factory, walletId))`），再用 `eth_getCode` 确认已部署。地址与已知工厂推导完全一致，才算工厂证据。
+3. **owner 核对**：公开资料返回但未命中推导的地址，必须再通过 `owner()`（Deposit）或 1-of-1 `getOwners()`（Safe）解出 owner，且 owner 等于私钥地址，才算 owner 证据。EIP-1167 / EIP-7702 / ERC-1967 的字节码形状本身只是候选线索。
+4. **验证状态**：只有 `verified=true`、Polygon chainId `137`、已部署、owner/signer 一致、地址与当前 Funder 一致、钱包类型与签名类型一致时，网页才允许保存代理实盘账户；否则显示「未验证，请核对」并阻止保存。检测只读，不保存、不派生 L2 凭据、不下单。
 
 链上只读调用默认走公共 Polygon RPC `https://polygon-bor-rpc.publicnode.com`，可用 `POLYGON_RPC_URL` 换成自己的节点（同样受「网络出口代理」设置约束）。若公开资料与链上校验都查不到，说明该钱包还没有在 polymarket.com 登录过，需要先用它登录一次让平台创建账户钱包。
 
@@ -354,11 +355,11 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `PREDICTFUN_API_KEY` | 空 | Predict.fun API Key 的可选回退值；只读行情无需填写，实盘下单必需；也可在网页中加密保存 |
 | `PREDICTFUN_PRIVATE_KEY` | 空 | Predict.fun 实盘签名私钥的可选回退值；也可在网页中加密保存（**务必使用专用小额热钱包**） |
 | `PREDICTFUN_SMART_WALLET` | 空 | 代理/智能钱包地址（可选）；当前版本要求签名者与 maker 一致，留空即用签名地址 |
-| `PREDICTFUN_RPC_URL` | `https://bsc-dataseed.bnbchain.org` | BNB Chain 只读 RPC，用于查询 USDT/ERC1155 授权与余额 |
+| `PREDICTFUN_RPC_URL` | 空（按网络选择 BNB Chain 公共 RPC） | Predict.fun 只读/签名交易 RPC，用于授权、余额、赎回与回执查询；启动时会校验 `chainId` 与所选网络一致 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 仅当代理模式为「跟随环境变量」（默认）时生效；由 Go 标准库在首次请求时读取并缓存 |
 | `NO_PROXY` | 空 | 仅当代理模式为「跟随环境变量」时生效，逗号分隔的主机/域名列表 |
 
-> **安全提醒**：本项目不会自动加载 `.env` 文件，请通过 Shell 或进程管理器注入环境变量。后端默认不设身份认证，**请勿直接暴露在公网环境**；如需远程访问，请先在「系统设置」中启用访问密码，并自行配置 TLS 反向代理与网络访问控制。私钥等同于钱包资产控制权，请务必使用专用的小额热钱包并严格限制宿主机权限。网页保存的实盘私钥与 L2 Secret 会加密写入 SQLite，但数据库旁的 `<DATABASE_PATH>.key` 密钥文件仍是敏感文件，请与数据库一同保护。
+> **安全提醒**：本项目不会自动加载 `.env` 文件，请通过 Shell 或进程管理器注入环境变量。后端默认不设身份认证，**请勿直接暴露在公网环境**；如需远程访问，请先在「系统设置」中启用访问密码，并自行配置 TLS 反向代理与网络访问控制。私钥等同于钱包资产控制权，请务必使用专用的小额热钱包并严格限制宿主机权限。网页保存的实盘私钥、API Key、L2 Secret 与 Passphrase 会加密写入 SQLite，但数据库旁的 `<DATABASE_PATH>.key` 密钥文件仍是敏感文件，请与数据库一同保护。
 
 > **代理说明**：出口代理的默认模式为「跟随环境变量」，与旧版本行为一致；进程启动时读取一次 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`（Go 标准库会缓存该环境）。若需要在不重启的情况下切换出口，请在「系统设置」中选择「自定义代理」或「直连」。
 
@@ -371,7 +372,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/venues` | 获取已注册场所的能力声明（`currency`、`quote_decimals`、`min_notional`、`min_sell_shares`、`order_types`、`supports_settlement`、`supports_redeem`、`testnet`、`read_only`），前端据此决定币种符号、精度与是否显示结算/赎回相关文案 |
-| `POST` | `/accounts/:id/positions/:positionId/redeem` | 对已结算仓位提交链上赎回交易（当前仅 Predict.fun），返回 `{venue, tx_hash, method}` |
+| `POST` | `/accounts/:id/positions/:positionId/redeem` | 对已结算仓位提交链上赎回交易（当前仅 Predict.fun），返回 `{venue, tx_hash, method}`；同一仓位已有活跃赎回时返回 409，不会重复发交易 |
 | `GET` | `/health` | 服务健康检查、默认账户模式、实盘配置与就绪状态 |
 | `GET` | `/accounts` | 获取所有账户列表（含实盘就绪状态、`signer` 与 `maker` 地址） |
 | `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper","venue":"predictfun","initial_bankroll":25000}`（`venue` 省略时默认为 `polymarket`，创建后不可更改；`initial_bankroll` 仅对模拟账户生效，省略或为 `0` 时使用当前账户策略里的默认资金，负数返回 400） |
@@ -461,7 +462,7 @@ npm run build
 - **平局退款（`split`）处理**：若市场按 `50/50` 分摊结算，持仓会标记为 `split`（平局退款），该笔交易不计入胜率的分子或分母。
 - **模拟表现不代表实盘收益**：模拟账户仅基于实时行情做简化规则记账，既非历史回测，也无法复现真实订单簿的排队、流动性枯竭与价格冲击，不证明策略具有正数学期望。
 - **特殊市场事件**：预测市场可能出现延期、规则争议、取消或特殊结算。当公开结算数据存在歧义或异常时，系统会保持持仓为未结算状态并提示错误，而不会强行猜测结算结果。
-- **单机单实例约束**：单次扫描最多拉取 500 个开放市场；系统基于本地 SQLite 运行，未针对多实例并发部署设计。**切勿在多个实例上同时配置同一个实盘钱包**，否则会导致风控失效与重复下单。
+- **单机单实例约束**：每个场所按自身分页上限拉取开放市场，Polymarket 使用临近到期、24 小时成交额与流动性多视图去重，Predict.fun 使用 `after` 游标遍历，不再有全局 500 个市场的上限；单轮扫描仍受上游分页、超时与内存约束。系统基于本地 SQLite 运行，未针对多实例并发部署设计。**切勿在多个实例上同时配置同一个实盘钱包**，否则会导致风控失效与重复下单。
 - **合规性要求**：使用 Polymarket 行情数据或参与交易时，请自行确认并遵守所在司法管辖区的法律法规及平台服务条款。
 
 ---

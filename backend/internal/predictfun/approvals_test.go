@@ -4,15 +4,21 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+
+	"pennyharvester/backend/internal/venue"
 )
 
 func TestSelectors(t *testing.T) {
@@ -249,7 +255,7 @@ func TestSendCallPreservesHashWhenBroadcastIsUncertain(t *testing.T) {
 		to:     common.HexToAddress("0x0000000000000000000000000000000000000001"),
 		data:   []byte{0x01},
 		action: "测试授权",
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected broadcast error")
 	}
@@ -259,6 +265,179 @@ func TestSendCallPreservesHashWhenBroadcastIsUncertain(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), hash.Hex()) {
 		t.Fatalf("error text %q does not identify transaction %s", err, hash.Hex())
+	}
+}
+
+func TestSendCallJournalsSignedTransactionBeforeBroadcast(t *testing.T) {
+	key := testKey(t)
+	var mu sync.Mutex
+	var events []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var call struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&call)
+		w.Header().Set("Content-Type", "application/json")
+		switch call.Method {
+		case "eth_estimateGas":
+			// Force the adapter onto its fixed gas fallback.
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"estimate unavailable"}}`, call.ID)
+		case "eth_sendRawTransaction":
+			mu.Lock()
+			events = append(events, "send")
+			mu.Unlock()
+			// The node can accept the raw transaction and still lose the
+			// connection before answering, so the caller must keep the hash.
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"connection reset"}}`, call.ID)
+		default:
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unexpected call"}}`, call.ID)
+		}
+	}))
+	defer server.Close()
+	client, err := ethclient.Dial(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := &OnChain{settings: settings{
+		key:     key,
+		signer:  crypto.PubkeyToAddress(key.PublicKey),
+		chainID: 97,
+	}}
+	var signed venue.ChainTxSigned
+	_, err = chain.sendCall(context.Background(), client, 7, big.NewInt(1), approvalCall{
+		to:     common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		data:   []byte{0x01},
+		action: "测试授权",
+	}, func(tx venue.ChainTxSigned) error {
+		mu.Lock()
+		events = append(events, "signed")
+		mu.Unlock()
+		signed = tx
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected broadcast error")
+	}
+	mu.Lock()
+	order := append([]string(nil), events...)
+	mu.Unlock()
+	if len(order) != 2 || order[0] != "signed" || order[1] != "send" {
+		t.Fatalf("signature must be journaled before broadcast, got %v", order)
+	}
+	if signed.Hash == "" || signed.From != chain.settings.signer.Hex() || signed.Nonce != 7 || signed.ChainID != 97 {
+		t.Fatalf("signed identity = %+v", signed)
+	}
+	hash, ok := TxHashOf(err)
+	if !ok || hash.Hex() != signed.Hash {
+		t.Fatalf("broadcast error hash = %s (ok=%v), signed %s", hash.Hex(), ok, signed.Hash)
+	}
+}
+
+func TestSendCallDoesNotBroadcastWhenJournalCallbackFails(t *testing.T) {
+	key := testKey(t)
+	sent := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var call struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&call)
+		w.Header().Set("Content-Type", "application/json")
+		switch call.Method {
+		case "eth_estimateGas":
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"estimate unavailable"}}`, call.ID)
+		case "eth_sendRawTransaction":
+			sent = true
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":"0x00"}`, call.ID)
+		default:
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unexpected call"}}`, call.ID)
+		}
+	}))
+	defer server.Close()
+	client, err := ethclient.Dial(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := &OnChain{settings: settings{
+		key:     key,
+		signer:  crypto.PubkeyToAddress(key.PublicKey),
+		chainID: 97,
+	}}
+	_, err = chain.sendCall(context.Background(), client, 8, big.NewInt(1), approvalCall{
+		to:     common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		data:   []byte{0x01},
+		action: "测试授权",
+	}, func(venue.ChainTxSigned) error {
+		return errors.New("journal unavailable")
+	})
+	if err == nil || !strings.Contains(err.Error(), "未广播") {
+		t.Fatalf("journal failure must stop the send, got %v", err)
+	}
+	if sent {
+		t.Fatal("transaction was broadcast after the journal callback failed")
+	}
+	if _, ok := TxHashOf(err); ok {
+		t.Fatalf("a transaction that was never sent must not report a hash: %v", err)
+	}
+}
+
+func TestSendCallPreservesHashWhenReceiptTimesOut(t *testing.T) {
+	key := testKey(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sent := false
+	receiptCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var call struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&call)
+		w.Header().Set("Content-Type", "application/json")
+		switch call.Method {
+		case "eth_estimateGas":
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"estimate unavailable"}}`, call.ID)
+		case "eth_sendRawTransaction":
+			sent = true
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":"0x%s"}`, call.ID, strings.Repeat("1", 64))
+		case "eth_getTransactionReceipt":
+			receiptCalls++
+			if receiptCalls >= 3 {
+				cancel()
+			}
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":null}`, call.ID)
+		default:
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unexpected call"}}`, call.ID)
+		}
+	}))
+	defer server.Close()
+	client, err := ethclient.Dial(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := &OnChain{settings: settings{
+		key:     key,
+		signer:  crypto.PubkeyToAddress(key.PublicKey),
+		chainID: 97,
+	}, sleep: func(time.Duration) {}}
+	_, err = chain.sendCall(ctx, client, 9, big.NewInt(1), approvalCall{
+		to:     common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		data:   []byte{0x01},
+		action: "测试授权",
+	}, nil)
+	if err == nil {
+		t.Fatal("expected receipt timeout")
+	}
+	if !sent {
+		t.Fatal("transaction was not broadcast")
+	}
+	var txErr *TxError
+	if !errors.As(err, &txErr) || txErr.Phase != "receipt" || txErr.Reverted {
+		t.Fatalf("receipt timeout error = %#v", err)
+	}
+	if txErr.Hash == (common.Hash{}) {
+		t.Fatal("receipt timeout lost the signed hash")
 	}
 }
 

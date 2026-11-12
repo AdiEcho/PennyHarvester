@@ -269,9 +269,12 @@ func (h *Handler) approveVenue(c *gin.Context) {
 		return
 	}
 	// An approval is a real transaction on a public chain; give it room for two
-	// confirmations instead of the read-only endpoints' timeout.
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	// confirmations instead of the read-only endpoints' timeout. The server's
+	// global write deadline is shorter than a chain receipt, so extend it for
+	// this response only; other endpoints keep the tighter bound.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), chainRequestTimeout)
 	defer cancel()
+	extendWriteDeadline(c, chainRequestTimeout+5*time.Second)
 	approval, err := h.engine.ApproveVenue(ctx, v)
 	if err != nil {
 		body := gin.H{"error": err.Error()}
@@ -301,8 +304,9 @@ func (h *Handler) redeemPosition(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "仓位 ID 无效"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), chainRequestTimeout)
 	defer cancel()
+	extendWriteDeadline(c, chainRequestTimeout+5*time.Second)
 	result, err := h.engine.RedeemPosition(ctx, accountID, positionID)
 	if err != nil {
 		body := gin.H{"error": err.Error()}
@@ -319,6 +323,17 @@ func (h *Handler) redeemPosition(c *gin.Context) {
 	})
 }
 
+// chainRequestTimeout bounds an approval or redemption end to end. It is longer
+// than the global write timeout because a mined transaction is the result; the
+// response deadline is extended for these two endpoints only.
+const chainRequestTimeout = 3 * time.Minute
+
+func extendWriteDeadline(c *gin.Context, d time.Duration) {
+	// Best effort: ResponseRecorder and some test writers do not implement
+	// deadlines, and that must not turn a chain request into an error.
+	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(d))
+}
+
 // redeemErrorStatus separates "this cannot work" (400/409) from "the chain or
 // the RPC failed" (502), so a retry decision can be made from the status alone.
 func redeemErrorStatus(err error) int {
@@ -327,6 +342,8 @@ func redeemErrorStatus(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrNotFound):
 		return http.StatusBadRequest
+	case errors.Is(err, engine.ErrChainOperationActive):
+		return http.StatusConflict
 	case errors.Is(err, engine.ErrVenueReadOnly), errors.Is(err, engine.ErrNoApproval),
 		errors.Is(err, engine.ErrVenueNotConfigured), errors.Is(err, engine.ErrInvalidSettings):
 		return http.StatusConflict
@@ -337,6 +354,8 @@ func redeemErrorStatus(err error) int {
 
 func approvalErrorStatus(err error) int {
 	switch {
+	case errors.Is(err, engine.ErrChainOperationActive):
+		return http.StatusConflict
 	case errors.Is(err, engine.ErrVenueReadOnly), errors.Is(err, engine.ErrNoApproval),
 		errors.Is(err, engine.ErrVenueNotConfigured), errors.Is(err, engine.ErrInvalidSettings):
 		// Same mapping the rest of the API uses for these sentinels, so a client
@@ -426,6 +445,11 @@ func (h *Handler) discoverFunder(c *gin.Context) {
 		"wallets":          discovery.Wallets,
 		"candidates":       discovery.Candidates,
 		"notes":            discovery.Notes,
+		"verified":         discovery.Verified,
+		"chain_id":         discovery.ChainID,
+		"owner":            discovery.Owner,
+		"implementation":   discovery.Implementation,
+		"evidence":         discovery.Evidence,
 	}
 	if err != nil {
 		payload["error"] = err.Error()

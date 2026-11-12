@@ -293,6 +293,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
           <div><CardTitle>最近订单</CardTitle><CardDescription className="mt-1">{isLive ? '最近的实盘买入、卖出与到期结算动态' : '最近的模拟买入、卖出与到期结算动态'}</CardDescription></div>
           <Button variant="ghost" size="sm" onClick={onOpenOrders}>查看全部<ChevronRight className="h-3.5 w-3.5" /></Button>
         </CardHeader>
+        {orders.error && orders.data && <div className="px-6 pt-4"><InlineError message={orders.error} onRetry={orders.refresh} /></div>}
         {orders.isLoading ? <div className="space-y-3 px-6 pb-6">{[1, 2, 3].map((item) => <Skeleton key={item} className="h-12 w-full" />)}</div> : orders.error && !orders.data ? <ErrorState compact message={orders.error} onRetry={orders.refresh} /> : !orders.data?.items.length ? <EmptyState compact title="还没有交易记录" description={isLive ? '去「机会雷达」挑选市场下单，或开启自动交易后，订单记录就会显示在这里。' : '去「机会雷达」试下一笔模拟单，或开启自动交易后，订单记录就会显示在这里。'} /> : (
           <>
             <div className="hidden overflow-x-auto sm:block">

@@ -38,6 +38,14 @@ var (
 	// ErrVenueNotConfigured means the venue has an executor but it is missing
 	// credentials or is not otherwise ready to trade.
 	ErrVenueNotConfigured = errors.New("该场所实盘未配置")
+	// ErrChainOperationActive means a previous approval or redemption for the
+	// same scope has not reached a terminal state. Retrying it would sign a
+	// second transaction with a new nonce while the first may still land, so the
+	// caller must check the chain first.
+	ErrChainOperationActive = errors.New("链上操作正在确认中，请稍后核对")
+	// ErrChainOperationConflict means a chain-operation transition lost a race
+	// with a different terminal state. The stored row is left untouched.
+	ErrChainOperationConflict = errors.New("链上操作状态冲突")
 )
 
 // venueError carries a contract-exact message while still matching a sentinel
@@ -966,26 +974,35 @@ type WalletEndpoints struct {
 // WalletCandidate is one wallet address that belongs to a signer, together with
 // the type that was inferred for it.
 type WalletCandidate struct {
-	Address    string `json:"address"`
-	WalletType int    `json:"wallet_type"`
-	WalletName string `json:"wallet_type_name"`
-	Deployed   bool   `json:"deployed"`
-	Source     string `json:"source"`
+	Address        string `json:"address"`
+	WalletType     int    `json:"wallet_type"`
+	WalletName     string `json:"wallet_type_name"`
+	Deployed       bool   `json:"deployed"`
+	Source         string `json:"source"`
+	Verified       bool   `json:"verified"`
+	Owner          string `json:"owner,omitempty"`
+	Implementation string `json:"implementation,omitempty"`
+	Evidence       string `json:"evidence,omitempty"`
 }
 
 // WalletDiscovery is the result of resolving a signer to its Polymarket account
 // wallet. Funder is empty when the signer is a plain EOA (wallet type 0), which
 // is exactly the value the settings page should store.
 type WalletDiscovery struct {
-	Signer     string            `json:"signer"`
-	Funder     string            `json:"funder"`
-	WalletType int               `json:"wallet_type"`
-	WalletName string            `json:"wallet_type_name"`
-	Deployed   bool              `json:"deployed"`
-	Source     string            `json:"source"`
-	Wallets    []string          `json:"wallets"`
-	Candidates []WalletCandidate `json:"candidates"`
-	Notes      []string          `json:"notes"`
+	Signer         string            `json:"signer"`
+	Funder         string            `json:"funder"`
+	WalletType     int               `json:"wallet_type"`
+	WalletName     string            `json:"wallet_type_name"`
+	Deployed       bool              `json:"deployed"`
+	Source         string            `json:"source"`
+	Wallets        []string          `json:"wallets"`
+	Candidates     []WalletCandidate `json:"candidates"`
+	Notes          []string          `json:"notes"`
+	Verified       bool              `json:"verified"`
+	ChainID        int64             `json:"chain_id"`
+	Owner          string            `json:"owner,omitempty"`
+	Implementation string            `json:"implementation,omitempty"`
+	Evidence       string            `json:"evidence,omitempty"`
 }
 
 // walletDiscovery is implemented by executors that can resolve the account
@@ -1363,6 +1380,16 @@ type Repository interface {
 	ListUnresolvedOrders(context.Context, int64) ([]Order, error)
 	MarkOrderStatus(context.Context, int64, string, string) error
 	FinalizeLiveBuy(context.Context, int64, Position, LiveFill) (Position, error)
+
+	// Chain-operation journal. A row is written before a transaction is
+	// broadcast, so a crash between signing and its receipt still leaves an
+	// identity the recovery pass can resolve without guessing.
+	BeginChainOperation(context.Context, ChainOperation) (ChainOperation, error)
+	SetChainOperationHash(context.Context, int64, string, string, *uint64, int64) error
+	FinishChainOperation(context.Context, int64, string, string) error
+	ActiveChainOperation(context.Context, int64, market.Venue, string, *int64) (ChainOperation, bool, error)
+	ListUnresolvedChainOperations(context.Context, int) ([]ChainOperation, error)
+	ChainOperationByID(context.Context, int64) (ChainOperation, bool, error)
 	// SellPosition books a fully simulated paper sell and inserts its order.
 	SellPosition(context.Context, Position, Order) error
 	// FinalizeLiveSell marks a pending/unknown real sell as filled and updates

@@ -4,7 +4,7 @@ import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
 import { useVenues } from '@/hooks/useVenues'
-import type { Position, PositionStatus } from '@/types'
+import type { Position, PositionStatus, PositionsResponse } from '@/types'
 import { formatDate, formatFullDate, formatNumber, formatPrice, pnlClass } from '@/lib/format'
 import { fmtMoney, settlementHintOf, venueMeta, venueOf } from '@/lib/venue'
 import { cn } from '@/lib/utils'
@@ -14,7 +14,13 @@ import { Card } from '@/components/ui/card'
 import { EmptyState, ErrorState, LoadingBlock } from '@/components/ui/feedback'
 import { InlineError, PageHeader } from '@/components/page-header'
 import { PositionStatusBadge, VenueChip } from '@/components/status-badges'
-import { VenueFilter, useVenueScope } from '@/components/venue-filter'
+import { VenueFilter, useVenueScope, type VenueScope } from '@/components/venue-filter'
+
+interface PositionsSnapshot {
+  response: PositionsResponse
+  query: { status: PositionStatus | 'all'; scope: VenueScope }
+  observedAt: number
+}
 
 const tabs: { value: PositionStatus | 'all'; label: string }[] = [
   { value: 'all', label: '全部' },
@@ -76,10 +82,14 @@ export function PositionsView() {
   // triggers refresh() so the table keeps showing rows while the filtered page
   // loads instead of falling back to skeletons.
   const fetchPositions = useCallback(
-    (signal: AbortSignal) => api.positions(accountId, status, scopeRef.current === 'all' ? null : scopeRef.current, signal),
+    async (signal: AbortSignal): Promise<PositionsSnapshot> => {
+      const query = { status, scope: scopeRef.current }
+      const response = await api.positions(accountId, query.status, query.scope === 'all' ? null : query.scope, signal)
+      return { response, query, observedAt: Date.now() }
+    },
     [accountId, status, scopeRef],
   )
-  const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchPositions, { enabled: Boolean(accountId) })
+  const { data: snapshot, error, isLoading, isRefreshing, refresh } = usePolling(fetchPositions, { enabled: Boolean(accountId) })
   const { toast } = useToast()
   // A single id unlocked every other row when two redemptions overlapped, and
   // the first completion cleared the second row's busy state. Track each
@@ -94,7 +104,12 @@ export function PositionsView() {
   )
   const handleRedeem = useCallback(
     async (position: Position) => {
-      if (!accountId || redeemingRef.current.has(position.id)) return
+      const positionVenue = venueOf(position)
+      const settled = position.status === 'won' || position.status === 'lost' || position.status === 'split'
+      // Redemption is on-chain and only valid for the account's own venue. The
+      // row button is hidden in the other cases, but a stale click or a
+      // keyboard activation must not bypass the same checks.
+      if (!accountId || !isLive || accountVenue !== positionVenue || !canRedeemVenue(positionVenue) || !settled || redeemingRef.current.has(position.id)) return
       redeemingRef.current.add(position.id)
       setRedeeming((current) => new Set(current).add(position.id))
       try {
@@ -112,7 +127,7 @@ export function PositionsView() {
         setRedeeming((current) => { const next = new Set(current); next.delete(position.id); return next })
       }
     },
-    [accountId, refresh, toast],
+    [accountId, accountVenue, canRedeemVenue, isLive, refresh, toast],
   )
   const lastScope = useRef<typeof scope>(scope)
   useEffect(() => {
@@ -120,42 +135,49 @@ export function PositionsView() {
     lastScope.current = scope
     refresh()
   }, [scope, refresh])
+  const accepted = snapshot?.query
+  const items = snapshot?.response.items || []
+  const statusText = (value: PositionStatus | 'all') => value === 'open' ? '未平仓' : value === 'all' ? '' : value === 'sold' ? '已止损' : '已结算'
+  const scopeText = (value: VenueScope) => value === 'all' ? venueMeta(accountVenue).label : venueMeta(value).label
+  const staleLabel = snapshot && accepted ? `${statusText(accepted.status)}${isLive ? '实盘' : '模拟'}头寸 · ${scopeText(accepted.scope)} · 观察于 ${formatFullDate(new Date(snapshot.observedAt).toISOString())}` : ''
+  const shownStatus = accepted?.status ?? status
+  const shownScope = accepted?.scope ?? scope
 
   return (
     <>
       <PageHeader eyebrow={isLive ? 'LIVE POSITIONS' : 'PAPER POSITIONS'} title={isLive ? '实盘持仓' : '模拟持仓'} description={isLive ? `追踪实盘头寸的价格变化与结算结果。${settlementHintOf(accountVenue)}` : '追踪虚拟头寸的价格变化与结算结果，分别观察未实现和已实现损益。'} actions={<Button variant="secondary" onClick={refresh} disabled={isRefreshing}><RefreshCw className={cn('h-4 w-4', isRefreshing && 'animate-spin')} />刷新持仓</Button>} />
-      {error && data && <InlineError message={error} onRetry={refresh} />}
+      {error && snapshot && <InlineError message={`${error}（当前展示 ${staleLabel}）`} onRetry={refresh} />}
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex w-full gap-1 overflow-x-auto rounded-xl border border-slate-200 bg-surface p-1 sm:w-auto" role="tablist" aria-label="持仓状态筛选">
           {tabs.map((tab) => <button key={tab.value} role="tab" aria-selected={status === tab.value} onClick={() => setStatus(tab.value)} className={cn('h-8 flex-1 whitespace-nowrap rounded-lg px-4 text-xs font-medium transition sm:flex-none', status === tab.value ? 'bg-navy text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800')}>{tab.label}</button>)}
         </div>
-        <p className="text-xs text-slate-500">{data ? <><span className="font-semibold tabular-nums text-slate-800">{formatNumber(data.total, 0)}</span> 个{status === 'open' ? '未平仓' : status === 'all' ? '' : status === 'sold' ? '已止损' : '已结算'}{isLive ? '实盘' : '模拟'}头寸 · {scope === 'all' ? venueMeta(accountVenue).label : venueMeta(scope).label}</> : '正在读取头寸…'}</p>
+        <p className="text-xs text-slate-500">{snapshot ? <><span className="font-semibold tabular-nums text-slate-800">{formatNumber(snapshot.response.total, 0)}</span> 个{staleLabel}</> : '正在读取头寸…'}</p>
       </div>
       <div className="mb-4">
         <VenueFilter available={venues} value={scope} onChange={setScope} />
       </div>
 
-      {accountLoading || isLoading ? <Card><LoadingBlock rows={5} /></Card> : error && !data ? <Card><ErrorState message={error} onRetry={refresh} /></Card> : !data?.items.length ? (
-        <Card><EmptyState icon={status === 'open' ? WalletCards : BriefcaseBusiness} title={status === 'open' ? '暂无未平仓头寸' : '此状态下暂无持仓'} description={`${venueMeta(scope === 'all' ? accountVenue : scope).label}：${status === 'open' ? (isLive ? '前往机会雷达，确认一笔实盘买入后即可开始观察。' : '前往机会雷达，确认一笔虚拟买入后即可开始观察。') : (isLive ? '切换其他状态查看，或等待实盘引擎产生新的记录。' : '切换其他状态查看，或等待模拟引擎产生新的记录。')}`} /></Card>
+      {accountLoading || isLoading ? <Card><LoadingBlock rows={5} /></Card> : error && !snapshot ? <Card><ErrorState message={error} onRetry={refresh} /></Card> : !items.length ? (
+        <Card><EmptyState icon={shownStatus === 'open' ? WalletCards : BriefcaseBusiness} title={shownStatus === 'open' ? '暂无未平仓头寸' : '此状态下暂无持仓'} description={`${scopeText(shownScope)}：${shownStatus === 'open' ? (isLive ? '前往机会雷达，确认一笔实盘买入后即可开始观察。' : '前往机会雷达，确认一笔虚拟买入后即可开始观察。') : (isLive ? '切换其他状态查看，或等待实盘引擎产生新的记录。' : '切换其他状态查看，或等待模拟引擎产生新的记录。')}`} /></Card>
       ) : (
         <>
           <Card className="hidden overflow-hidden lg:block">
             <div className="overflow-x-auto"><table className="w-full min-w-[1080px] text-left text-sm">
               <thead className="border-b border-slate-100 bg-slate-50/70 text-xs text-slate-500"><tr><th className="px-5 py-3.5 font-medium">市场 / 方向</th><th className="px-4 py-3.5 font-medium">状态</th><th className="px-4 py-3.5 text-right font-medium">入场 / 当前</th><th className="px-4 py-3.5 text-right font-medium">份额</th><th className="px-4 py-3.5 text-right font-medium">投入成本</th><th className="px-4 py-3.5 text-right font-medium">损益</th><th className="px-5 py-3.5 text-right font-medium">时间 / 收盘</th></tr></thead>
-              <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>{data.items.map((position) => {
+              <tbody className={cn('divide-y divide-slate-100 transition-opacity', isRefreshing && 'opacity-60')}>{items.map((position) => {
                 const pnl = positionPnl(position)
                 const venue = venueOf(position)
-                const canRedeemRow = isLive && canRedeemVenue(venue) && (position.status === 'won' || position.status === 'lost' || position.status === 'split')
+                const canRedeemRow = isLive && accountVenue === venue && canRedeemVenue(venue) && (position.status === 'won' || position.status === 'lost' || position.status === 'split')
                 return <tr key={position.id} className="hover:bg-slate-50/60"><td className="max-w-[360px] px-5 py-4"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={position.question}>{position.question}</p><div className="mt-1.5 flex items-center gap-2 text-xs"><VenueChip venue={venue} /><span className="font-medium text-blue-700">{position.outcome}</span><span className="text-slate-300">·</span><span className="text-slate-400">#{position.id}</span></div></td><td className="px-4 py-4"><PositionStatusBadge status={position.status} exitKind={position.exit_kind} endDate={position.end_date} /></td><td className="px-4 py-4 text-right tabular-nums text-slate-700"><span>{formatPrice(position.entry_price)}</span><span className="mx-1.5 text-slate-300">→</span><span>{formatPrice(position.current_price)}</span></td><td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatNumber(position.shares, 4)}</td><td className="px-4 py-4 text-right"><p className="font-medium tabular-nums text-slate-800">{fmtMoney(position.cost, venue)}</p><p className="mt-1 text-[11px] text-slate-400">费用 {fmtMoney(position.fee, venue)}</p></td><td className="px-4 py-4 text-right"><p className={cn('font-semibold tabular-nums', pnlClass(pnl))}>{fmtMoney(pnl, venue, { signed: true })}</p><p className="mt-1 text-[11px] text-slate-400">{position.status === 'open' ? '未实现' : '已实现'}</p></td><td className="px-5 py-4 text-right text-xs text-slate-500"><p>{position.status === 'open' ? '开仓' : position.exit_kind === 'stop' ? '止损' : '结算'} {formatDate(position.status === 'open' ? position.opened_at : position.closed_at)}</p><p className="mt-1 text-[11px] text-slate-400" title={formatFullDate(position.end_date)}>收盘 {formatDate(position.end_date)}</p>{canRedeemRow && <Button className="mt-2" variant="secondary" onClick={() => handleRedeem(position)} disabled={redeeming.has(position.id)}>{redeeming.has(position.id) ? '赎回中…' : '赎回'}</Button>}</td></tr>
               })}</tbody>
             </table></div>
           </Card>
-          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{data.items.map((position) => (
+          <div className="grid gap-3 sm:grid-cols-2 lg:hidden">{items.map((position) => (
             <PositionCard
               key={position.id}
               position={position}
               isLive={isLive}
-              canRedeem={canRedeemVenue(venueOf(position))}
+              canRedeem={isLive && accountVenue === venueOf(position) && canRedeemVenue(venueOf(position))}
               redeeming={redeeming.has(position.id)}
               onRedeem={handleRedeem}
             />
