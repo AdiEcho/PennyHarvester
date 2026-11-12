@@ -64,8 +64,20 @@ type fakeExchange struct {
 	bookJSON   string
 	category   map[string]string
 
-	orderID     string
-	orderStatus string
+	orderID           string
+	orderHash         string
+	orderStatus       string
+	orderAmount       string
+	orderAmountFilled string
+	// matchesJSON is the next matches page. matchPages, when present, is keyed
+	// by the incoming after cursor so pagination can be exercised.
+	matchesJSON   string
+	matchesCursor string
+	// matchCursors overrides matchesCursor per incoming after cursor. An empty
+	// mapped value terminates pagination.
+	matchCursors map[string]string
+	matchPages   map[string]string
+	marketID     int64
 	// placed flips once a POST /v1/orders succeeds, so a lookup for an order the
 	// exchange never accepted answers 404 like the real API does.
 	placed bool
@@ -73,18 +85,24 @@ type fakeExchange struct {
 	statusHooks []int
 
 	orderAttempts int
-	orderBodies   []SignedOrderRequest
+	orderBodies   []CreateOrderRequest
+	lastOrder     *ContractOrder
 	authPosts     int
 	messageCalls  int
 }
 
 func newFakeExchange() *fakeExchange {
 	return &fakeExchange{
-		marketJSON:  testMarketJSON,
-		bookJSON:    `{"marketId": 42, "asks": [[0.5, 100000000000000000000]], "bids": [[0.48, 100000000000000000000]]}`,
-		category:    map[string]string{"crypto": testEndsAt},
-		orderID:     "ord-1",
-		orderStatus: "MATCHED",
+		marketJSON:        testMarketJSON,
+		bookJSON:          `{"marketId": 42, "asks": [[0.5, 100000000000000000000]], "bids": [[0.48, 100000000000000000000]]}`,
+		category:          map[string]string{"crypto": testEndsAt},
+		orderID:           "ord-1",
+		orderHash:         "0x" + strings.Repeat("11", 32),
+		orderStatus:       "FILLED",
+		orderAmount:       "100000000000000000000",
+		orderAmountFilled: "0",
+		matchesJSON:       "[]",
+		marketID:          42,
 	}
 }
 
@@ -129,6 +147,17 @@ func (f *fakeExchange) handler() http.Handler {
 	})
 	mux.HandleFunc("/v1/orders", func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
+		if r.Header.Get("Content-Type") != "application/json" {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			io.WriteString(w, `{"success":false,"message":"content type must be application/json"}`)
+			return
+		}
+		var body CreateOrderRequest
+		if !decodeStrictJSON(raw, &body) || body.Data.Order == nil || body.Data.PricePerShare == "" || body.Data.Strategy == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"success":false,"message":"data.order required object; data.pricePerShare required string; data.strategy required MARKET|LIMIT"}`)
+			return
+		}
 		f.mu.Lock()
 		f.orderAttempts++
 		attempt := f.orderAttempts
@@ -136,9 +165,10 @@ func (f *fakeExchange) handler() http.Handler {
 		if attempt <= len(f.statusHooks) {
 			injected = f.statusHooks[attempt-1]
 		}
-		var body SignedOrderRequest
-		if err := json.Unmarshal(raw, &body); err == nil {
-			f.orderBodies = append(f.orderBodies, body)
+		f.orderBodies = append(f.orderBodies, body)
+		if body.Data.Order != nil {
+			copied := *body.Data.Order
+			f.lastOrder = &copied
 		}
 		if injected != 0 {
 			f.mu.Unlock()
@@ -146,20 +176,80 @@ func (f *fakeExchange) handler() http.Handler {
 			io.WriteString(w, `{"success":false,"message":"injected"}`)
 			return
 		}
-		status, id := f.orderStatus, f.orderID
+		id, hash := f.orderID, f.orderHash
 		f.placed = true
 		f.mu.Unlock()
-		writeJSON(w, fmt.Sprintf(`{"success":true,"data":{"id":%q,"status":%q}}`, id, status))
+		writeJSON(w, fmt.Sprintf(`{"success":true,"data":{"code":"OK","orderId":%q,"orderHash":%q}}`, id, hash))
+	})
+	mux.HandleFunc("/v1/orders/matches", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		cursor := r.URL.Query().Get("after")
+		body, ok := f.matchPages[cursor]
+		if !ok {
+			body = f.matchesJSON
+		}
+		next := f.matchesCursor
+		if perPage, ok := f.matchCursors[cursor]; ok {
+			next = perPage
+		}
+		f.mu.Unlock()
+		writeJSON(w, fmt.Sprintf(`{"success":true,"cursor":%q,"data":%s}`, next, body))
+	})
+	mux.HandleFunc("/v1/orders/remove", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body RemoveOrdersRequest
+		if !decodeStrictJSON(raw, &body) || len(body.Data.IDs) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"success":false,"message":"data.ids required non-empty string array"}`)
+			return
+		}
+		removed := []string{}
+		rejected := []string{}
+		for _, id := range body.Data.IDs {
+			if strings.HasPrefix(id, "locked") {
+				rejected = append(rejected, id)
+			} else {
+				removed = append(removed, id)
+			}
+		}
+		payload, _ := json.Marshal(RemoveOrdersResponse{
+			Success:  true,
+			Removed:  &removed,
+			Noop:     &[]string{},
+			Rejected: &rejected,
+		})
+		writeJSON(w, string(payload))
 	})
 	mux.HandleFunc("/v1/orders/", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
-		status, id, placed := f.orderStatus, f.orderID, f.placed
+		placed := f.placed
+		status, id, amount, filled := f.orderStatus, f.orderID, f.orderAmount, f.orderAmountFilled
+		marketID := f.marketID
+		inner := ContractOrder{
+			Salt: "1", Maker: "0x1111111111111111111111111111111111111111",
+			Signer:  "0x1111111111111111111111111111111111111111",
+			Taker:   "0x0000000000000000000000000000000000000000",
+			TokenID: "111", MakerAmount: "5000000000000000000",
+			TakerAmount: "10000000000000000000", Expiration: 1893456000,
+			Nonce: "0", FeeRateBps: "200", Side: 0, SignatureType: 0,
+			Signature: "0xsig",
+		}
+		if f.lastOrder != nil {
+			inner = *f.lastOrder
+		}
+		inner.Hash = strings.TrimPrefix(r.URL.Path, "/v1/orders/")
 		f.mu.Unlock()
 		if !placed {
 			http.NotFound(w, r)
 			return
 		}
-		writeJSON(w, fmt.Sprintf(`{"success":true,"data":{"id":%q,"status":%q,"pricePerShare":"0.5"}}`, id, status))
+		order := OrderData{
+			Order: &inner, ID: id, MarketID: marketID, Currency: "USDT",
+			Amount: Number(amount), AmountFilled: Number(filled),
+			Strategy: StrategyLimit, Status: status,
+		}
+		payload, _ := json.Marshal(OrderResponse{Success: true, Data: &order})
+		writeJSON(w, string(payload))
 	})
 	return mux
 }
@@ -170,10 +260,10 @@ func (f *fakeExchange) attempts() int {
 	return f.orderAttempts
 }
 
-func (f *fakeExchange) bodies() []SignedOrderRequest {
+func (f *fakeExchange) bodies() []CreateOrderRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]SignedOrderRequest, len(f.orderBodies))
+	out := make([]CreateOrderRequest, len(f.orderBodies))
 	copy(out, f.orderBodies)
 	return out
 }
@@ -184,9 +274,45 @@ func (f *fakeExchange) authCount() int {
 	return f.authPosts
 }
 
+// decodeStrictJSON mirrors a strict exchange: unknown fields (including the old
+// top-level order DTO and orderId cancel shape) are rejected instead of ignored.
+func decodeStrictJSON(raw []byte, out any) bool {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(out) == nil
+}
+
 func writeJSON(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	io.WriteString(w, body)
+}
+
+// testCreateOrderRequest is a structurally valid POST /v1/orders payload. Its
+// signature is not cryptographically checked by these fixtures; the executor
+// tests recover the signer from a real ECDSA signature separately.
+func testCreateOrderRequest() CreateOrderRequest {
+	minOut := true
+	return CreateOrderRequest{Data: CreateOrderData{
+		Order: &ContractOrder{
+			Salt:          "1",
+			Maker:         "0x1111111111111111111111111111111111111111",
+			Signer:        "0x1111111111111111111111111111111111111111",
+			Taker:         "0x0000000000000000000000000000000000000000",
+			TokenID:       "111",
+			MakerAmount:   "5000000000000000000",
+			TakerAmount:   "10000000000000000000",
+			Expiration:    1893456000,
+			Nonce:         "0",
+			FeeRateBps:    "200",
+			Side:          uint8(SideBuy),
+			SignatureType: uint8(SignatureTypeEOA),
+			Signature:     "0xsig",
+		},
+		PricePerShare:  "500000000000000000",
+		Strategy:       StrategyLimit,
+		SlippageBps:    "200",
+		IsMinAmountOut: &minOut,
+	}}
 }
 
 // newTestClient builds a client against a fake handler and disables the real

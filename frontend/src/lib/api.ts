@@ -67,9 +67,30 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 
   const contentType = response.headers.get('content-type') || ''
-  const payload = contentType.includes('application/json')
-    ? await response.json().catch(() => null)
-    : await response.text().catch(() => '')
+  const noBody = response.status === 204 || response.status === 205
+  let payload: unknown = null
+  if (!noBody) {
+    // A successful response with a truncated or non-JSON body is a protocol
+    // failure, not an empty result. Silently returning null would clear data or
+    // let a caller act on a malformed success. Error responses keep the HTTP
+    // fallback message even when their body is unreadable.
+    if (contentType.includes('application/json')) {
+      try {
+        payload = await response.json()
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        if (response.ok) throw new ApiError('后端返回了无法解析的 JSON 响应，请刷新后重试。', response.status)
+      }
+    } else {
+      try {
+        const text = await response.text()
+        payload = text === '' ? null : text
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        if (response.ok) throw new ApiError('读取后端响应失败，请刷新后重试。', response.status)
+      }
+    }
+  }
 
   if (!response.ok) {
     if (response.status === 401 && !path.startsWith('/auth/')) {

@@ -2,7 +2,9 @@ package predictfun
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -30,7 +32,7 @@ func recoverWireSigner(t *testing.T, signed SignedOrder, negRisk bool) common.Ad
 		TokenID:       mustBig(t, signed.TokenID),
 		MakerAmount:   mustBig(t, signed.MakerAmount),
 		TakerAmount:   mustBig(t, signed.TakerAmount),
-		Expiration:    mustBig(t, signed.Expiration),
+		Expiration:    big.NewInt(signed.Expiration),
 		Nonce:         mustBig(t, signed.Nonce),
 		FeeRateBps:    mustBig(t, signed.FeeRateBps),
 		Side:          Side(signed.Side),
@@ -90,49 +92,43 @@ func TestBuyScalesAmountsAndSignsOnce(t *testing.T) {
 		t.Fatalf("order posts = %d, want 1", len(bodies))
 	}
 	posted := bodies[0]
-	if posted.Order.MakerAmount != "5000000000000000000" {
-		t.Fatalf("makerAmount = %s, want 5e18", posted.Order.MakerAmount)
+	if posted.Data.Order.MakerAmount != "5000000000000000000" {
+		t.Fatalf("makerAmount = %s, want 5e18", posted.Data.Order.MakerAmount)
 	}
 	limit := 0.51
 	shares := math.Floor(5/limit/shareStep) * shareStep
-	if posted.Order.TakerAmount != venue.Scale(shares, venue.USDTDecimals).String() {
-		t.Fatalf("takerAmount = %s, want %s", posted.Order.TakerAmount, venue.Scale(shares, venue.USDTDecimals))
+	if posted.Data.Order.TakerAmount != venue.Scale(shares, venue.USDTDecimals).String() {
+		t.Fatalf("takerAmount = %s, want %s", posted.Data.Order.TakerAmount, venue.Scale(shares, venue.USDTDecimals))
 	}
-	if posted.PricePerShare != "0.51" {
-		t.Fatalf("pricePerShare = %s, want 0.51", posted.PricePerShare)
+	if posted.Data.PricePerShare != "510000000000000000" {
+		t.Fatalf("pricePerShare = %s, want 510000000000000000", posted.Data.PricePerShare)
 	}
-	if posted.Order.Side != uint8(SideBuy) || posted.Order.TokenID != "111" || posted.Order.FeeRateBps != "200" {
-		t.Fatalf("posted order = %+v", posted.Order)
+	if posted.Data.Strategy != StrategyMarket || posted.Data.SlippageBps != "200" {
+		t.Fatalf("strategy/slippage = %q/%q, want MARKET/200", posted.Data.Strategy, posted.Data.SlippageBps)
 	}
-	if posted.Order.Taker != (common.Address{}).Hex() {
-		t.Fatalf("taker = %s, want the zero address for a public order", posted.Order.Taker)
+	if posted.Data.Order.Side != uint8(SideBuy) || posted.Data.Order.TokenID != "111" || posted.Data.Order.FeeRateBps != "200" {
+		t.Fatalf("posted order = %+v", posted.Data.Order)
 	}
-	if got := recoverWireSigner(t, posted.Order, false); got != wantSigner {
+	if posted.Data.Order.Taker != (common.Address{}).Hex() {
+		t.Fatalf("taker = %s, want the zero address for a public order", posted.Data.Order.Taker)
+	}
+	if got := recoverWireSigner(t, *posted.Data.Order, false); got != wantSigner {
 		t.Fatalf("posted order signed by %s, want %s", got, wantSigner)
 	}
 
-	if fill.OrderID != "ord-1" || fill.Status != "filled" {
-		t.Fatalf("fill = %+v", fill)
-	}
-	if math.Abs(fill.Shares-shares) > 1e-9 || fill.Price != 0.51 {
-		t.Fatalf("fill shares/price = %v/%v", fill.Shares, fill.Price)
-	}
-	wantFee := 0.02 * math.Min(0.51, 0.49) * shares
-	if math.Abs(fill.Fee-wantFee) > 1e-9 {
-		t.Fatalf("fee = %v, want %v", fill.Fee, wantFee)
-	}
-	// Cost is the gross notional; the fee travels separately so the engine can
-	// add it exactly once instead of charging it twice.
-	if math.Abs(fill.Cost-shares*0.51) > 1e-9 {
-		t.Fatalf("cost = %v, want gross notional %v", fill.Cost, shares*0.51)
+	// A successful create is only an acceptance. This fixture does not expose a
+	// terminal order or settled matches, so the executor must not invent a fill
+	// from the signed request size or limit price.
+	if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+		t.Fatalf("fill = %+v, want an unknown zero-share result", fill)
 	}
 	// The ledger row is created before the POST, so onSigned receives the local
-	// order hash rather than the exchange id that arrives with the response.
+	// order hash, which is also the reconciliation identity returned here.
 	if len(signedIDs) != 1 || !strings.HasPrefix(signedIDs[0], "0x") || len(signedIDs[0]) != 66 {
 		t.Fatalf("onSigned calls = %v, want one local order hash", signedIDs)
 	}
-	if signedIDs[0] == fill.OrderID {
-		t.Fatalf("onSigned must run before the exchange id is known: %v", signedIDs)
+	if fill.OrderID != signedIDs[0] {
+		t.Fatalf("fill order id = %q, want local hash %q", fill.OrderID, signedIDs[0])
 	}
 }
 
@@ -159,7 +155,7 @@ func TestBuyReusesSignatureAcrossAuthRetry(t *testing.T) {
 	if len(bodies) != 2 {
 		t.Fatalf("captured bodies = %d", len(bodies))
 	}
-	if bodies[0].Order != bodies[1].Order || bodies[0].PricePerShare != bodies[1].PricePerShare {
+	if *bodies[0].Data.Order != *bodies[1].Data.Order || bodies[0].Data.PricePerShare != bodies[1].Data.PricePerShare {
 		t.Fatalf("retry re-signed the order:\n%+v\n%+v", bodies[0], bodies[1])
 	}
 	// A resting order is not a rejection: the engine would otherwise write
@@ -168,8 +164,8 @@ func TestBuyReusesSignatureAcrossAuthRetry(t *testing.T) {
 	if fill.Status != "unknown" || fill.Shares != 0 {
 		t.Fatalf("resting order fill = %+v, want status unknown with no booked shares", fill)
 	}
-	if fill.OrderID != "ord-1" {
-		t.Fatalf("fill order id = %s", fill.OrderID)
+	if !strings.HasPrefix(fill.OrderID, "0x") || len(fill.OrderID) != 66 {
+		t.Fatalf("fill order id = %s, want the local order hash", fill.OrderID)
 	}
 }
 
@@ -302,12 +298,12 @@ func TestBuyClampsLimitToMaxPrice(t *testing.T) {
 		t.Fatalf("signatures = %d", *signatures)
 	}
 	bodies := exchange.bodies()
-	if len(bodies) != 1 || bodies[0].PricePerShare != "0.509" {
-		t.Fatalf("pricePerShare = %+v, want the clamped 0.509", bodies)
+	if len(bodies) != 1 || bodies[0].Data.PricePerShare != "509000000000000000" {
+		t.Fatalf("pricePerShare = %+v, want the clamped 509000000000000000", bodies)
 	}
 	shares := math.Floor(5/0.509/shareStep) * shareStep
-	if bodies[0].Order.TakerAmount != venue.Scale(shares, venue.USDTDecimals).String() {
-		t.Fatalf("takerAmount = %s, want %s", bodies[0].Order.TakerAmount, venue.Scale(shares, venue.USDTDecimals))
+	if bodies[0].Data.Order.TakerAmount != venue.Scale(shares, venue.USDTDecimals).String() {
+		t.Fatalf("takerAmount = %s, want %s", bodies[0].Data.Order.TakerAmount, venue.Scale(shares, venue.USDTDecimals))
 	}
 }
 
@@ -324,15 +320,15 @@ func TestBuyNoOutcomeUsesInvertedYesBid(t *testing.T) {
 	}
 	// The only published side is Yes; the No ask is 1-(best Yes bid 0.48)=0.52,
 	// and the 200 bps cushion lands on 0.53.
-	if bodies[0].PricePerShare != "0.53" {
-		t.Fatalf("No pricePerShare = %s, want 0.53", bodies[0].PricePerShare)
+	if bodies[0].Data.PricePerShare != "530000000000000000" {
+		t.Fatalf("No pricePerShare = %s, want 530000000000000000", bodies[0].Data.PricePerShare)
 	}
 	shares := math.Floor(5/0.53/shareStep) * shareStep
-	if bodies[0].Order.TakerAmount != venue.Scale(shares, venue.USDTDecimals).String() {
-		t.Fatalf("No takerAmount = %s, want %s", bodies[0].Order.TakerAmount, venue.Scale(shares, venue.USDTDecimals))
+	if bodies[0].Data.Order.TakerAmount != venue.Scale(shares, venue.USDTDecimals).String() {
+		t.Fatalf("No takerAmount = %s, want %s", bodies[0].Data.Order.TakerAmount, venue.Scale(shares, venue.USDTDecimals))
 	}
-	if bodies[0].Order.TokenID != "222" {
-		t.Fatalf("token = %s, want the No onChainId", bodies[0].Order.TokenID)
+	if bodies[0].Data.Order.TokenID != "222" {
+		t.Fatalf("token = %s, want the No onChainId", bodies[0].Data.Order.TokenID)
 	}
 }
 
@@ -355,30 +351,223 @@ func TestSellAmountsAndSignature(t *testing.T) {
 	}
 	posted := bodies[0]
 	// best bid 0.48 minus 200 bps = 0.4704, quantized down to 0.47.
-	if posted.PricePerShare != "0.47" {
-		t.Fatalf("pricePerShare = %s", posted.PricePerShare)
+	if posted.Data.PricePerShare != "470000000000000000" {
+		t.Fatalf("pricePerShare = %s", posted.Data.PricePerShare)
 	}
-	if posted.Order.Side != uint8(SideSell) {
-		t.Fatalf("side = %d, want SELL", posted.Order.Side)
+	if posted.Data.Order.Side != uint8(SideSell) {
+		t.Fatalf("side = %d, want SELL", posted.Data.Order.Side)
 	}
-	if posted.Order.MakerAmount != "10000000000000000000" {
-		t.Fatalf("makerAmount = %s, want 10 shares", posted.Order.MakerAmount)
+	if posted.Data.Order.MakerAmount != "10000000000000000000" {
+		t.Fatalf("makerAmount = %s, want 10 shares", posted.Data.Order.MakerAmount)
 	}
-	if posted.Order.TakerAmount != "4700000000000000000" {
-		t.Fatalf("takerAmount = %s, want 4.7 USDT", posted.Order.TakerAmount)
+	if posted.Data.Order.TakerAmount != "4700000000000000000" {
+		t.Fatalf("takerAmount = %s, want 4.7 USDT", posted.Data.Order.TakerAmount)
 	}
-	if got := recoverWireSigner(t, posted.Order, false); got != wantSigner {
+	if got := recoverWireSigner(t, *posted.Data.Order, false); got != wantSigner {
 		t.Fatalf("sell signed by %s, want %s", got, wantSigner)
 	}
-	wantFee := 0.02 * math.Min(0.47, 0.53) * 10
-	if math.Abs(fill.Fee-wantFee) > 1e-9 {
-		t.Fatalf("fee = %v, want %v", fill.Fee, wantFee)
+	// As with a buy, acceptance carries no execution evidence. The sell only
+	// becomes bookable after a terminal order and attributable matches exist.
+	if fill.Status != "unknown" || fill.Shares != 0 {
+		t.Fatalf("fill = %+v, want unknown with no booked shares", fill)
 	}
-	if math.Abs(fill.Cost-4.7) > 1e-9 {
-		t.Fatalf("cost = %v, want gross proceeds 4.7", fill.Cost)
+}
+
+func testFillOrder(hash string, side Side, status, filled string) OrderData {
+	return OrderData{
+		Order:        &ContractOrder{Hash: hash, Side: uint8(side)},
+		ID:           "exchange-id",
+		Status:       status,
+		Amount:       Number(venue.Scale(100, venue.USDTDecimals).String()),
+		AmountFilled: Number(filled),
 	}
-	if fill.Status != "filled" || math.Abs(fill.Shares-10) > 1e-9 {
-		t.Fatalf("fill = %+v", fill)
+}
+
+func testMatch(hash string, taker bool, amount, price float64, feeType string, feeAmount float64) MatchData {
+	leg := OrderFillData{
+		QuoteType: "Ask",
+		Amount:    Number(venue.Scale(amount, venue.USDTDecimals).String()),
+		Price:     Number(fmt.Sprintf("%.6f", price)),
+		Hash:      hash,
+		Fee:       &Fee{Amount: Number(venue.Scale(feeAmount, venue.USDTDecimals).String()), Type: feeType},
+	}
+	match := MatchData{TransactionHash: "0xtx", Taker: OrderFillData{Hash: "0xother", Fee: &Fee{Amount: Number("0"), Type: feeType}}}
+	if taker {
+		match.Taker = leg
+	} else {
+		match.Makers = []OrderFillData{leg, {Hash: "0xother", Fee: &Fee{Amount: Number("0"), Type: feeType}}}
+	}
+	return match
+}
+
+func TestFillFromOrderUsesAttributableMatchesForVWAP(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xabc"
+	order := testFillOrder(hash, SideBuy, "FILLED", venue.Scale(100, venue.USDTDecimals).String())
+	matches := []MatchData{
+		testMatch(hash, false, 40, 0.40, "SHARES", 0),
+		testMatch(hash, true, 60, 0.60, "SHARES", 0),
+	}
+	fill := executor.fillFromOrder(order, matches, hash)
+	if fill.Status != "filled" {
+		t.Fatalf("status = %q, want filled", fill.Status)
+	}
+	if math.Abs(fill.Shares-100) > 1e-9 {
+		t.Fatalf("shares = %v, want 100 (maker leg must not be double counted)", fill.Shares)
+	}
+	if math.Abs(fill.Cost-52) > 1e-9 {
+		t.Fatalf("cost = %v, want 40*0.4 + 60*0.6 = 52", fill.Cost)
+	}
+	if math.Abs(fill.Price-0.52) > 1e-9 {
+		t.Fatalf("price = %v, want two-leg VWAP 0.52", fill.Price)
+	}
+}
+
+func TestFillFromOrderConvertsBuyFeeAssets(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xabc"
+	tests := []struct {
+		name      string
+		feeType   string
+		feeAmount float64
+	}{
+		{name: "shares", feeType: "SHARES", feeAmount: 2},
+		{name: "collateral", feeType: "COLLATERAL", feeAmount: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			order := testFillOrder(hash, SideBuy, "FILLED", venue.Scale(100, venue.USDTDecimals).String())
+			matches := []MatchData{testMatch(hash, true, 100, 0.5, tc.feeType, tc.feeAmount)}
+			fill := executor.fillFromOrder(order, matches, hash)
+			if fill.Status != "filled" {
+				t.Fatalf("status = %q", fill.Status)
+			}
+			if math.Abs(fill.Shares-98) > 1e-9 {
+				t.Fatalf("net shares = %v, want 98 after a 2-share-equivalent fee", fill.Shares)
+			}
+			if math.Abs(fill.Cost-50) > 1e-9 || fill.Fee != 0 {
+				t.Fatalf("cost/fee = %v/%v, want gross 50 and Fee=0", fill.Cost, fill.Fee)
+			}
+		})
+	}
+}
+
+func TestFillFromOrderSellIsNestedAndNetOfCollateralFee(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xsell"
+	order := testFillOrder(hash, SideSell, "FILLED", venue.Scale(100, venue.USDTDecimals).String())
+	matches := []MatchData{testMatch(hash, false, 100, 0.5, "COLLATERAL", 1)}
+	fill := executor.fillFromOrder(order, matches, hash)
+	if fill.Status != "filled" || math.Abs(fill.Shares-100) > 1e-9 {
+		t.Fatalf("fill = %+v, want 100 gross shares filled", fill)
+	}
+	if math.Abs(fill.Cost-49) > 1e-9 || fill.Fee != 0 {
+		t.Fatalf("cost/fee = %v/%v, want net 49 and Fee=0", fill.Cost, fill.Fee)
+	}
+	if math.Abs(fill.Price-0.5) > 1e-9 {
+		t.Fatalf("price = %v, want execution price 0.5", fill.Price)
+	}
+}
+
+func TestFillFromOrderDoesNotDoubleChargeFee(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xabc"
+	buy := executor.fillFromOrder(
+		testFillOrder(hash, SideBuy, "FILLED", venue.Scale(100, venue.USDTDecimals).String()),
+		[]MatchData{testMatch(hash, true, 100, 0.5, "SHARES", 2)}, hash,
+	)
+	if booked := buy.Cost + buy.Fee; math.Abs(booked-50) > 1e-9 {
+		t.Fatalf("engine buy cost = %v, want 50", booked)
+	}
+	sell := executor.fillFromOrder(
+		testFillOrder(hash, SideSell, "FILLED", venue.Scale(98, venue.USDTDecimals).String()),
+		[]MatchData{testMatch(hash, true, 98, 0.5, "COLLATERAL", 1)}, hash,
+	)
+	if proceeds := sell.Cost - sell.Fee; math.Abs(proceeds-48) > 1e-9 {
+		t.Fatalf("engine sell proceeds = %v, want 48", proceeds)
+	}
+}
+
+func TestFillFromOrderExplicitZeroFeeIsKnown(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xzero"
+	fill := executor.fillFromOrder(
+		testFillOrder(hash, SideBuy, "FILLED", venue.Scale(100, venue.USDTDecimals).String()),
+		[]MatchData{testMatch(hash, true, 100, 0.5, "SHARES", 0)}, hash,
+	)
+	if fill.Status != "filled" || math.Abs(fill.Shares-100) > 1e-9 || math.Abs(fill.Cost-50) > 1e-9 {
+		t.Fatalf("explicit zero fee was estimated: %+v", fill)
+	}
+	if fill.Fee != 0 {
+		t.Fatalf("fee = %v, want zero", fill.Fee)
+	}
+}
+
+func TestFillFromOrderMissingEvidenceStaysUnknown(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xabc"
+	filled := venue.Scale(100, venue.USDTDecimals).String()
+	cases := []struct {
+		name    string
+		order   OrderData
+		matches []MatchData
+	}{
+		{
+			name:    "missing amountFilled",
+			order:   testFillOrder(hash, SideBuy, "FILLED", ""),
+			matches: []MatchData{testMatch(hash, true, 100, 0.5, "SHARES", 0)},
+		},
+		{
+			name:    "incomplete match set",
+			order:   testFillOrder(hash, SideBuy, "FILLED", filled),
+			matches: []MatchData{testMatch(hash, true, 40, 0.5, "SHARES", 0)},
+		},
+		{
+			name:    "only another maker leg",
+			order:   testFillOrder(hash, SideBuy, "FILLED", filled),
+			matches: []MatchData{testMatch("0xother", true, 100, 0.5, "SHARES", 0)},
+		},
+		{
+			name:    "missing fee object",
+			order:   testFillOrder(hash, SideBuy, "FILLED", filled),
+			matches: []MatchData{{TransactionHash: "0xtx", Taker: OrderFillData{Hash: hash, Amount: Number(filled), Price: Number("0.5")}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fill := executor.fillFromOrder(tc.order, tc.matches, hash)
+			if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+				t.Fatalf("fill = %+v, want unknown with no booked amounts", fill)
+			}
+		})
+	}
+}
+
+func TestFillFromOrderPartialFilledIsNotPadded(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xpartial"
+	order := testFillOrder(hash, SideBuy, "FILLED", venue.Scale(40, venue.USDTDecimals).String())
+	fill := executor.fillFromOrder(order, []MatchData{testMatch(hash, true, 40, 0.5, "SHARES", 0)}, hash)
+	if fill.Status != "filled" || math.Abs(fill.Shares-40) > 1e-9 {
+		t.Fatalf("partial MARKET fill = %+v, want exactly 40 shares", fill)
+	}
+}
+
+func TestFillFromOrderOpenAmountFilledGrowthDoesNotFinalize(t *testing.T) {
+	executor := &Executor{}
+	hash := "0xopen"
+	first := testFillOrder(hash, SideBuy, "OPEN", venue.Scale(40, venue.USDTDecimals).String())
+	if fill := executor.fillFromOrder(first, []MatchData{testMatch(hash, true, 40, 0.5, "SHARES", 0)}, hash); fill.Status != "unknown" || fill.Shares != 0 {
+		t.Fatalf("first OPEN increment was finalized: %+v", fill)
+	}
+	second := testFillOrder(hash, SideBuy, "FILLED", venue.Scale(100, venue.USDTDecimals).String())
+	matches := []MatchData{
+		testMatch(hash, true, 40, 0.5, "SHARES", 0),
+		testMatch(hash, false, 60, 0.6, "SHARES", 0),
+	}
+	fill := executor.fillFromOrder(second, matches, hash)
+	if fill.Status != "filled" || math.Abs(fill.Shares-100) > 1e-9 || math.Abs(fill.Cost-56) > 1e-9 {
+		t.Fatalf("terminal cumulative fill = %+v, want 100 shares at 0.56", fill)
 	}
 }
 

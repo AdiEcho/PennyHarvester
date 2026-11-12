@@ -28,6 +28,7 @@ export function usePolling<T>(
     }
 
     let active = true
+    let generation = 0
     let timer: ReturnType<typeof setTimeout> | null = null
     let controller: AbortController | null = null
 
@@ -41,21 +42,24 @@ export function usePolling<T>(
       clearTimer()
       controller?.abort()
       controller = new AbortController()
+      const requestGeneration = ++generation
       const hasData = dataRef.current !== null
       setIsLoading(!hasData)
       setIsRefreshing(hasData)
 
       try {
         const result = await fetcher(controller.signal)
-        if (!active) return
+        if (!active || requestGeneration !== generation) return
         dataRef.current = result
         setData(result)
         setError(null)
       } catch (caught) {
-        if (!active || (caught instanceof DOMException && caught.name === 'AbortError')) return
+        if (!active || requestGeneration !== generation || (caught instanceof DOMException && caught.name === 'AbortError')) return
         setError(caught instanceof Error ? caught.message : '数据加载失败，请重试。')
       } finally {
-        if (active) {
+        // A superseded request must not clear the newer request's loading state
+        // or schedule a second timer.
+        if (active && requestGeneration === generation) {
           setIsLoading(false)
           setIsRefreshing(false)
           timer = setTimeout(load, interval)

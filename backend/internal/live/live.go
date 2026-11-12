@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -64,6 +65,7 @@ type Executor struct {
 	credentials *clobclient.Credentials
 	cash        engine.CashSnapshot
 	cashAt      time.Time
+	generation  uint64
 	signer      string
 	builderCode string
 	builderErr  error
@@ -172,6 +174,7 @@ func (e *Executor) UpdateSettings(settings engine.LiveSettings, clobBaseURL stri
 	e.credentials = nil
 	e.cash = engine.CashSnapshot{}
 	e.cashAt = time.Time{}
+	e.generation++
 	return nil
 }
 
@@ -553,18 +556,23 @@ func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount,
 	}
 	response, submitErr := client.SubmitSignedOrder(ctx, signed, clobclient.OrderTypeFAK, false)
 	if submitErr != nil {
-		// A timeout can still mean the exchange accepted the order. Look the
-		// signed digest up before reporting a rejection so a real fill is not
-		// silently lost from the local ledger.
-		if detail, lookupErr := client.Order(ctx, signed.OrderID); lookupErr == nil {
-			if fill, ok := fillFromOrder(detail, order.Price); ok {
-				if feeErr := applyFee(schedule, &fill); feeErr != nil {
-					return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, feeErr
-				}
-				return fill, nil
+		// success=false is an explicit rejection, not an unknown outcome. The
+		// SDK returns it together with a response and OrderRejectedError; doing
+		// a 404 lookup first would turn a definite rejection into a blocked
+		// unknown. Timeouts and transport errors keep the lookup path.
+		var rejected *clobclient.OrderRejectedError
+		if errors.As(submitErr, &rejected) {
+			message := strings.TrimSpace(rejected.Message)
+			if message == "" {
+				message = "Polymarket 拒绝了订单"
 			}
+			return engine.LiveFill{OrderID: signed.OrderID, Status: "rejected"}, fmt.Errorf("%s", message)
 		}
-		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("提交实盘买单（订单 %s，结果可能未知）: %w", signed.OrderID, submitErr)
+		// A timeout can still mean the exchange accepted the order. Reconcile
+		// the signed digest, but book only a complete CONFIRMED trade set; a
+		// size_matched estimate is not a final fill.
+		return e.lookupAmbiguousSubmit(ctx, signed.OrderID, conditionID,
+			fmt.Errorf("提交实盘买单（订单 %s，结果可能未知）: %w", signed.OrderID, submitErr))
 	}
 	if response == nil {
 		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("Polymarket 返回空订单响应")
@@ -582,19 +590,6 @@ func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount,
 	fill := engine.LiveFill{OrderID: response.OrderID, Status: response.Status}
 	fill.Cost = parseAmount(response.MakingAmount)
 	fill.Shares = parseAmount(response.TakingAmount)
-	if fill.Shares <= 0 || fill.Cost <= 0 {
-		if response.OrderID != "" {
-			if detail, lookupErr := client.Order(ctx, response.OrderID); lookupErr == nil {
-				if lookedUp, ok := fillFromOrder(detail, order.Price); ok {
-					lookedUp.OrderID = response.OrderID
-					if feeErr := applyFee(schedule, &lookedUp); feeErr != nil {
-						return engine.LiveFill{OrderID: response.OrderID, Status: "unknown"}, feeErr
-					}
-					return lookedUp, nil
-				}
-			}
-		}
-	}
 	if fill.Shares <= 0 || fill.Cost <= 0 {
 		// The exchange accepted the order but the response did not include a
 		// usable match. Treat it as unknown and reconcile instead of
@@ -619,8 +614,9 @@ func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount,
 // book cannot take every share, the order is killed and the next scan retries.
 //
 // The CLOB response reports makingAmount as shares and takingAmount as pUSD for
-// a sell, the reverse of a buy. The taker fee is subtracted from the proceeds,
-// so LiveFill.Cost is the net cash the wallet receives.
+// a sell, the reverse of a buy. LiveFill.Cost stays the gross proceeds and the
+// taker fee is reported separately in LiveFill.Fee, so the engine subtracts it
+// exactly once.
 func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
 	if tokenID == "" || conditionID == "" || shares <= 0 || math.IsNaN(shares) || math.IsInf(shares, 0) {
 		return engine.LiveFill{}, fmt.Errorf("%w: token、condition 与份额必须有效", engine.ErrInvalidOrder)
@@ -633,6 +629,9 @@ func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares
 	if err != nil {
 		return engine.LiveFill{}, fmt.Errorf("读取实盘手续费: %w", err)
 	}
+	// MarketSellOrder reads the SDK's cached tick (and CreateOrder reuses it).
+	// Drop stale metadata first so the sell price is floored on today's tick.
+	client.InvalidateMarketMetadata(tokenID)
 	order, err := client.MarketSellOrder(ctx, tokenID, shares, clobclient.OrderTypeFOK)
 	if err != nil {
 		return engine.LiveFill{}, fmt.Errorf("构建实盘卖单: %w", err)
@@ -649,16 +648,16 @@ func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares
 	}
 	response, submitErr := client.SubmitSignedOrder(ctx, signed, clobclient.OrderTypeFOK, false)
 	if submitErr != nil {
-		if detail, lookupErr := client.Order(ctx, signed.OrderID); lookupErr == nil {
-			if fill, ok := fillFromOrder(detail, order.Price); ok {
-				fill.OrderID = signed.OrderID
-				if feeErr := applySellFee(schedule, &fill); feeErr != nil {
-					return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, feeErr
-				}
-				return fill, nil
+		var rejected *clobclient.OrderRejectedError
+		if errors.As(submitErr, &rejected) {
+			message := strings.TrimSpace(rejected.Message)
+			if message == "" {
+				message = "Polymarket 拒绝了卖单"
 			}
+			return engine.LiveFill{OrderID: signed.OrderID, Status: "rejected"}, fmt.Errorf("%s", message)
 		}
-		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("提交实盘卖单（订单 %s，结果可能未知）: %w", signed.OrderID, submitErr)
+		return e.lookupAmbiguousSubmit(ctx, signed.OrderID, conditionID,
+			fmt.Errorf("提交实盘卖单（订单 %s，结果可能未知）: %w", signed.OrderID, submitErr))
 	}
 	if response == nil {
 		return engine.LiveFill{OrderID: signed.OrderID, Status: "unknown"}, fmt.Errorf("Polymarket 返回空订单响应")
@@ -678,17 +677,6 @@ func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares
 		Shares: parseAmount(response.MakingAmount), Cost: parseAmount(response.TakingAmount),
 	}
 	if fill.Shares <= 0 || fill.Cost <= 0 {
-		if response.OrderID != "" {
-			if detail, lookupErr := client.Order(ctx, response.OrderID); lookupErr == nil {
-				if lookedUp, ok := fillFromOrder(detail, order.Price); ok {
-					lookedUp.OrderID = response.OrderID
-					if feeErr := applySellFee(schedule, &lookedUp); feeErr != nil {
-						return engine.LiveFill{OrderID: response.OrderID, Status: "unknown"}, feeErr
-					}
-					return lookedUp, nil
-				}
-			}
-		}
 		originalStatus := fill.Status
 		if fill.OrderID == "" {
 			fill.OrderID = signed.OrderID
@@ -697,16 +685,16 @@ func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares
 		return fill, fmt.Errorf("实盘卖单未产生可确认成交（原状态 %s）", originalStatus)
 	}
 	fill.Price = fill.Cost / fill.Shares
-	if err := applySellFee(schedule, &fill); err != nil {
+	if err := reportSellFee(schedule, &fill); err != nil {
 		return engine.LiveFill{OrderID: fill.OrderID, Status: "unknown"}, err
 	}
 	return fill, nil
 }
 
-// applySellFee subtracts the taker fee from a sell's gross proceeds. The fee is
-// charged on the shares sold, exactly like a buy, but it reduces cash received
-// instead of increasing cash paid.
-func applySellFee(schedule clobclient.FeeSchedule, fill *engine.LiveFill) error {
+// reportSellFee reports the taker fee on a sell without folding it into Cost.
+// Fill.Cost is the gross proceeds; the engine subtracts Fee exactly once, so
+// pre-deducting it here would charge the seller twice.
+func reportSellFee(schedule clobclient.FeeSchedule, fill *engine.LiveFill) error {
 	if fill == nil || fill.Shares <= 0 || fill.Price <= 0 || fill.Price >= 1 {
 		return nil
 	}
@@ -718,7 +706,6 @@ func applySellFee(schedule clobclient.FeeSchedule, fill *engine.LiveFill) error 
 		return fmt.Errorf("卖出手续费 %.8f 不小于成交所得 %.8f", fee, fill.Cost)
 	}
 	fill.Fee = fee
-	fill.Cost -= fee
 	return nil
 }
 
@@ -768,6 +755,16 @@ type buyPlan struct {
 // min_order_size is the five-share floor for resting limit orders; a marketable
 // BUY is sized in USDC and the exchange only requires one dollar, which is why
 // the web UI fills a $2 buy at 0.98 (2.04 shares) while the SDK refuses it.
+func alignTick(price, tick float64) float64 {
+	return math.Round(price/tick) * tick
+}
+
+// ceilTick rounds price up to the next tick without letting float noise
+// (0.07/0.01 == 7.000000000000001) add a tick that the price already sits on.
+func ceilTick(price, tick float64) float64 {
+	return alignTick(math.Ceil(price/tick-1e-9)*tick, tick)
+}
+
 func planMarketBuy(ctx context.Context, client *clobclient.Client, tokenID string, amount float64) (buyPlan, error) {
 	book, err := client.OrderBook(ctx, tokenID)
 	if err != nil {
@@ -806,28 +803,56 @@ func planMarketBuy(ctx context.Context, client *clobclient.Client, tokenID strin
 			break
 		}
 	}
-	tick := 0.01
+	bookTick := 0.0
 	if parsed, tickErr := strconv.ParseFloat(strings.TrimSpace(book.TickSize), 64); tickErr == nil && parsed > 0 {
-		tick = parsed
-	} else if fetched, tickErr := client.TickSize(ctx, tokenID); tickErr == nil && fetched > 0 {
-		tick = fetched
+		bookTick = parsed
 	}
-	limitPrice = math.Ceil(limitPrice/tick) * tick
+	// Signing uses the SDK's cached tick, not the book snapshot. Refresh that
+	// cache when it disagrees so the plan and the signature use one tick.
+	tick, tickErr := client.TickSize(ctx, tokenID)
+	if tickErr != nil || tick <= 0 {
+		if bookTick > 0 {
+			tick = bookTick
+		} else {
+			return buyPlan{}, fmt.Errorf("读取最小价位: %w", tickErr)
+		}
+	} else if bookTick > 0 && math.Abs(bookTick-tick) > 1e-9 {
+		client.InvalidateMarketMetadata(tokenID)
+		if refreshed, refreshErr := client.TickSize(ctx, tokenID); refreshErr == nil && refreshed > 0 {
+			tick = refreshed
+		}
+	}
+	limitPrice = ceilTick(limitPrice, tick)
 	if limitPrice <= 0 || limitPrice >= 1 {
 		return buyPlan{}, fmt.Errorf("盘口价格 %.6f 无法成交", limitPrice)
 	}
-	// The exchange keeps four decimals for a FAK buy's share amount.
+	// The exchange keeps four decimals for a FAK buy's share amount and floors
+	// the signed USDC amount to cents. A price of 0.98 with 2.0408 shares signs
+	// as $1.99 / 2.0408 = 0.9751, below the limit, and the exchange rejects it.
+	// Raise the signed limit by whole ticks (and resize the shares to stay in
+	// budget) until the signed maker/taker ratio still crosses the ask.
 	const shareScale = 10_000
-	shares := math.Floor((budget/limitPrice)*shareScale) / shareScale
-	if shares <= 0 {
-		return buyPlan{}, fmt.Errorf("盘口深度不足，无法买入")
+	bestAsk := levels[0].price
+	shares, signedNotional := 0.0, 0.0
+	for {
+		shares = math.Floor((budget/limitPrice)*shareScale) / shareScale
+		if shares <= 0 {
+			return buyPlan{}, fmt.Errorf("盘口深度不足，无法买入")
+		}
+		signedNotional = math.Floor(limitPrice*shares*100) / 100
+		if signedNotional/shares+1e-9 >= bestAsk {
+			break
+		}
+		limitPrice = alignTick(limitPrice+tick, tick)
+		if limitPrice >= 1 {
+			break
+		}
 	}
-	// The exchange floors a FAK buy's USDC side to cents when it signs, and its
-	// floor applies to that signed amount: a $1.00 budget at a 0.983 ask signs
-	// as $0.99 and is refused, so validate what would actually be signed.
-	signedNotional := math.Floor(limitPrice*shares*100) / 100
 	if minimum := polymarketMinBuyNotional; minimum > 0 && signedNotional+1e-9 < minimum {
 		return buyPlan{}, fmt.Errorf("下单金额 %.2f USDC 低于市场最小下单额 %.2f USDC（卖盘深度 %.4f USDC）", signedNotional, minimum, available)
+	}
+	if signedNotional/shares+1e-9 < bestAsk {
+		return buyPlan{}, fmt.Errorf("盘口价格 %.6f 按最小价位签名后无法成交", bestAsk)
 	}
 	return buyPlan{levels: levels, available: available, limitPrice: limitPrice, shares: shares}, nil
 }
@@ -893,10 +918,32 @@ func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amoun
 	}, nil
 }
 
+// lookupAmbiguousSubmit reconciles an order whose submit response did not
+// prove a fill. It returns a bookable fill only when LookupOrder can prove a
+// complete CONFIRMED trade set; otherwise the order stays unknown with an error
+// so the caller keeps it for reconciliation instead of booking a size_matched ×
+// limit-price estimate.
+func (e *Executor) lookupAmbiguousSubmit(ctx context.Context, orderID, conditionID string, cause error) (engine.LiveFill, error) {
+	fill, found, lookupErr := e.LookupOrder(ctx, orderID, conditionID)
+	if lookupErr == nil && found && fill.Shares > 0 && fill.Cost > 0 {
+		return fill, nil
+	}
+	reason := fmt.Sprintf("订单 %s 结果待确认: %v", orderID, cause)
+	if lookupErr != nil {
+		reason = fmt.Sprintf("%s（对账: %v）", reason, lookupErr)
+	}
+	return engine.LiveFill{OrderID: orderID, Status: "unknown"}, errors.New(reason)
+}
+
 // LookupOrder reconciles an order by its signed digest / exchange order ID.
-// The exchange reports the order's limit price, not its average execution
-// price, so the real fills are read from /data/trades and charged at what they
-// actually paid.
+//
+// The exchange reports the order's matched quantity and limit price, not the
+// average execution price. A positive size_matched is therefore not a fill:
+// a match can still be retried, mined or failed. The order is booked only when
+// every trade row is CONFIRMED, the cursor chain has been exhausted, and the
+// confirmed shares equal size_matched. Anything else returns an unknown fill
+// with an error so the engine leaves the order unresolved instead of booking a
+// limit-price estimate the exchange has not settled.
 func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string) (engine.LiveFill, bool, error) {
 	if orderID == "" {
 		return engine.LiveFill{}, false, nil
@@ -916,31 +963,37 @@ func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string)
 	if detail == nil {
 		return engine.LiveFill{}, false, nil
 	}
-	fill, ok := fillFromOrder(detail, 0)
-	if !ok {
+	expected := parseAmount(detail.SizeMatched)
+	trades, tradeErr := e.tradesForOrder(ctx, orderID, conditionID, expected)
+	if tradeErr != nil {
+		// The limit-price estimate is deliberately not returned: it is not a
+		// confirmed fill, and a failed or still-processing match must never be
+		// booked as shares. The error keeps the order unresolved upstream.
+		return engine.LiveFill{OrderID: orderID, Status: "unknown"}, true, fmt.Errorf("对账订单 %s 成交: %w", orderID, tradeErr)
+	}
+	if trades.ConfirmedShares <= 0 {
+		// A verified empty fill set: keep the order's own status so the engine
+		// can distinguish an open order from a terminal rejection.
 		return engine.LiveFill{OrderID: orderID, Status: detail.Status}, true, nil
 	}
-	if fill.OrderID == "" {
-		fill.OrderID = orderID
-	}
-	// Replace the limit-price estimate with the real average execution price
-	// whenever the fills are available. A trade read failure must not lose the
-	// reconciled order: the limit price stays as a conservative fallback.
-	if shares, notional, found, tradeErr := e.tradesForOrder(ctx, orderID, conditionID); tradeErr == nil && found && shares > 0 {
-		fill.Shares = shares
-		fill.Cost = notional
-		fill.Price = notional / shares
+	fill := engine.LiveFill{
+		OrderID: orderID,
+		Shares:  trades.ConfirmedShares,
+		Cost:    trades.ConfirmedNotional,
+		Price:   trades.ConfirmedNotional / trades.ConfirmedShares,
+		Status:  "CONFIRMED",
 	}
 	if conditionID != "" {
 		schedule, scheduleErr := client.FeeSchedule(ctx, conditionID)
 		if scheduleErr != nil {
-			return engine.LiveFill{}, false, fmt.Errorf("对账时读取实盘手续费: %w", scheduleErr)
+			return engine.LiveFill{OrderID: orderID, Status: "unknown"}, true, fmt.Errorf("对账时读取实盘手续费: %w", scheduleErr)
 		}
-		// Report the fee without folding it into Cost. The engine knows the
-		// order side and adds it for a buy or subtracts it for a sell.
-		fee, feeErr := feeFromSchedule(schedule, fill.Shares, fill.Price)
+		// Polymarket's fee is nonlinear in price, so compute it per confirmed
+		// trade instead of applying the schedule to the VWAP. Report it without
+		// folding it into Cost; the engine adds or subtracts it once.
+		fee, feeErr := feeFromLevels(schedule, trades.ConfirmedLevels)
 		if feeErr != nil {
-			return engine.LiveFill{}, false, feeErr
+			return engine.LiveFill{OrderID: orderID, Status: "unknown"}, true, feeErr
 		}
 		fill.Fee = fee
 	}
@@ -1055,6 +1108,21 @@ func applyFee(schedule clobclient.FeeSchedule, fill *engine.LiveFill) error {
 	return nil
 }
 
+// guardedHTTPClient never follows a redirect on an authenticated request.
+// Go's default redirect policy protects Authorization/Cookie but not the
+// POLY_* and RELAYER_* headers, so a configured or compromised endpoint could
+// otherwise forward exchange credentials to another host.
+func guardedHTTPClient(timeout time.Duration, proxy *netproxy.Manager) *http.Client {
+	client := &http.Client{Timeout: timeout}
+	if proxy != nil {
+		client = proxy.HTTPClient(timeout)
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client
+}
+
 func formatFloat(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
 }
@@ -1082,20 +1150,34 @@ func (e *Executor) Collateral(ctx context.Context) (engine.CashSnapshot, error) 
 		return snapshot, nil
 	}
 	cached := e.cash
+	generation := e.generation
 	e.mu.Unlock()
 
 	client, err := e.ensure(ctx)
 	if err != nil {
-		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, err
+		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, Allowances: cached.Allowances, At: cached.At, Stale: true}, err
 	}
-	balanceUnits, allowanceUnits, err := e.collateralBalance(ctx, client)
+	balanceUnits, allowances, err := e.collateralBalance(ctx, client)
 	if err != nil {
-		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true}, fmt.Errorf("读取实盘 pUSD 余额: %w", err)
+		return engine.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, Allowances: cached.Allowances, At: cached.At, Stale: true}, fmt.Errorf("读取实盘 pUSD 余额: %w", err)
 	}
-	snapshot := engine.CashSnapshot{Amount: balanceUnits, Allowance: allowanceUnits, At: time.Now().UTC()}
+	// Keep the largest approval for display and legacy callers; the engine
+	// guards each order against the exchange that will actually settle it.
+	allowanceUnits := 0.0
+	for _, value := range allowances {
+		if value > allowanceUnits {
+			allowanceUnits = value
+		}
+	}
+	snapshot := engine.CashSnapshot{Amount: balanceUnits, Allowance: allowanceUnits, Allowances: allowances, At: time.Now().UTC()}
 	e.mu.Lock()
-	e.cash = snapshot
-	e.cashAt = snapshot.At
+	// A balance read started before a credential/host switch belongs to the
+	// old wallet. Do not let its late response refill the new configuration's
+	// cache as fresh data.
+	if e.generation == generation {
+		e.cash = snapshot
+		e.cashAt = snapshot.At
+	}
 	e.mu.Unlock()
 	return snapshot, nil
 }
@@ -1111,7 +1193,7 @@ func (e *Executor) Collateral(ctx context.Context) (engine.CashSnapshot, error) 
 // therefore the source of truth, with the scalar kept for older deployments and
 // a fallback to the client so a rejected direct call never breaks the balance
 // read.
-func (e *Executor) collateralBalance(ctx context.Context, client *clobclient.Client) (float64, float64, error) {
+func (e *Executor) collateralBalance(ctx context.Context, client *clobclient.Client) (float64, map[string]float64, error) {
 	var response struct {
 		Balance    json.Number            `json:"balance"`
 		Allowance  json.Number            `json:"allowance"`
@@ -1124,34 +1206,38 @@ func (e *Executor) collateralBalance(ctx context.Context, client *clobclient.Cli
 	if err := e.l2Get(ctx, "/balance-allowance", query, &response); err != nil {
 		balance, allowance, sdkErr := e.collateralFromSDK(ctx, client)
 		if sdkErr != nil {
-			return 0, 0, err
+			return 0, nil, err
 		}
-		return balance, allowance, nil
+		return balance, map[string]float64{venue.PolymarketExchange: allowance}, nil
 	}
 	if strings.TrimSpace(response.Balance.String()) == "" {
 		// A response without a balance must not be booked as zero: zero cash
 		// would silently block every strategy order and misreport the wallet.
 		balance, allowance, sdkErr := e.collateralFromSDK(ctx, client)
 		if sdkErr != nil {
-			return 0, 0, fmt.Errorf("CLOB 未返回 pUSD 余额")
+			return 0, nil, fmt.Errorf("CLOB 未返回 pUSD 余额")
 		}
-		return balance, allowance, nil
+		return balance, map[string]float64{venue.PolymarketExchange: allowance}, nil
 	}
 	balance, err := collateralUnits(response.Balance)
 	if err != nil {
-		return 0, 0, fmt.Errorf("解析 pUSD 余额: %w", err)
+		return 0, nil, fmt.Errorf("解析 pUSD 余额: %w", err)
 	}
-	allowance, err := maxAllowance(response.Allowances)
-	if err != nil {
-		return 0, 0, fmt.Errorf("解析 pUSD 授权额度: %w", err)
+	allowances := make(map[string]float64, len(response.Allowances))
+	for spender, raw := range response.Allowances {
+		value, err := collateralUnits(raw)
+		if err != nil {
+			return 0, nil, fmt.Errorf("解析 pUSD 授权额度（%s）: %w", spender, err)
+		}
+		allowances[strings.ToLower(spender)] = value
 	}
-	if allowance == 0 {
+	if len(allowances) == 0 {
 		// Older deployments answered with a single scalar instead of the map.
 		if scalar, scalarErr := collateralUnits(response.Allowance); scalarErr == nil {
-			allowance = scalar
+			allowances[venue.PolymarketExchange] = scalar
 		}
 	}
-	return balance, allowance, nil
+	return balance, allowances, nil
 }
 
 // collateralFromSDK is the fallback read through the CLOB client. It can only
@@ -1181,31 +1267,6 @@ func (e *Executor) signatureType() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.cfg.SignatureType
-}
-
-// fillFromOrder turns an exchange order into a fill. The order response carries
-// no average execution price (avg_price is not part of GET /data/order), so this
-// is a limit-price estimate; LookupOrder overrides it with the real trade rows
-// whenever they are available.
-func fillFromOrder(detail *clobclient.Order, limitPrice float64) (engine.LiveFill, bool) {
-	if detail == nil {
-		return engine.LiveFill{}, false
-	}
-	shares := parseAmount(detail.SizeMatched)
-	price := parseAmount(detail.Price)
-	if price <= 0 {
-		price = limitPrice
-	}
-	if shares <= 0 || price <= 0 {
-		return engine.LiveFill{}, false
-	}
-	return engine.LiveFill{
-		OrderID: detail.ID,
-		Shares:  shares,
-		Cost:    shares * price,
-		Price:   price,
-		Status:  detail.Status,
-	}, true
 }
 
 func parseAmount(raw string) float64 {

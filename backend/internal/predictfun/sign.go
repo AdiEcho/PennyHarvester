@@ -215,7 +215,6 @@ func (o Order) validate(domain OrderDomain) error {
 	for name, value := range map[string]*big.Int{
 		"makerAmount": o.MakerAmount,
 		"takerAmount": o.TakerAmount,
-		"expiration":  o.Expiration,
 		"nonce":       o.Nonce,
 		"feeRateBps":  o.FeeRateBps,
 	} {
@@ -224,6 +223,14 @@ func (o Order) validate(domain OrderDomain) error {
 		}
 		if value.Sign() < 0 {
 			return fmt.Errorf("订单字段 %s 不能为负", name)
+		}
+	}
+	if o.Expiration != nil {
+		if o.Expiration.Sign() < 0 {
+			return fmt.Errorf("订单字段 expiration 不能为负")
+		}
+		if !o.Expiration.IsInt64() {
+			return fmt.Errorf("订单字段 expiration 超出 int64 Unix 秒范围")
 		}
 	}
 	return nil
@@ -249,7 +256,7 @@ func (o Order) signedOrder(signature string) SignedOrder {
 		TokenID:       bigOrZero(o.TokenID).String(),
 		MakerAmount:   bigOrZero(o.MakerAmount).String(),
 		TakerAmount:   bigOrZero(o.TakerAmount).String(),
-		Expiration:    bigOrZero(o.Expiration).String(),
+		Expiration:    bigOrZero(o.Expiration).Int64(),
 		Nonce:         bigOrZero(o.Nonce).String(),
 		FeeRateBps:    bigOrZero(o.FeeRateBps).String(),
 		Side:          uint8(o.Side),

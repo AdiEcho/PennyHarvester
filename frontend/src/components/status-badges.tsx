@@ -45,9 +45,9 @@ export function PositionStatusBadge({ status, exitKind, endDate }: { status: Pos
   return <Badge variant="danger"><CircleX className="h-3 w-3" /> 未胜出</Badge>
 }
 
-export function ModeBadge({ mode, className }: { mode: AccountMode | string; className?: string }) {
+export function ModeBadge({ mode, testnet = false, className }: { mode: AccountMode | string; testnet?: boolean; className?: string }) {
   if (mode === 'live') {
-    return <Badge variant="warning" className={className}><Radio className="h-3 w-3" /> 实盘 LIVE</Badge>
+    return <Badge variant="warning" className={className} title={testnet ? '实盘账户连接 Predict.fun 测试网，签名不涉及主网资金。' : undefined}><Radio className="h-3 w-3" /> {testnet ? '测试网 TESTNET' : '实盘 LIVE'}</Badge>
   }
   return <Badge variant="success" className={className}><FlaskConical className="h-3 w-3" /> 模拟 PAPER</Badge>
 }

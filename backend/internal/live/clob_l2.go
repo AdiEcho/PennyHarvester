@@ -21,9 +21,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -41,9 +41,14 @@ const defaultCLOBURL = "https://clob.polymarket.com"
 const maxL2ResponseBytes = 4 << 20
 
 // maxTradePages bounds how many /data/trades pages a single reconciliation may
-// walk. Fills of one order are contiguous, so a few pages are plenty and an
-// unbounded walk would make a cold reconcile expensive.
+// walk. Exceeding the cap makes the result incomplete; the absolute number is a
+// cost bound, not an assumption about how many fills one order may have.
 const maxTradePages = 5
+
+// tradeEndCursor is the CLOB pagination sentinel (base64 of "-1"). Sending it
+// back is rejected as an invalid cursor, so pagination must stop on it instead
+// of requesting one more page.
+const tradeEndCursor = "LTE="
 
 // clobHTTPError keeps the HTTP status of a failed CLOB call visible so callers
 // can distinguish "this order does not exist" (404) from a real failure.
@@ -115,10 +120,7 @@ func (e *Executor) l2Get(ctx context.Context, path string, query url.Values, tar
 	request.Header.Set("POLY_API_KEY", credentials.APIKey)
 	request.Header.Set("POLY_PASSPHRASE", credentials.Passphrase)
 
-	client := &http.Client{Timeout: 20 * time.Second}
-	if cfg.Proxy != nil {
-		client = cfg.Proxy.HTTPClient(20 * time.Second)
-	}
+	client := guardedHTTPClient(20*time.Second, cfg.Proxy)
 	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("请求 Polymarket CLOB: %w", err)
@@ -198,10 +200,79 @@ func maxAllowance(allowances map[string]json.Number) (float64, error) {
 
 // clobTrade is one fill row of GET /data/trades.
 type clobTrade struct {
+	ID           string `json:"id"`
 	TakerOrderID string `json:"taker_order_id"`
 	Price        string `json:"price"`
 	Size         string `json:"size"`
 	Status       string `json:"status"`
+}
+
+// tradeLegStatus is the finality of one trade row. MATCHED and MINED are
+// intermediate states: a match can still be retried, mined or failed, so only
+// CONFIRMED is booked. An unrecognized status is treated as pending on purpose;
+// it is not proof of a fill.
+type tradeLegStatus int
+
+const (
+	tradeLegPending tradeLegStatus = iota
+	tradeLegConfirmed
+	tradeLegFailed
+)
+
+// normalizeTradeStatus maps the REST and OpenAPI spellings of a trade status
+// onto its finality. The exchange prefixes some responses with TRADE_STATUS_;
+// stripping it keeps TRADE_STATUS_FAILED and FAILED the same failed leg. The
+// CLOB trade enum has one successful terminal state, CONFIRMED; MATCHED, MINED,
+// RETRYING and unknown values are non-final.
+func normalizeTradeStatus(raw string) tradeLegStatus {
+	status := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(raw)), "TRADE_STATUS_")
+	switch {
+	case status == "CONFIRMED":
+		return tradeLegConfirmed
+	case strings.HasPrefix(status, "FAILED"):
+		return tradeLegFailed
+	default:
+		return tradeLegPending
+	}
+}
+
+// orderTrades is the evidence gathered from /data/trades for one order. Only
+// confirmed legs contribute shares and notional; failed and pending legs are
+// counted so an incomplete fill set can be surfaced instead of booked.
+type orderTrades struct {
+	ExpectedShares    float64
+	ConfirmedShares   float64
+	ConfirmedNotional float64
+	ConfirmedLegs     int
+	ConfirmedLevels   []fillLevel
+	PendingLegs       int
+	FailedLegs        int
+	DuplicateLegs     int
+	Pages             int
+	Complete          bool
+}
+
+// reconciliationError describes why the evidence cannot be booked as a final
+// fill. It includes the confirmed/expected quantities and the non-final leg
+// counts so callers and operators can see what is missing.
+func (t orderTrades) reconciliationError() error {
+	details := []string{fmt.Sprintf("已确认 %.8g/%.8g 份", t.ConfirmedShares, t.ExpectedShares)}
+	if t.PendingLegs > 0 {
+		details = append(details, fmt.Sprintf("未终态 %d 笔", t.PendingLegs))
+	}
+	if t.FailedLegs > 0 {
+		details = append(details, fmt.Sprintf("失败 %d 笔", t.FailedLegs))
+	}
+	if t.DuplicateLegs > 0 {
+		details = append(details, fmt.Sprintf("重复 %d 笔已去重", t.DuplicateLegs))
+	}
+	return fmt.Errorf("成交记录不完整：%s", strings.Join(details, "，"))
+}
+
+// tradesReconcile compares the confirmed shares with the exchange's matched
+// quantity, allowing only floating-point noise between decimal strings.
+func tradesReconcile(confirmed, expected float64) bool {
+	return math.Abs(confirmed-expected) <= 1e-9*math.Max(1, math.Abs(expected))
 }
 
 // makerAddress is the wallet that owns the CLOB position: the funder for proxy,
@@ -213,15 +284,23 @@ func (e *Executor) makerAddress() string {
 	return strings.TrimSpace(e.Signer())
 }
 
-// tradesForOrder sums the fills of one order from GET /data/trades.
+// tradesForOrder enumerates the fills of one order from GET /data/trades and
+// keeps only CONFIRMED legs.
 //
 // This is what reconciliation needs: /data/order only reports the order's limit
 // price, so booking size_matched × price charges a FAK buy at its worst allowed
-// price instead of the price its matches actually paid.
-func (e *Executor) tradesForOrder(ctx context.Context, orderID, conditionID string) (shares, notional float64, found bool, err error) {
+// price instead of the price its matches actually paid. The whole cursor chain
+// is followed because one order's fills can span pages; stopping at the first
+// page that mentions the order permanently loses the rest of the fill. Every
+// page, cap or malformed-row failure returns an error alongside a result whose
+// Complete flag stays false, so the caller never books partial evidence as
+// final. Repeated trade IDs are counted once; identical repeats are harmless,
+// conflicting repeats cannot be proven and fail the reconciliation.
+func (e *Executor) tradesForOrder(ctx context.Context, orderID, conditionID string, expectedShares float64) (orderTrades, error) {
+	result := orderTrades{ExpectedShares: expectedShares}
 	orderID = strings.TrimSpace(orderID)
 	if orderID == "" {
-		return 0, 0, false, nil
+		return result, nil
 	}
 	query := url.Values{}
 	if conditionID != "" {
@@ -230,8 +309,12 @@ func (e *Executor) tradesForOrder(ctx context.Context, orderID, conditionID stri
 	if maker := e.makerAddress(); maker != "" {
 		query.Set("maker_address", maker)
 	}
+	seen := make(map[string]clobTrade)
 	cursor := ""
-	for page := 0; page < maxTradePages; page++ {
+	for {
+		if result.Pages >= maxTradePages {
+			return result, fmt.Errorf("成交记录超过 %d 页上限，无法确认完整成交", maxTradePages)
+		}
 		if cursor != "" {
 			query.Set("next_cursor", cursor)
 		}
@@ -240,40 +323,57 @@ func (e *Executor) tradesForOrder(ctx context.Context, orderID, conditionID stri
 			NextCursor string      `json:"next_cursor"`
 		}
 		if err := e.l2Get(ctx, "/data/trades", query, &response); err != nil {
-			// No trade history for this account yet is not a failure: the caller
-			// keeps the conservative limit-price estimate.
-			if isNotFound(err) {
-				return 0, 0, false, nil
-			}
-			return 0, 0, false, err
+			return result, fmt.Errorf("读取订单成交（第 %d 页）: %w", result.Pages+1, err)
 		}
+		result.Pages++
 		for _, trade := range response.Data {
 			if !strings.EqualFold(strings.TrimSpace(trade.TakerOrderID), orderID) {
 				continue
 			}
-			if strings.EqualFold(strings.TrimSpace(trade.Status), "FAILED") {
+			id := strings.TrimSpace(trade.ID)
+			if id == "" {
+				return result, fmt.Errorf("订单 %s 的成交缺少 ID，无法去重并确认完整成交", orderID)
+			}
+			if previous, ok := seen[id]; ok {
+				result.DuplicateLegs++
+				if normalizeTradeStatus(previous.Status) != normalizeTradeStatus(trade.Status) ||
+					parseAmount(previous.Size) != parseAmount(trade.Size) ||
+					parseAmount(previous.Price) != parseAmount(trade.Price) {
+					return result, fmt.Errorf("成交 %s 重复出现且内容冲突，无法确认完整成交", id)
+				}
 				continue
 			}
+			seen[id] = trade
 			size, price := parseAmount(trade.Size), parseAmount(trade.Price)
-			if size <= 0 || price <= 0 {
-				continue
+			if size <= 0 || price <= 0 || math.IsNaN(size) || math.IsNaN(price) || math.IsInf(size, 0) || math.IsInf(price, 0) {
+				return result, fmt.Errorf("成交 %s 的数量或价格无效（size=%q price=%q）", id, trade.Size, trade.Price)
 			}
-			shares += size
-			notional += size * price
-			found = true
+			switch normalizeTradeStatus(trade.Status) {
+			case tradeLegConfirmed:
+				result.ConfirmedLegs++
+				result.ConfirmedShares += size
+				result.ConfirmedNotional += size * price
+				result.ConfirmedLevels = append(result.ConfirmedLevels, fillLevel{shares: size, price: price})
+			case tradeLegFailed:
+				// A failed leg never contributes shares, but it still makes the
+				// order's fill set non-final.
+				result.FailedLegs++
+			default:
+				result.PendingLegs++
+			}
 		}
-		// Fills of one order are contiguous, so stop as soon as they are found.
-		if found || response.NextCursor == "" || response.NextCursor == cursor || len(response.Data) == 0 {
+		next := strings.TrimSpace(response.NextCursor)
+		if next == "" || next == tradeEndCursor {
 			break
 		}
-		cursor = response.NextCursor
+		if next == cursor {
+			return result, fmt.Errorf("成交分页游标 %q 未前进，无法确认完整成交", next)
+		}
+		cursor = next
 	}
-	return shares, notional, found, nil
-}
-
-// isNotFound reports whether err is a CLOB 404, which means the route answered
-// "nothing here" rather than a transport failure.
-func isNotFound(err error) bool {
-	var httpErr *clobHTTPError
-	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+	if result.FailedLegs > 0 || result.PendingLegs > 0 || !tradesReconcile(result.ConfirmedShares, expectedShares) {
+		return result, result.reconciliationError()
+	}
+	result.Complete = true
+	return result, nil
 }

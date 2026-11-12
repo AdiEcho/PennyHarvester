@@ -279,24 +279,3 @@ func TestApplyLiveSettingsDropsEndpointPinnedToTheOldNetwork(t *testing.T) {
 		t.Fatal("a nil network must keep the client on testnet")
 	}
 }
-
-func TestSideIsSellFallsBackWhenTheAckOmitsTheSide(t *testing.T) {
-	cases := []struct {
-		name     string
-		ack      OrderAck
-		fallback bool
-		want     bool
-	}{
-		{name: "explicit sell", ack: OrderAck{Side: Number("1")}, fallback: false, want: true},
-		{name: "explicit buy", ack: OrderAck{Side: Number("0")}, fallback: true, want: false},
-		{name: "missing side, sell request", ack: OrderAck{}, fallback: true, want: true},
-		{name: "missing side, buy request", ack: OrderAck{}, fallback: false, want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.ack.sideIsSell(tc.fallback); got != tc.want {
-				t.Fatalf("sideIsSell = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}

@@ -36,50 +36,63 @@ func (h *Handler) updateSystemSettings(c *gin.Context) {
 		return
 	}
 	// Treat the payload as a partial update so saving one section cannot wipe
-	// the other one. Masked secrets echoed back by the browser are restored
-	// from the stored values.
-	current := h.engine.SystemSettings()
-	settings := current
-	if request.Proxy != nil {
-		settings.Proxy = request.Proxy.MergeSecret(current.Proxy)
-	}
-	if request.DataSource != nil {
-		settings.DataSource = *request.DataSource
-	}
-	if request.Live != nil {
-		settings.Live = request.Live.MergeSecret(current.Live)
-	}
-	if request.Venues != nil {
-		venues := make(map[market.Venue]engine.VenueSystemSettings, len(current.Venues)+len(request.Venues))
-		for v, entry := range current.Venues {
-			venues[v] = entry
+	// the other one. The read/merge/validate/save sequence runs under the
+	// engine's configuration lock: two clients editing disjoint sections must
+	// not overwrite each other with a stale snapshot.
+	_, err := h.engine.PatchSystemSettings(c.Request.Context(), func(settings *engine.SystemSettings) error {
+		current := *settings
+		if request.Proxy != nil {
+			settings.Proxy = request.Proxy.MergeSecret(current.Proxy)
 		}
-		for v, entry := range request.Venues {
-			if !v.Valid() {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "未知场所"})
-				return
+		if request.DataSource != nil {
+			settings.DataSource = *request.DataSource
+		}
+		if request.Live != nil {
+			settings.Live = request.Live.MergeSecret(current.Live)
+		}
+		if request.Venues != nil {
+			venues := make(map[market.Venue]engine.VenueSystemSettings, len(current.Venues)+len(request.Venues))
+			for v, entry := range current.Venues {
+				venues[v] = entry
 			}
-			venues[v] = entry.Merge(current.Venues[v])
+			for v, entry := range request.Venues {
+				if !v.Valid() {
+					return engine.ErrInvalidSettings
+				}
+				venues[v] = entry.Merge(current.Venues[v])
+			}
+			settings.Venues = venues
 		}
-		settings.Venues = venues
-	}
-	// Dual read/write for Polymarket: when the payload carries venues.polymarket
-	// it wins over the flat fields; otherwise the flat fields win. Either way
-	// both views are written so an older frontend keeps working.
-	if pm, ok := request.Venues[market.VenuePolymarket]; ok {
-		merged := pm.Merge(current.Venues[market.VenuePolymarket])
-		settings.DataSource = engine.DataSourceSettings{
-			GammaBaseURL: merged.DataSource.GammaBaseURL,
-			CLOBBaseURL:  merged.DataSource.CLOBBaseURL,
+		// The flat fields are the legacy shape the current UI still submits. An
+		// explicitly supplied flat section wins over venues.polymarket for that
+		// section; a venue-only patch still fills the flat runtime view.
+		polymarketPatch, polymarketPatched := request.Venues[market.VenuePolymarket]
+		mergedPolymarket := polymarketPatch.Merge(current.Venues[market.VenuePolymarket])
+		if request.DataSource != nil {
+			// Normalize lets a populated venue entry win over the flat fields, so
+			// a flat edit must be mirrored into the venue entry before Sync.
+			pm := settings.Venues[market.VenuePolymarket]
+			pm.DataSource.GammaBaseURL = request.DataSource.GammaBaseURL
+			pm.DataSource.CLOBBaseURL = request.DataSource.CLOBBaseURL
+			settings.Venues[market.VenuePolymarket] = pm.Normalize()
+		} else if polymarketPatched {
+			settings.DataSource = engine.DataSourceSettings{
+				GammaBaseURL: mergedPolymarket.DataSource.GammaBaseURL,
+				CLOBBaseURL:  mergedPolymarket.DataSource.CLOBBaseURL,
+			}
 		}
-		settings.Live = merged.Live.LiveSettings
-	}
-	settings = settings.SyncPolymarketVenue()
-	if err := settings.Validate(); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := h.engine.UpdateSystemSettings(c.Request.Context(), settings); err != nil {
+		if request.Live != nil {
+			// settings.Live already carries the merged secrets from above.
+			pm := settings.Venues[market.VenuePolymarket]
+			pm.Live.LiveSettings = settings.Live
+			settings.Venues[market.VenuePolymarket] = pm.Normalize()
+		} else if polymarketPatched {
+			settings.Live = mergedPolymarket.Live.LiveSettings
+		}
+		*settings = settings.SyncPolymarketVenue()
+		return nil
+	})
+	if err != nil {
 		respondError(c, err)
 		return
 	}
@@ -227,6 +240,7 @@ func (h *Handler) testLive(c *gin.Context) {
 		"cash":           probe.Cash,
 		"allowance":      probe.Allowance,
 		"latency_ms":     probe.LatencyMS,
+		"testnet":        probe.Testnet,
 	})
 }
 
@@ -260,7 +274,11 @@ func (h *Handler) approveVenue(c *gin.Context) {
 	defer cancel()
 	approval, err := h.engine.ApproveVenue(ctx, v)
 	if err != nil {
-		c.JSON(approvalErrorStatus(err), gin.H{"error": err.Error()})
+		body := gin.H{"error": err.Error()}
+		if txHash := errorTransactionHash(err); txHash != "" {
+			body["tx_hash"] = txHash
+		}
+		c.JSON(approvalErrorStatus(err), body)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"venue": effectiveVenueLabel(v), "approval": approval})
@@ -287,7 +305,11 @@ func (h *Handler) redeemPosition(c *gin.Context) {
 	defer cancel()
 	result, err := h.engine.RedeemPosition(ctx, accountID, positionID)
 	if err != nil {
-		c.JSON(redeemErrorStatus(err), gin.H{"error": err.Error()})
+		body := gin.H{"error": err.Error()}
+		if result.TxHash != "" {
+			body["tx_hash"] = result.TxHash
+		}
+		c.JSON(redeemErrorStatus(err), body)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -429,4 +451,14 @@ func envValue(key string) string {
 		return value
 	}
 	return strings.TrimSpace(os.Getenv(strings.ToLower(key)))
+}
+
+// errorTransactionHash exposes a signed chain hash from a wrapped error without
+// coupling the HTTP layer to a venue adapter.
+func errorTransactionHash(err error) string {
+	var hasher interface{ TransactionHash() string }
+	if errors.As(err, &hasher) {
+		return hasher.TransactionHash()
+	}
+	return ""
 }

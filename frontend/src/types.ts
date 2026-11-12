@@ -54,6 +54,8 @@ export interface Account {
   live_signer: string
   live_maker: string
   live_error: string
+  /** Predict.fun 测试网实盘；Polymarket 与模拟账户为 false。 */
+  live_testnet?: boolean
 }
 
 export interface AccountsResponse {

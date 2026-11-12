@@ -81,7 +81,11 @@ export function PositionsView() {
   )
   const { data, error, isLoading, isRefreshing, refresh } = usePolling(fetchPositions, { enabled: Boolean(accountId) })
   const { toast } = useToast()
-  const [redeeming, setRedeeming] = useState<number | null>(null)
+  // A single id unlocked every other row when two redemptions overlapped, and
+  // the first completion cleared the second row's busy state. Track each
+  // on-chain attempt independently.
+  const [redeeming, setRedeeming] = useState<Set<number>>(() => new Set())
+  const redeemingRef = useRef<Set<number>>(new Set())
   // Redemption is a live, on-chain action: a simulated position has no shares to
   // burn, and each venue advertises whether it implements claiming at all.
   const canRedeemVenue = useCallback(
@@ -90,8 +94,9 @@ export function PositionsView() {
   )
   const handleRedeem = useCallback(
     async (position: Position) => {
-      if (!accountId) return
-      setRedeeming(position.id)
+      if (!accountId || redeemingRef.current.has(position.id)) return
+      redeemingRef.current.add(position.id)
+      setRedeeming((current) => new Set(current).add(position.id))
       try {
         const result = await api.redeemPosition(accountId, position.id)
         toast({
@@ -103,7 +108,8 @@ export function PositionsView() {
       } catch (caught) {
         toast({ title: '赎回失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
       } finally {
-        setRedeeming(null)
+        redeemingRef.current.delete(position.id)
+        setRedeeming((current) => { const next = new Set(current); next.delete(position.id); return next })
       }
     },
     [accountId, refresh, toast],
@@ -140,7 +146,7 @@ export function PositionsView() {
                 const pnl = positionPnl(position)
                 const venue = venueOf(position)
                 const canRedeemRow = isLive && canRedeemVenue(venue) && (position.status === 'won' || position.status === 'lost' || position.status === 'split')
-                return <tr key={position.id} className="hover:bg-slate-50/60"><td className="max-w-[360px] px-5 py-4"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={position.question}>{position.question}</p><div className="mt-1.5 flex items-center gap-2 text-xs"><VenueChip venue={venue} /><span className="font-medium text-blue-700">{position.outcome}</span><span className="text-slate-300">·</span><span className="text-slate-400">#{position.id}</span></div></td><td className="px-4 py-4"><PositionStatusBadge status={position.status} exitKind={position.exit_kind} endDate={position.end_date} /></td><td className="px-4 py-4 text-right tabular-nums text-slate-700"><span>{formatPrice(position.entry_price)}</span><span className="mx-1.5 text-slate-300">→</span><span>{formatPrice(position.current_price)}</span></td><td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatNumber(position.shares, 4)}</td><td className="px-4 py-4 text-right"><p className="font-medium tabular-nums text-slate-800">{fmtMoney(position.cost, venue)}</p><p className="mt-1 text-[11px] text-slate-400">费用 {fmtMoney(position.fee, venue)}</p></td><td className="px-4 py-4 text-right"><p className={cn('font-semibold tabular-nums', pnlClass(pnl))}>{fmtMoney(pnl, venue, { signed: true })}</p><p className="mt-1 text-[11px] text-slate-400">{position.status === 'open' ? '未实现' : '已实现'}</p></td><td className="px-5 py-4 text-right text-xs text-slate-500"><p>{position.status === 'open' ? '开仓' : position.exit_kind === 'stop' ? '止损' : '结算'} {formatDate(position.status === 'open' ? position.opened_at : position.closed_at)}</p><p className="mt-1 text-[11px] text-slate-400" title={formatFullDate(position.end_date)}>收盘 {formatDate(position.end_date)}</p>{canRedeemRow && <Button className="mt-2" variant="secondary" onClick={() => handleRedeem(position)} disabled={redeeming === position.id}>{redeeming === position.id ? '赎回中…' : '赎回'}</Button>}</td></tr>
+                return <tr key={position.id} className="hover:bg-slate-50/60"><td className="max-w-[360px] px-5 py-4"><p className="line-clamp-2 font-medium leading-5 text-slate-800" title={position.question}>{position.question}</p><div className="mt-1.5 flex items-center gap-2 text-xs"><VenueChip venue={venue} /><span className="font-medium text-blue-700">{position.outcome}</span><span className="text-slate-300">·</span><span className="text-slate-400">#{position.id}</span></div></td><td className="px-4 py-4"><PositionStatusBadge status={position.status} exitKind={position.exit_kind} endDate={position.end_date} /></td><td className="px-4 py-4 text-right tabular-nums text-slate-700"><span>{formatPrice(position.entry_price)}</span><span className="mx-1.5 text-slate-300">→</span><span>{formatPrice(position.current_price)}</span></td><td className="px-4 py-4 text-right tabular-nums text-slate-600">{formatNumber(position.shares, 4)}</td><td className="px-4 py-4 text-right"><p className="font-medium tabular-nums text-slate-800">{fmtMoney(position.cost, venue)}</p><p className="mt-1 text-[11px] text-slate-400">费用 {fmtMoney(position.fee, venue)}</p></td><td className="px-4 py-4 text-right"><p className={cn('font-semibold tabular-nums', pnlClass(pnl))}>{fmtMoney(pnl, venue, { signed: true })}</p><p className="mt-1 text-[11px] text-slate-400">{position.status === 'open' ? '未实现' : '已实现'}</p></td><td className="px-5 py-4 text-right text-xs text-slate-500"><p>{position.status === 'open' ? '开仓' : position.exit_kind === 'stop' ? '止损' : '结算'} {formatDate(position.status === 'open' ? position.opened_at : position.closed_at)}</p><p className="mt-1 text-[11px] text-slate-400" title={formatFullDate(position.end_date)}>收盘 {formatDate(position.end_date)}</p>{canRedeemRow && <Button className="mt-2" variant="secondary" onClick={() => handleRedeem(position)} disabled={redeeming.has(position.id)}>{redeeming.has(position.id) ? '赎回中…' : '赎回'}</Button>}</td></tr>
               })}</tbody>
             </table></div>
           </Card>
@@ -150,7 +156,7 @@ export function PositionsView() {
               position={position}
               isLive={isLive}
               canRedeem={canRedeemVenue(venueOf(position))}
-              redeeming={redeeming === position.id}
+              redeeming={redeeming.has(position.id)}
               onRedeem={handleRedeem}
             />
           ))}</div>

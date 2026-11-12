@@ -275,8 +275,8 @@ func TestSystemSettingsLiveCredentialsAreRedactedAndPreserved(t *testing.T) {
 	if saved.Live.PrivateKey != netproxy.RedactedSecret || saved.Live.APISecret != netproxy.RedactedSecret || saved.Live.APIPassphrase != netproxy.RedactedSecret {
 		t.Fatalf("secrets were not redacted: %+v", saved.Live)
 	}
-	if saved.Live.APIKey != "api-key" {
-		t.Fatalf("API key should remain readable, got %q", saved.Live.APIKey)
+	if saved.Live.APIKey != netproxy.RedactedSecret {
+		t.Fatalf("API key should be masked, got %q", saved.Live.APIKey)
 	}
 
 	stored, err := repository.LoadSystemSettings(ctx)
@@ -399,6 +399,7 @@ func TestSystemSettingsVenueBlocksRoundTrip(t *testing.T) {
 			Live       engine.VenueLiveSettings       `json:"live"`
 			LiveOK     bool                           `json:"live_configured"`
 			KeyOK      bool                           `json:"private_key_configured"`
+			APIKeyOK   bool                           `json:"api_key_configured"`
 		} `json:"venues"`
 		Runtime engine.SystemRuntime `json:"runtime"`
 	}
@@ -406,10 +407,10 @@ func TestSystemSettingsVenueBlocksRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	pf := saved.Venues[market.VenuePredictFun]
-	if pf.DataSource.BaseURL != "https://api.predict.fun" || pf.Live.APIKey != "pf-key" || !testnetOn(pf.Live.Testnet) {
+	if pf.DataSource.BaseURL != "https://api.predict.fun" || pf.Live.APIKey != netproxy.RedactedSecret || !testnetOn(pf.Live.Testnet) {
 		t.Fatalf("predictfun venue block was not returned: %+v", pf)
 	}
-	if pf.Live.PrivateKey != netproxy.RedactedSecret || !pf.LiveOK || !pf.KeyOK {
+	if pf.Live.PrivateKey != netproxy.RedactedSecret || !pf.LiveOK || !pf.KeyOK || !pf.APIKeyOK {
 		t.Fatalf("predictfun secrets must be redacted with configured flags: %+v", pf)
 	}
 	if len(saved.Runtime.Venues) != 1 || saved.Runtime.Venues[0].Venue != market.VenuePolymarket {

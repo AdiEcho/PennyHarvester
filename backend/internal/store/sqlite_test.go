@@ -169,7 +169,7 @@ func TestSchemaMigratesLegacyStatusConstraints(t *testing.T) {
 		t.Fatalf("split status was not accepted after migration: %v", err)
 	}
 	order, err := repository.CreateOrder(ctx, engine.Order{
-		AccountID: paper.ID, PositionID: &position.ID, MarketID: "m1", Question: "split",
+		AccountID: paper.ID, PositionID: &position.ID, MarketID: "m1", EventID: "event-m1", Question: "split",
 		Outcome: "Yes", TokenID: "t1", Kind: "manual", Type: "buy", Amount: 100.15,
 		Price: 0.98, Shares: 102.19, Fee: 0.15, Status: "pending", Reason: "pending", ExternalID: "order-1", CreatedAt: now,
 	})
@@ -201,6 +201,18 @@ func TestSchemaMigratesLegacyStatusConstraints(t *testing.T) {
 	}
 	if len(orders) != 2 {
 		t.Fatalf("expected a buy and a sell order after migration: %+v", orders)
+	}
+	foundEvent := false
+	for _, got := range orders {
+		if got.ID == order.ID {
+			foundEvent = true
+			if got.EventID != "event-m1" {
+				t.Fatalf("event_id was lost in the status rebuild: %+v", got)
+			}
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("migrated buy order was not returned: %+v", orders)
 	}
 }
 
@@ -403,7 +415,7 @@ func TestOrderFeeIsPersisted(t *testing.T) {
 		t.Fatal(err)
 	}
 	order, err := repository.CreateOrder(ctx, engine.Order{
-		AccountID: account.ID, MarketID: "m", Question: "q", Outcome: "Yes", TokenID: "t",
+		AccountID: account.ID, MarketID: "m", EventID: "event-m", Question: "q", Outcome: "Yes", TokenID: "t",
 		Kind: "manual", Type: "buy", Amount: 100.15, Price: 0.98, Shares: 102.19,
 		Fee: 0.15, Status: "filled", CreatedAt: time.Now().UTC(),
 	})
@@ -419,6 +431,9 @@ func TestOrderFeeIsPersisted(t *testing.T) {
 	}
 	if orders[0].ID != order.ID || orders[0].Fee != 0.15 || orders[0].Amount != 100.15 {
 		t.Fatalf("order fee was not persisted: %+v", orders[0])
+	}
+	if orders[0].EventID != "event-m" {
+		t.Fatalf("order event id was not persisted: %+v", orders[0])
 	}
 }
 
@@ -816,5 +831,38 @@ func TestAccountSettingsAreStoredPerAccount(t *testing.T) {
 	}
 	if reloaded.OrderSize != global.OrderSize {
 		t.Fatalf("saving account settings changed the global defaults: %+v", reloaded)
+	}
+}
+
+func TestInitializeAccountBaselineIsCompareAndSet(t *testing.T) {
+	ctx := context.Background()
+	repository, err := Open(ctx, filepath.Join(t.TempDir(), "baseline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	account, err := repository.CreateAccount(ctx, engine.Account{
+		Name: "live", Mode: engine.AccountModeLive, CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := repository.InitializeAccountBaseline(ctx, account.ID, 1000)
+	if err != nil || !updated {
+		t.Fatalf("first init = %v/%v", updated, err)
+	}
+	updated, err = repository.InitializeAccountBaseline(ctx, account.ID, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("second init overwrote the committed baseline")
+	}
+	stored, err := repository.AccountByID(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.BaselineEquity != 1000 {
+		t.Fatalf("baseline = %v, want 1000", stored.BaselineEquity)
 	}
 }

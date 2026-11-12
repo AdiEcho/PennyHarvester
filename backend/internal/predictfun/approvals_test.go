@@ -1,11 +1,18 @@
 package predictfun
 
 import (
+	"context"
 	"encoding/hex"
+	"encoding/json"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 func TestSelectors(t *testing.T) {
@@ -214,5 +221,72 @@ func TestApprovalStateAllowanceAndReady(t *testing.T) {
 				t.Fatalf("Ready(%v) = %v, want %v", tc.min, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSendCallPreservesHashWhenBroadcastIsUncertain(t *testing.T) {
+	key, err := crypto.HexToECDSA("4c0883a69102937d6231471b5dbb6204fe512961708279f2e3e8a5d4b8e3e8a5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// EstimateGas falls back, then the broadcast fails. A node can accept
+		// the raw transaction and still lose the connection before answering.
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"connection reset"}}`))
+	}))
+	defer server.Close()
+	client, err := ethclient.Dial(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := &OnChain{settings: settings{
+		key:     key,
+		signer:  crypto.PubkeyToAddress(key.PublicKey),
+		chainID: 97,
+	}}
+	_, err = chain.sendCall(context.Background(), client, 7, big.NewInt(1), approvalCall{
+		to:     common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		data:   []byte{0x01},
+		action: "测试授权",
+	})
+	if err == nil {
+		t.Fatal("expected broadcast error")
+	}
+	hash, ok := TxHashOf(err)
+	if !ok || hash == (common.Hash{}) {
+		t.Fatalf("broadcast error lost the signed hash: %v", err)
+	}
+	if !strings.Contains(err.Error(), hash.Hex()) {
+		t.Fatalf("error text %q does not identify transaction %s", err, hash.Hex())
+	}
+}
+
+func TestOnChainRejectsRPCFromAnotherNetwork(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var call struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&call)
+		w.Header().Set("Content-Type", "application/json")
+		switch call.Method {
+		case "eth_chainId":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x38"}`)) // 56
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"unexpected call"}}`))
+		}
+	}))
+	defer server.Close()
+	chain, err := NewOnChain(Config{
+		PrivateKey: "4c0883a69102937d6231471b5dbb6204fe512961708279f2e3e8a5d4b8e3e8a5",
+		Testnet:    true, // chainId 97
+		RPCURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chain.Allowance(context.Background()); err == nil || !strings.Contains(err.Error(), "chainId") {
+		t.Fatalf("mismatched network was not rejected: %v", err)
 	}
 }

@@ -62,6 +62,25 @@ func TestMarketsReadsEnvelopeAndCursor(t *testing.T) {
 	}
 }
 
+func TestMarketsSendsAfterNotCursor(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		writeJSON(w, `{"success":true,"data":[]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, Testnet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := client.Markets(context.Background(), MarketQuery{Cursor: "page-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotQuery, "after=page-2") || strings.Contains(gotQuery, "cursor=") {
+		t.Fatalf("pagination query = %q, want after=", gotQuery)
+	}
+}
+
 func TestAPIErrorCarriesStatusAndTruncatedBody(t *testing.T) {
 	body := strings.Repeat("x", 500)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +159,7 @@ func TestAuthRefreshRetriesOnceWithSamePayload(t *testing.T) {
 				io.WriteString(w, `{"success":false,"message":"token expired"}`)
 				return
 			}
-			writeJSON(w, `{"success":true,"data":{"id":"ord-9","status":"MATCHED"}}`)
+			writeJSON(w, `{"success":true,"data":{"code":"OK","orderId":"ord-9","orderHash":"0x99"}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -151,13 +170,11 @@ func TestAuthRefreshRetriesOnceWithSamePayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	ack, err := client.PlaceOrder(context.Background(), SignedOrderRequest{
-		Order: SignedOrder{TokenID: "111", Side: uint8(SideBuy), Signature: "0xsig"},
-	})
+	ack, err := client.PlaceOrder(context.Background(), testCreateOrderRequest())
 	if err != nil {
 		t.Fatalf("PlaceOrder: %v", err)
 	}
-	if ack.IDString() != "ord-9" {
+	if ack.OrderID != "ord-9" {
 		t.Fatalf("ack = %+v", ack)
 	}
 	mu.Lock()
@@ -240,9 +257,7 @@ func TestPlaceOrderDoesNotRetryServerError(t *testing.T) {
 	exchange := newFakeExchange()
 	exchange.statusHooks = []int{http.StatusInternalServerError}
 	client := newTestClient(t, exchange.handler())
-	_, err := client.PlaceOrder(context.Background(), SignedOrderRequest{
-		Order: SignedOrder{TokenID: "111", Side: uint8(SideBuy), Signature: "0xsig"},
-	})
+	_, err := client.PlaceOrder(context.Background(), testCreateOrderRequest())
 	if err == nil || !strings.Contains(err.Error(), "HTTP 500") {
 		t.Fatalf("error = %v", err)
 	}
@@ -251,8 +266,8 @@ func TestPlaceOrderDoesNotRetryServerError(t *testing.T) {
 	}
 }
 
-func TestCancelOrderPostsOrderID(t *testing.T) {
-	var body map[string]string
+func TestCancelOrderPostsNestedIDsAndHonoursOutcomes(t *testing.T) {
+	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/auth/message":
@@ -264,7 +279,7 @@ func TestCancelOrderPostsOrderID(t *testing.T) {
 			if err := json.Unmarshal(raw, &body); err != nil {
 				t.Errorf("cancel body: %v", err)
 			}
-			writeJSON(w, `{"success":true,"data":{}}`)
+			writeJSON(w, `{"success":true,"removed":["ord-1"],"noop":["ord-2"],"rejected":["locked-3"]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -276,10 +291,142 @@ func TestCancelOrderPostsOrderID(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 	if err := client.CancelOrder(context.Background(), "ord-1"); err != nil {
-		t.Fatalf("CancelOrder: %v", err)
+		t.Fatalf("CancelOrder removed: %v", err)
 	}
-	if body["orderId"] != "ord-1" {
-		t.Fatalf("cancel body = %v", body)
+	if err := client.CancelOrder(context.Background(), "ord-2"); err != nil {
+		t.Fatalf("CancelOrder noop: %v", err)
+	}
+	err = client.CancelOrder(context.Background(), "locked-3")
+	var rejected *CancelRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("CancelOrder rejected error = %v, want CancelRejectedError", err)
+	}
+	data, ok := body["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("cancel body = %v, want a data object", body)
+	}
+	ids, ok := data["ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != "locked-3" {
+		t.Fatalf("cancel ids = %v, want [locked-3]", data["ids"])
+	}
+	if _, exists := body["orderId"]; exists {
+		t.Fatalf("old orderId field was sent: %v", body)
+	}
+}
+
+func TestCancelOrdersReportsMixedResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/message":
+			writeJSON(w, `{"success":true,"data":{"message":"login"}}`)
+		case "/v1/auth":
+			writeJSON(w, `{"success":true,"data":{"token":"test-token"}}`)
+		default:
+			writeJSON(w, `{"success":true,"removed":["a"],"noop":["b"],"rejected":["c"]}`)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key", PrivateKey: testKeyHex, Testnet: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	response, err := client.CancelOrders(context.Background(), []string{"a", "b", "c"})
+	if err != nil {
+		t.Fatalf("CancelOrders: %v", err)
+	}
+	if response.Removed == nil || response.Noop == nil || response.Rejected == nil {
+		t.Fatalf("response = %+v, want all three outcome lists", response)
+	}
+	if !containsString(*response.Removed, "a") || !containsString(*response.Noop, "b") || !containsString(*response.Rejected, "c") {
+		t.Fatalf("response outcomes = %+v", response)
+	}
+	if _, err := client.CancelOrders(context.Background(), nil); err == nil {
+		t.Fatal("an empty ids request must be rejected locally")
+	}
+}
+
+func TestCancelOrderRequiresTheRequestedIDInTheResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, `{"success":true,"removed":[],"noop":[],"rejected":[]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, Testnet: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := client.CancelOrder(context.Background(), "missing"); err == nil {
+		t.Fatal("an outcome that omits the requested id must not be treated as success")
+	}
+}
+
+func TestPlaceOrderPostsTheOfficialNestedContract(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/message":
+			writeJSON(w, `{"success":true,"data":{"message":"login"}}`)
+		case "/v1/auth":
+			writeJSON(w, `{"success":true,"data":{"token":"test-token"}}`)
+		default:
+			raw, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+			writeJSON(w, `{"success":true,"data":{"code":"OK","orderId":"ord-1","orderHash":"0x1"}}`)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key", PrivateKey: testKeyHex, Testnet: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := client.PlaceOrder(context.Background(), testCreateOrderRequest()); err != nil {
+		t.Fatalf("PlaceOrder: %v", err)
+	}
+	data, ok := body["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("body = %v, want data object", body)
+	}
+	if _, ok := data["order"].(map[string]any); !ok {
+		t.Fatalf("data.order = %v, want the ContractOrder object", data["order"])
+	}
+	if data["pricePerShare"] != "500000000000000000" {
+		t.Fatalf("data.pricePerShare = %v", data["pricePerShare"])
+	}
+	if data["strategy"] != "LIMIT" {
+		t.Fatalf("data.strategy = %v", data["strategy"])
+	}
+	if data["slippageBps"] != "200" {
+		t.Fatalf("data.slippageBps = %v, want a string", data["slippageBps"])
+	}
+	for _, old := range []string{"salt", "maker", "side", "pricePerShare", "slippageBps"} {
+		if _, ok := body[old]; ok {
+			t.Fatalf("old top-level %q field was sent: %v", old, body)
+		}
+	}
+}
+
+func TestPlaceOrderRejectsMissingRequiredContractFields(t *testing.T) {
+	client, err := NewClient(Config{BaseURL: "http://127.0.0.1:1", Testnet: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	missingOrder := testCreateOrderRequest()
+	missingOrder.Data.Order = nil
+	missingPrice := testCreateOrderRequest()
+	missingPrice.Data.PricePerShare = ""
+	missingStrategy := testCreateOrderRequest()
+	missingStrategy.Data.Strategy = ""
+	numericSlippage := testCreateOrderRequest()
+	numericSlippage.Data.SlippageBps = "abc"
+	for name, request := range map[string]CreateOrderRequest{
+		"order": missingOrder, "price": missingPrice, "strategy": missingStrategy, "slippage": numericSlippage,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := client.PlaceOrder(context.Background(), request); err == nil {
+				t.Fatal("invalid create request was accepted locally")
+			}
+		})
 	}
 }
 
@@ -297,6 +444,102 @@ func TestOrderNotFound(t *testing.T) {
 	_, err = client.Order(context.Background(), "missing")
 	if !IsNotFound(err) {
 		t.Fatalf("IsNotFound(%v) = false", err)
+	}
+}
+
+func TestStrictFixtureRejectsOldCreateAndCancelShapes(t *testing.T) {
+	exchange := newFakeExchange()
+	client := newTestClient(t, exchange.handler())
+
+	oldCreate := map[string]any{
+		"data": map[string]any{
+			"salt": "1", "maker": "0x1111111111111111111111111111111111111111",
+			"signer":  "0x1111111111111111111111111111111111111111",
+			"taker":   "0x0000000000000000000000000000000000000000",
+			"tokenId": "111", "makerAmount": "5000000000000000000",
+			"takerAmount": "10000000000000000000", "expiration": 1893456000,
+			"nonce": "0", "feeRateBps": "200", "side": 0, "signatureType": 0, "signature": "0xsig",
+		},
+		"pricePerShare": "500000000000000000", "slippageBps": 200, "isMinAmountOut": true,
+	}
+	var createResponse CreateOrderResponse
+	if _, err := client.roundTrip(context.Background(), apiRequest{
+		method: http.MethodPost, path: "/v1/orders", body: oldCreate, authed: true, whole: true,
+	}, &createResponse); err == nil || !isAPIStatus(err, http.StatusBadRequest) {
+		t.Fatalf("old create shape error = %v, want HTTP 400 from the strict fixture", err)
+	}
+
+	oldCancel := map[string]any{"orderId": "ord-1"}
+	var cancelResponse RemoveOrdersResponse
+	if _, err := client.roundTrip(context.Background(), apiRequest{
+		method: http.MethodPost, path: "/v1/orders/remove", body: oldCancel, authed: true, whole: true,
+	}, &cancelResponse); err == nil || !isAPIStatus(err, http.StatusBadRequest) {
+		t.Fatalf("old cancel shape error = %v, want HTTP 400 from the strict fixture", err)
+	}
+}
+
+func isAPIStatus(err error, status int) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == status
+}
+
+func TestOrderReadsNestedOrderWhenOuterIDIsPresent(t *testing.T) {
+	exchange := newFakeExchange()
+	exchange.placed = true
+	exchange.orderStatus = "OPEN"
+	exchange.orderAmountFilled = "40000000000000000000"
+	exchange.lastOrder = &ContractOrder{
+		Salt: "7", Maker: "0x2222222222222222222222222222222222222222",
+		Signer:  "0x2222222222222222222222222222222222222222",
+		Taker:   "0x0000000000000000000000000000000000000000",
+		TokenID: "222", MakerAmount: "30000000000000000000",
+		TakerAmount: "100000000000000000000", Expiration: 1893456000,
+		Nonce: "3", FeeRateBps: "150", Side: uint8(SideSell), SignatureType: 0,
+		Signature: "0xsig",
+	}
+	client := newTestClient(t, exchange.handler())
+	order, err := client.Order(context.Background(), exchange.orderHash)
+	if err != nil {
+		t.Fatalf("Order: %v", err)
+	}
+	if order.ID != exchange.orderID || order.Status != "OPEN" || order.AmountFilled.String() != exchange.orderAmountFilled {
+		t.Fatalf("outer order fields = %+v", order)
+	}
+	if order.Order == nil {
+		t.Fatal("nested order was dropped because the outer id was present")
+	}
+	if order.Order.Side != uint8(SideSell) || order.Order.MakerAmount != "30000000000000000000" || order.Order.TakerAmount != "100000000000000000000" {
+		t.Fatalf("nested order = %+v", order.Order)
+	}
+	if order.Order.Hash != exchange.orderHash {
+		t.Fatalf("inner hash = %q, want %q", order.Order.Hash, exchange.orderHash)
+	}
+}
+
+func TestAllMatchesForOrderFollowsCursorAndStopsOnCycle(t *testing.T) {
+	pageOne := `[{"transactionHash":"0xtx1","taker":{"hash":"0xa","amount":"10","price":"0.4","fee":{"amount":"0","type":"SHARES"}}}]`
+	pageTwo := `[{"transactionHash":"0xtx2","taker":{"hash":"0xa","amount":"20","price":"0.6","fee":{"amount":"0","type":"SHARES"}}}]`
+
+	exchange := newFakeExchange()
+	exchange.matchPages = map[string]string{"": pageOne, "p2": pageTwo}
+	exchange.matchCursors = map[string]string{"": "p2", "p2": ""}
+	client := newTestClient(t, exchange.handler())
+	matches, complete, err := client.AllMatchesForOrder(context.Background(), exchange.orderHash)
+	if err != nil {
+		t.Fatalf("AllMatchesForOrder: %v", err)
+	}
+	if !complete || len(matches) != 2 {
+		t.Fatalf("matches/complete = %d/%v, want 2/true", len(matches), complete)
+	}
+
+	exchange.matchesCursor = ""
+	exchange.matchCursors = map[string]string{"": "p2", "p2": "p2"}
+	matches, complete, err = client.AllMatchesForOrder(context.Background(), exchange.orderHash)
+	if err != nil {
+		t.Fatalf("AllMatchesForOrder cycle: %v", err)
+	}
+	if complete || len(matches) != 2 {
+		t.Fatalf("repeated cursor matches/complete = %d/%v, want 2/false", len(matches), complete)
 	}
 }
 
@@ -363,5 +606,44 @@ func TestBookLevelAcceptsObjectForm(t *testing.T) {
 	}
 	if level.Price.String() != "0.4" || level.Size.String() != "12" {
 		t.Fatalf("level = %+v", level)
+	}
+}
+
+func TestApplyDuringAuthenticationDropsTheOldToken(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/message":
+			writeJSON(w, `{"success":true,"data":{"message":"login challenge"}}`)
+		case "/v1/auth":
+			close(started)
+			<-release
+			writeJSON(w, `{"success":true,"data":{"token":"old-wallet-token"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{BaseURL: server.URL, APIKey: "key", PrivateKey: testKeyHex, Testnet: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- client.Authenticate(context.Background()) }()
+	<-started
+	if err := client.SetBaseURL(server.URL + "/v2"); err != nil {
+		t.Fatalf("switch configuration: %v", err)
+	}
+	close(release)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "配置已变更") {
+		t.Fatalf("Authenticate error = %v, want a generation mismatch", err)
+	}
+	client.mu.Lock()
+	token := client.token
+	client.mu.Unlock()
+	if token != "" {
+		t.Fatalf("token from the old configuration was cached: %q", token)
 	}
 }

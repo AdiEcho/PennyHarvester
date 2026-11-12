@@ -11,6 +11,10 @@ import (
 // what a position row shows; the executor converts them to base units, because
 // a float64 that has already been rounded is not what the chain should receive.
 type RedeemRequest struct {
+	// MarketID is the venue's own market id, when the caller has it. A venue can
+	// use it to load redemption metadata after a restart without rescanning the
+	// open-market list (a resolved market is no longer in that list).
+	MarketID string `json:"market_id,omitempty"`
 	// ConditionID is the market's condition id, used by every CTF-shaped venue.
 	ConditionID string `json:"condition_id"`
 	// TokenID identifies which outcome shares are burned.

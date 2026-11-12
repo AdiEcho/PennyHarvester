@@ -66,7 +66,10 @@ func FromEnv() Config {
 		PredictFunSmartWallet: envAny([]string{"PREDICTFUN_SMART_WALLET", "PREDICTFUN_FUNDER"}, ""),
 		PredictFunTestnet:     envBool("PREDICTFUN_TESTNET"),
 		PredictFunBaseURL:     os.Getenv("PREDICTFUN_BASE_URL"),
-		PredictFunRPC:         env("PREDICTFUN_RPC_URL", "https://bsc-dataseed.bnbchain.org"),
+		// Empty means "pick the RPC that belongs to the configured network".
+		// Defaulting to mainnet here would leave a testnet client signing
+		// chainId 97 while reading balances from chain 56.
+		PredictFunRPC: os.Getenv("PREDICTFUN_RPC_URL"),
 	}
 }
 

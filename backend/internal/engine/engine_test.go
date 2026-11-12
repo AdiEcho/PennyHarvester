@@ -22,6 +22,7 @@ type fakeProvider struct {
 	localized map[string]market.Market
 	eventTags map[string][]market.Tag
 	err       error
+	listErr   error
 }
 
 func (f *fakeProvider) Name() string { return "test" }
@@ -35,6 +36,9 @@ func (f *fakeProvider) Venue() market.Venue {
 	return f.venue
 }
 func (f *fakeProvider) ListOpen(context.Context, int) ([]market.Market, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -356,6 +360,77 @@ func TestScanFiltersAndSettlesPaperPosition(t *testing.T) {
 	}
 }
 
+func TestStaleMarketIsVisibleButCannotBeTraded(t *testing.T) {
+	item := binary("eligible", 0.98, 20000, 2)
+	item.Stale = true
+	item.StaleReason = "upstream 503"
+	provider := &fakeProvider{markets: map[string]market.Market{"eligible": item}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	radar := instance.Opportunities()
+	if radar.Total != 1 || !radar.Items[0].Stale {
+		t.Fatalf("stale row should stay visible and marked: %+v", radar)
+	}
+	_, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{
+		MarketID: "eligible", Outcome: "Yes", TokenID: "eligible-yes", Amount: 100,
+	})
+	if !errors.Is(err, engine.ErrInvalidOrder) {
+		t.Fatalf("stale market order error = %v, want ErrInvalidOrder", err)
+	}
+}
+
+func TestStaleSnapshotDoesNotSettlePosition(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"eligible": binary("eligible", 0.98, 20000, 2),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{
+		MarketID: "eligible", Outcome: "Yes", TokenID: "eligible-yes", Amount: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved := provider.markets["eligible"]
+	resolved.Closed = true
+	resolved.Active = false
+	resolved.ResolutionStatus = "resolved"
+	resolved.Outcomes[0].Price = 1
+	resolved.Outcomes[1].Price = 0
+	resolved.Stale = true
+	resolved.StaleReason = "cached 24h"
+	provider.markets["eligible"] = resolved
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	open, err := instance.Positions(context.Background(), paper.ID, "open", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.Total != 1 {
+		t.Fatalf("stale settlement closed the position: %+v", open)
+	}
+
+	resolved.Stale = false
+	provider.markets["eligible"] = resolved
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	won, err := instance.Positions(context.Background(), paper.ID, "won", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won.Total != 1 {
+		t.Fatalf("fresh resolution did not settle: %+v", won)
+	}
+}
+
 func TestScanRefreshesMissingPositionMarketsInOneBatch(t *testing.T) {
 	provider := &batchProvider{fakeProvider: fakeProvider{markets: map[string]market.Market{
 		"eligible": binary("eligible", 0.98, 20000, 2),
@@ -406,6 +481,7 @@ type batchProvider struct {
 	getCalls   int
 	batchCalls int
 	batchIDs   []string
+	omitIDs    map[string]bool
 }
 
 func (b *batchProvider) Get(ctx context.Context, id string) (market.Market, error) {
@@ -418,6 +494,9 @@ func (b *batchProvider) GetMany(ctx context.Context, ids []string) (map[string]m
 	b.batchIDs = append(b.batchIDs, ids...)
 	items := make(map[string]market.Market, len(ids))
 	for _, id := range ids {
+		if b.omitIDs[id] {
+			continue
+		}
 		item, err := b.fakeProvider.Get(ctx, id)
 		if err != nil {
 			return items, err
@@ -1840,7 +1919,9 @@ func TestLiveAllowanceIsCheckedBeforeSubmit(t *testing.T) {
 }
 
 func TestUnknownLiveOrderIsReconciled(t *testing.T) {
-	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
+	marketOne := binary("one", 0.98, 20000, 2)
+	marketOne.EventID = "ev-reconciled"
+	provider := &fakeProvider{markets: map[string]market.Market{"one": marketOne}}
 	executor := &fakeLive{
 		balance: 1000, allowance: 1000,
 		fill: engine.LiveFill{OrderID: "pending-1", Status: "unknown"},
@@ -1871,9 +1952,15 @@ func TestUnknownLiveOrderIsReconciled(t *testing.T) {
 	if positions.Total != 1 || math.Abs(positions.Items[0].Shares-100) > 1e-9 {
 		t.Fatalf("reconciliation did not create the position: %+v", positions.Items)
 	}
+	if positions.Items[0].EventID != "ev-reconciled" {
+		t.Fatalf("reconciled position lost its event id: %+v", positions.Items[0])
+	}
 	orders, err = instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0, "")
 	if err != nil || orders.Total != 1 || orders.Items[0].Status != "filled" || orders.Items[0].ExternalID != "pending-1" {
 		t.Fatalf("reconciliation did not finalize the order: %+v, %v", orders, err)
+	}
+	if orders.Items[0].EventID != "ev-reconciled" {
+		t.Fatalf("reconciled order lost its event id: %+v", orders.Items[0])
 	}
 }
 
@@ -3002,5 +3089,313 @@ func TestScanBuildsRadarViewPerAccount(t *testing.T) {
 	}
 	if inherited.MinPrice != 0.95 || inherited.MaxPrice != 0.99 {
 		t.Fatalf("the account-scoped update leaked into another account: %+v", inherited)
+	}
+}
+
+func createPendingBuyOrder(t *testing.T, repository *store.SQLite, account engine.Account, marketID, eventID string, amount float64) engine.Order {
+	t.Helper()
+	order, err := repository.CreateOrder(context.Background(), engine.Order{
+		AccountID: account.ID, Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
+		MarketID: marketID, EventID: eventID, Question: marketID, Outcome: "Yes", TokenID: marketID + "-yes",
+		Kind: "manual", Type: "buy", Amount: amount, Price: 0.5, Shares: amount / 0.5,
+		Status: "pending", Reason: "test pending order", ExternalID: "pending-" + marketID,
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return order
+}
+
+type unresolvedReadFailRepository struct {
+	engine.Repository
+}
+
+func (unresolvedReadFailRepository) ListUnresolvedOrders(context.Context, int64) ([]engine.Order, error) {
+	return nil, errors.New("unresolved read failed")
+}
+
+func TestUnresolvedBuyReservesExposureAndBlocksMarketAndEvent(t *testing.T) {
+	t.Run("reserves exposure", func(t *testing.T) {
+		provider := &fakeProvider{markets: map[string]market.Market{
+			"target": binary("target", 0.98, 20000, 2),
+		}}
+		instance, repository := newTestEngine(t, provider, nil)
+		paper := accountByMode(t, instance, engine.AccountModePaper)
+		createPendingBuyOrder(t, repository, paper, "other", "other-event", 950)
+
+		_, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{MarketID: "target", Outcome: "Yes", TokenID: "target-yes", Amount: 100})
+		if !errors.Is(err, engine.ErrInvalidOrder) || !strings.Contains(err.Error(), "超过总敞口上限") {
+			t.Fatalf("pending buy exposure was not reserved: %v", err)
+		}
+	})
+
+	t.Run("blocks same market", func(t *testing.T) {
+		provider := &fakeProvider{markets: map[string]market.Market{
+			"target": binary("target", 0.98, 20000, 2),
+		}}
+		instance, repository := newTestEngine(t, provider, nil)
+		paper := accountByMode(t, instance, engine.AccountModePaper)
+		createPendingBuyOrder(t, repository, paper, "target", "other-event", 10)
+
+		_, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{MarketID: "target", Outcome: "Yes", TokenID: "target-yes", Amount: 100})
+		if !errors.Is(err, engine.ErrInvalidOrder) || !strings.Contains(err.Error(), "该市场存在未确认订单") {
+			t.Fatalf("same-market unresolved order did not block entry: %v", err)
+		}
+	})
+
+	t.Run("blocks same event", func(t *testing.T) {
+		provider := &fakeProvider{markets: map[string]market.Market{
+			"target": binary("target", 0.98, 20000, 2),
+		}}
+		instance, repository := newTestEngine(t, provider, nil)
+		paper := accountByMode(t, instance, engine.AccountModePaper)
+		createPendingBuyOrder(t, repository, paper, "sibling", "ev-shared", 10)
+		target := provider.markets["target"]
+		target.EventID = "ev-shared"
+		provider.markets["target"] = target
+
+		_, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{MarketID: "target", Outcome: "Yes", TokenID: "target-yes", Amount: 100})
+		if !errors.Is(err, engine.ErrInvalidOrder) || !strings.Contains(err.Error(), "该事件存在未确认订单") {
+			t.Fatalf("same-event unresolved order did not block entry: %v", err)
+		}
+	})
+}
+
+func TestUnresolvedOrderLoadErrorFailsClosed(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"target": binary("target", 0.98, 20000, 2),
+	}}
+	registry := venue.NewRegistry()
+	if err := registry.Register(testCapabilities(provider.Venue()), provider, nil); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repository.Close() })
+	instance, err := engine.New(context.Background(), unresolvedReadFailRepository{Repository: repository}, registry, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+
+	_, err = instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{MarketID: "target", Outcome: "Yes", TokenID: "target-yes", Amount: 100})
+	if err == nil || !strings.Contains(err.Error(), "读取未确认订单") {
+		t.Fatalf("unresolved load error must fail closed: %v", err)
+	}
+	if errors.Is(err, engine.ErrInvalidOrder) {
+		t.Fatalf("fail-closed read error must abort automatic entry: %v", err)
+	}
+	orders, err := instance.Orders(context.Background(), paper.ID, "all", 10, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orders.Total != 1 || orders.Items[0].Status != "rejected" || !strings.Contains(orders.Items[0].Reason, "读取未确认订单") {
+		t.Fatalf("fail-closed rejection was not recorded: %+v", orders.Items)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "all", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 0 {
+		t.Fatalf("fail-closed entry opened a position: %+v", positions.Items)
+	}
+}
+
+func TestLiveEntryEnforcesEventCap(t *testing.T) {
+	first := binary("first", 0.98, 20000, 2)
+	first.EventID = "ev-live"
+	second := binary("second", 0.97, 20000, 2)
+	second.EventID = "ev-live"
+	live := &fakeLive{
+		balance: 1000,
+		fill:    engine.LiveFill{Shares: 100, Cost: 100, Price: 0.98, Status: "matched", OrderID: "fill-1"},
+	}
+	instance, _ := newTestEngine(t, &fakeProvider{markets: map[string]market.Market{
+		"first": first, "second": second,
+	}}, live)
+	account := accountByMode(t, instance, engine.AccountModeLive)
+	settings := instance.Settings()
+	settings.MaxEventExposure = 150
+	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := instance.PlaceOrder(context.Background(), account.ID, engine.OrderRequest{MarketID: "first", Outcome: "Yes", TokenID: "first-yes", Amount: 100}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := instance.PlaceOrder(context.Background(), account.ID, engine.OrderRequest{MarketID: "second", Outcome: "Yes", TokenID: "second-yes", Amount: 100})
+	if !errors.Is(err, engine.ErrInvalidOrder) || !strings.Contains(err.Error(), "超过单事件敞口上限") {
+		t.Fatalf("live event cap was not enforced: %v", err)
+	}
+	orders, err := instance.Orders(context.Background(), account.ID, "all", 10, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, order := range orders.Items {
+		if order.Status == "rejected" && strings.Contains(order.Reason, "超过单事件敞口上限") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("event-cap rejection was not recorded: %+v", orders.Items)
+	}
+}
+
+func TestPendingSellFreezesSettlement(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"eligible": binary("eligible", 0.98, 20000, 2),
+	}}
+	instance, repository := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	position, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{MarketID: "eligible", Outcome: "Yes", TokenID: "eligible-yes", Amount: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	positionID := position.ID
+	if _, err := repository.CreateOrder(context.Background(), engine.Order{
+		AccountID: paper.ID, Venue: position.Venue, Currency: position.Currency, PositionID: &positionID,
+		MarketID: position.MarketID, EventID: position.EventID, Question: position.Question,
+		Outcome: position.Outcome, TokenID: position.TokenID, Kind: "auto", Type: "settle",
+		Action: "stop", Price: position.CurrentPrice, Shares: position.Shares,
+		Status: "pending", Reason: "pending exit", ExternalID: "pending-exit", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved := provider.markets["eligible"]
+	resolved.Closed = true
+	resolved.Active = false
+	resolved.ResolutionStatus = "resolved"
+	resolved.Outcomes[0].Price = 1
+	resolved.Outcomes[1].Price = 0
+	provider.markets["eligible"] = resolved
+
+	summary, err := instance.ManualScan(context.Background(), paper.ID, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary.Error, "持仓已结算但存在未确认卖单") || !strings.Contains(summary.Error, "未确认订单 1 笔") {
+		t.Fatalf("settlement freeze was not reported: %q", summary.Error)
+	}
+	open, err := instance.Positions(context.Background(), paper.ID, "open", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.Total != 1 {
+		t.Fatalf("frozen position was settled or removed: %+v", open.Items)
+	}
+	frozen := open.Items[0]
+	if frozen.CurrentPrice != 1 || frozen.RealizedPNL != position.RealizedPNL {
+		t.Fatalf("frozen position was not marked at settlement without payout: %+v", frozen)
+	}
+}
+
+func TestLateSellFillStaysUnknown(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"late": binary("late", 0.75, 20000, 2),
+	}}
+	live := &fakeLive{lookup: map[string]engine.LiveFill{
+		"late-stop": {Shares: 40, Cost: 30, Price: 0.75, Status: "matched"},
+	}}
+	instance, repository := newTestEngine(t, provider, live)
+	account := accountByMode(t, instance, engine.AccountModeLive)
+	if _, err := repository.CreateOrder(context.Background(), engine.Order{
+		AccountID: account.ID, Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
+		MarketID: "late", Question: "late", Outcome: "Yes", TokenID: "late-yes",
+		Kind: "auto", Type: "settle", Action: "stop", Price: 0.75, Shares: 40,
+		Status: "pending", Reason: "late exit", ExternalID: "late-stop", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := instance.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	unresolved, err := repository.ListUnresolvedOrders(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 1 {
+		t.Fatalf("late fill was removed from the unresolved ledger: %+v", unresolved)
+	}
+	if unresolved[0].Status != "unknown" || !strings.Contains(unresolved[0].Reason, "迟到成交") ||
+		!strings.Contains(unresolved[0].Reason, "未入账") || !strings.Contains(unresolved[0].Reason, "40") {
+		t.Fatalf("late sell fill was not recorded as an unbooked discrepancy: %+v", unresolved[0])
+	}
+	positions, err := instance.Positions(context.Background(), account.ID, "all", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 0 {
+		t.Fatalf("late fill was booked after close: %+v", positions.Items)
+	}
+}
+
+func TestDiscoveryFailureStillRefreshesPositions(t *testing.T) {
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"eligible": binary("eligible", 0.98, 20000, 2),
+	}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{MarketID: "eligible", Outcome: "Yes", TokenID: "eligible-yes", Amount: 100}); err != nil {
+		t.Fatal(err)
+	}
+
+	moved := provider.markets["eligible"]
+	moved.Outcomes[0].Price = 0.9
+	moved.Outcomes[1].Price = 0.1
+	provider.markets["eligible"] = moved
+	provider.listErr = errors.New("venue down")
+
+	if err := instance.Scan(context.Background()); !errors.Is(err, engine.ErrUpstream) {
+		t.Fatalf("all-discovery failure was not returned: %v", err)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 || positions.Items[0].CurrentPrice != 0.9 {
+		t.Fatalf("maintenance did not refresh the position without discovery: %+v", positions.Items)
+	}
+}
+
+func TestBatchMissingMarketIsExplicitError(t *testing.T) {
+	provider := &batchProvider{fakeProvider: fakeProvider{markets: map[string]market.Market{
+		"eligible": binary("eligible", 0.98, 20000, 2),
+	}}, omitIDs: map[string]bool{"eligible": true}}
+	instance, _ := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.PlaceOrder(context.Background(), paper.ID, engine.OrderRequest{MarketID: "eligible", Outcome: "Yes", TokenID: "eligible-yes", Amount: 100}); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved := provider.markets["eligible"]
+	resolved.Closed = true
+	resolved.Active = false
+	resolved.ResolutionStatus = "resolved"
+	resolved.Outcomes[0].Price = 1
+	resolved.Outcomes[1].Price = 0
+	provider.markets["eligible"] = resolved
+
+	summary, err := instance.ManualScan(context.Background(), paper.ID, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary.Error, "行情未返回该市场") {
+		t.Fatalf("missing batch market was silently ignored: %q", summary.Error)
+	}
+	if provider.batchCalls != 1 {
+		t.Fatalf("expected one batch refresh, got %d", provider.batchCalls)
+	}
+	positions, err := instance.Positions(context.Background(), paper.ID, "open", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if positions.Total != 1 {
+		t.Fatalf("position was settled from a missing batch response: %+v", positions.Items)
 	}
 }

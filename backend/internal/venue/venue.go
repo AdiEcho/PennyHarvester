@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,8 +46,41 @@ type Fill struct {
 type CashSnapshot struct {
 	Amount    float64
 	Allowance float64
-	At        time.Time
-	Stale     bool
+	// Allowances is the per-spender approval map returned by venues that settle
+	// through more than one exchange. A scalar Allowance cannot say which
+	// exchange a trade will hit, so a stale approval for another exchange must
+	// never be mistaken for the target's.
+	Allowances map[string]float64
+	At         time.Time
+	Stale      bool
+}
+
+// Polymarket exchange spenders. The CLOB signs the same addresses on mainnet
+// and Amoy; the neg-risk exchange only settles neg-risk markets.
+const (
+	PolymarketExchange        = "0xe111180000d2663c0091e4f400237545b87b996b"
+	PolymarketNegRiskExchange = "0xe2222d279d744050d28e00520010520000310f59"
+)
+
+// AllowanceFor returns the approval for the exchange that will settle the
+// trade. ok is false when the snapshot has no per-spender evidence, in which
+// case callers may fall back to the legacy scalar.
+func (c CashSnapshot) AllowanceFor(negRisk bool) (float64, bool) {
+	if len(c.Allowances) == 0 {
+		return 0, false
+	}
+	spender := PolymarketExchange
+	if negRisk {
+		spender = PolymarketNegRiskExchange
+	}
+	for address, value := range c.Allowances {
+		if strings.EqualFold(address, spender) {
+			return value, true
+		}
+	}
+	// The map is authoritative: an unknown target means the wallet has not
+	// approved this exchange, not that the trade is free.
+	return 0, true
 }
 
 // Quote is a pre-trade estimate for a buy. AvailableNotional is how much the

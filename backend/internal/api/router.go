@@ -2,7 +2,10 @@ package api
 
 import (
 	"errors"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,10 +25,13 @@ type Handler struct {
 
 func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Authenticator) *gin.Engine {
 	router := gin.New()
+	// No proxy is trusted unless the operator names one. Gin otherwise trusts
+	// every proxy and lets X-Forwarded-For rotate the login rate-limit key.
+	_ = router.SetTrustedProxies(trustedProxiesFromEnv())
 	router.Use(gin.Logger(), gin.Recovery(), securityHeaders())
 	h := &Handler{engine: strategyEngine, auth: authenticator}
 	v1 := router.Group("/api/v1")
-	v1.Use(maxBodySize(1 << 20))
+	v1.Use(maxBodySize(1<<20), sameOriginGuard())
 	{
 		// Login endpoints stay public so the SPA can render its sign-in form.
 		v1.GET("/auth/status", h.authStatus)
@@ -81,6 +87,98 @@ func securityHeaders() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// sameOriginGuard protects state-changing API calls independently of the
+// optional access password. A hostile page cannot send these requests with a
+// same-origin Origin, and a form-encoded body cannot smuggle a JSON payload.
+func sameOriginGuard() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		switch c.Request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			c.Next()
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(c.GetHeader("Sec-Fetch-Site")), "cross-site") {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "拒绝跨站请求"})
+			return
+		}
+		if origin := strings.TrimSpace(c.GetHeader("Origin")); origin != "" && !sameOrigin(origin, c.Request.Host) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "请求来源不受信任"})
+			return
+		}
+		if requestHasBody(c.Request) && !isJSONMediaType(c.GetHeader("Content-Type")) {
+			c.AbortWithStatusJSON(http.StatusUnsupportedMediaType, gin.H{"error": "请求必须使用 application/json"})
+			return
+		}
+		c.Next()
+	}
+}
+
+func requestHasBody(r *http.Request) bool {
+	return r.ContentLength > 0 || len(r.TransferEncoding) > 0
+}
+
+func isJSONMediaType(raw string) bool {
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
+func sameOrigin(origin, requestHost string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	if !strings.EqualFold(parsed.Host, requestHost) {
+		return false
+	}
+	return allowedOriginHost(parsed.Hostname())
+}
+
+// allowedOriginHost defaults to loopback so a DNS-rebinding name pointed at
+// localhost cannot pass the Origin check. Deployments reached through another
+// hostname add it to ALLOWED_HOSTS.
+func allowedOriginHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	for _, entry := range strings.Split(os.Getenv("ALLOWED_HOSTS"), ",") {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(entry); err == nil {
+			entry = h
+		}
+		if host == entry {
+			return true
+		}
+	}
+	return false
+}
+
+func trustedProxiesFromEnv() []string {
+	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
+	if raw == "" {
+		return nil
+	}
+	var proxies []string
+	for _, entry := range strings.Split(raw, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			proxies = append(proxies, entry)
+		}
+	}
+	return proxies
 }
 
 func maxBodySize(limit int64) gin.HandlerFunc {

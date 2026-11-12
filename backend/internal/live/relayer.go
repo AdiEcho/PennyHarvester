@@ -80,10 +80,7 @@ func (e *Executor) ProbeRelayer(ctx context.Context, settings engine.LiveSetting
 	request.Header.Set("RELAYER_API_KEY_ADDRESS", address)
 
 	start := time.Now()
-	client := http.DefaultClient
-	if effective.Proxy != nil {
-		client = effective.Proxy.HTTPClient(15 * time.Second)
-	}
+	client := guardedHTTPClient(15*time.Second, effective.Proxy)
 	response, err := client.Do(request)
 	if err != nil {
 		return engine.RelayerProbe{}, fmt.Errorf("连接 Polymarket Relayer: %w", err)

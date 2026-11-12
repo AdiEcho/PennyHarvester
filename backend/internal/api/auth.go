@@ -47,8 +47,10 @@ type Authenticator struct {
 	mu       sync.Mutex
 	hash     string
 	loaded   bool
+	revision uint64
 	sessions map[string]time.Time
 	failures map[string][]time.Time
+	loginSem chan struct{}
 	now      func() time.Time
 }
 
@@ -57,6 +59,7 @@ func NewAuthenticator(store PasswordStore) *Authenticator {
 		store:    store,
 		sessions: map[string]time.Time{},
 		failures: map[string][]time.Time{},
+		loginSem: make(chan struct{}, 4),
 		now:      time.Now,
 	}
 }
@@ -92,49 +95,68 @@ func (a *Authenticator) Enabled(ctx context.Context) (bool, error) {
 // Verify checks a candidate password. When no password is configured it
 // succeeds, so callers can use it for the first-time setup flow.
 func (a *Authenticator) Verify(ctx context.Context, password string) (bool, error) {
+	ok, _, err := a.verifyRevision(ctx, password)
+	return ok, err
+}
+
+// verifyRevision binds a successful comparison to the credential revision it
+// was made against. Issuing a session at a later revision rejects passwords
+// that were verified before a concurrent password change.
+func (a *Authenticator) verifyRevision(ctx context.Context, password string) (bool, uint64, error) {
 	if err := a.ensureLoaded(ctx); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	a.mu.Lock()
 	hash := a.hash
+	revision := a.revision
 	a.mu.Unlock()
 	if hash == "" {
-		return true, nil
+		return true, revision, nil
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
-		return false, nil
+		return false, revision, nil
 	}
-	return true, nil
+	return true, revision, nil
 }
 
 // SetPassword verifies the current password (if any) and stores a new hash.
 // All sessions are dropped afterwards; the caller issues a fresh one.
 func (a *Authenticator) SetPassword(ctx context.Context, current, next string) error {
+	_, err := a.SetPasswordRevision(ctx, current, next)
+	return err
+}
+
+// SetPasswordRevision stores a new password and returns the credential
+// revision that produced it. Callers that issue a session must use it so a
+// concurrent password change cannot leave an older verification alive.
+func (a *Authenticator) SetPasswordRevision(ctx context.Context, current, next string) (uint64, error) {
 	if err := a.ensureLoaded(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	if len(next) < minPasswordBytes || len(next) > maxPasswordBytes || strings.TrimSpace(next) == "" {
-		return ErrPasswordPolicy
+		return 0, ErrPasswordPolicy
 	}
 	ok, err := a.Verify(ctx, current)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !ok {
-		return ErrAccessDenied
+		return 0, ErrAccessDenied
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(next), bcrypt.DefaultCost)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := a.store.SaveAccessHash(ctx, string(hash)); err != nil {
-		return err
+		return 0, err
 	}
 	a.mu.Lock()
 	a.hash = string(hash)
+	a.revision++
+	revision := a.revision
 	a.sessions = map[string]time.Time{}
 	a.mu.Unlock()
-	return nil
+	return revision, nil
 }
 
 // Disable turns password protection off after verifying the current password.
@@ -158,12 +180,20 @@ func (a *Authenticator) Disable(ctx context.Context, current string) error {
 	}
 	a.mu.Lock()
 	a.hash = ""
+	a.revision++
 	a.sessions = map[string]time.Time{}
 	a.mu.Unlock()
 	return nil
 }
 
 func (a *Authenticator) newSession() (string, time.Time, error) {
+	a.mu.Lock()
+	revision := a.revision
+	a.mu.Unlock()
+	return a.newSessionAt(revision)
+}
+
+func (a *Authenticator) newSessionAt(revision uint64) (string, time.Time, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", time.Time{}, err
@@ -171,8 +201,11 @@ func (a *Authenticator) newSession() (string, time.Time, error) {
 	token := base64.RawURLEncoding.EncodeToString(raw)
 	expires := a.now().Add(sessionTTL)
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.revision != revision {
+		return "", time.Time{}, ErrAccessDenied
+	}
 	a.sessions[token] = expires
-	a.mu.Unlock()
 	return token, expires, nil
 }
 
@@ -202,7 +235,10 @@ func (a *Authenticator) Revoke(token string) {
 	a.mu.Unlock()
 }
 
-func (a *Authenticator) allow(ip string) bool {
+// reserveAttempt consumes one slot before the expensive bcrypt comparison.
+// Counting the attempt at admission closes the window where concurrent
+// failures all pass the limit check before any failure is recorded.
+func (a *Authenticator) reserveAttempt(ip string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	cutoff := a.now().Add(-loginWindow)
@@ -212,18 +248,13 @@ func (a *Authenticator) allow(ip string) bool {
 			recent = append(recent, at)
 		}
 	}
-	if len(recent) == 0 {
-		delete(a.failures, ip)
-	} else {
+	if len(recent) >= maxLoginFailures {
 		a.failures[ip] = recent
+		return false
 	}
-	return len(recent) < maxLoginFailures
-}
-
-func (a *Authenticator) recordFailure(ip string) {
-	a.mu.Lock()
-	a.failures[ip] = append(a.failures[ip], a.now())
-	a.mu.Unlock()
+	recent = append(recent, a.now())
+	a.failures[ip] = recent
+	return true
 }
 
 func (a *Authenticator) clearFailures(ip string) {
@@ -284,24 +315,30 @@ func (h *Handler) login(c *gin.Context) {
 		return
 	}
 	ip := c.ClientIP()
-	if !h.auth.allow(ip) {
+	if !h.auth.reserveAttempt(ip) {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "登录尝试过于频繁，请稍后再试"})
 		return
 	}
-	ok, err := h.auth.Verify(c.Request.Context(), request.Password)
+	select {
+	case h.auth.loginSem <- struct{}{}:
+		defer func() { <-h.auth.loginSem }()
+	default:
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "登录验证繁忙，请稍后再试"})
+		return
+	}
+	ok, revision, err := h.auth.verifyRevision(c.Request.Context(), request.Password)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
 	if !ok {
-		h.auth.recordFailure(ip)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "访问密码错误"})
 		return
 	}
 	h.auth.clearFailures(ip)
-	token, expires, err := h.auth.newSession()
+	token, expires, err := h.auth.newSessionAt(revision)
 	if err != nil {
-		respondError(c, err)
+		respondAuthError(c, err)
 		return
 	}
 	h.setSessionCookie(c, token, expires)
@@ -324,13 +361,14 @@ func (h *Handler) updatePassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "密码请求无效: " + err.Error()})
 		return
 	}
-	if err := h.auth.SetPassword(c.Request.Context(), request.CurrentPassword, request.NewPassword); err != nil {
+	revision, err := h.auth.SetPasswordRevision(c.Request.Context(), request.CurrentPassword, request.NewPassword)
+	if err != nil {
 		respondAuthError(c, err)
 		return
 	}
 	// Changing the password drops every session, including the caller's, so
 	// hand the caller a fresh one to avoid an immediate logout.
-	token, expires, err := h.auth.newSession()
+	token, expires, err := h.auth.newSessionAt(revision)
 	if err != nil {
 		respondError(c, err)
 		return

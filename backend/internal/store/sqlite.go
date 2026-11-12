@@ -97,6 +97,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		venue TEXT NOT NULL DEFAULT 'polymarket',
 		currency TEXT NOT NULL DEFAULT 'USDC',
 		market_id TEXT NOT NULL,
+		event_id TEXT NOT NULL DEFAULT '',
 		condition_id TEXT NOT NULL,
 		question TEXT NOT NULL,
 		outcome TEXT NOT NULL,
@@ -123,6 +124,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		currency TEXT NOT NULL DEFAULT 'USDC',
 		position_id INTEGER REFERENCES positions(id),
 		market_id TEXT NOT NULL,
+		event_id TEXT NOT NULL DEFAULT '',
 		question TEXT NOT NULL,
 		outcome TEXT NOT NULL,
 		token_id TEXT NOT NULL,
@@ -181,6 +183,11 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "positions", "exit_kind", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	// event_id groups the markets of one settlement event. It must exist before
+	// the status rebuilds so their explicit column lists can carry it over.
+	if err := s.ensureColumn(ctx, "positions", "event_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := s.migratePositionStatus(ctx); err != nil {
 		return err
 	}
@@ -190,6 +197,11 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "orders", "action", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// event_id identifies the settlement event a buy order reserves. Existing
+	// pending rows keep "" and only count against their market.
+	if err := s.ensureColumn(ctx, "orders", "event_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.migrateOrderStatus(ctx); err != nil {
@@ -204,12 +216,6 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "positions", "currency", "TEXT NOT NULL DEFAULT 'USDC'"); err != nil {
-		return err
-	}
-	// event_id groups the markets of one settlement event so automatic entries
-	// can be capped per event. Rows written before the column existed keep ""
-	// and are capped per market only.
-	if err := s.ensureColumn(ctx, "positions", "event_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "orders", "venue", "TEXT NOT NULL DEFAULT 'polymarket'"); err != nil {
@@ -229,6 +235,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_positions_account_token ON positions(account_id, token_id, status);
 	CREATE INDEX IF NOT EXISTS idx_positions_venue_status ON positions(venue, status);
 	CREATE INDEX IF NOT EXISTS idx_orders_account_created ON orders(account_id, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_orders_account_event ON orders(account_id, event_id);
 	CREATE INDEX IF NOT EXISTS idx_orders_venue_created ON orders(venue, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_snapshots_account_id ON equity_snapshots(account_id, id DESC);`
 	if _, err := s.db.ExecContext(ctx, indexes); err != nil {
@@ -270,6 +277,7 @@ func (s *SQLite) migratePositionStatus(ctx context.Context) error {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		account_id INTEGER NOT NULL REFERENCES accounts(id),
 		market_id TEXT NOT NULL,
+		event_id TEXT NOT NULL DEFAULT '',
 		condition_id TEXT NOT NULL,
 		question TEXT NOT NULL,
 		outcome TEXT NOT NULL,
@@ -289,9 +297,9 @@ func (s *SQLite) migratePositionStatus(ctx context.Context) error {
 		realized_pnl REAL NOT NULL DEFAULT 0,
 		unrealized_pnl REAL NOT NULL DEFAULT 0
 	);
-	INSERT INTO positions_new(id, account_id, market_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
+	INSERT INTO positions_new(id, account_id, market_id, event_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
 		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at, end_date, realized_pnl, unrealized_pnl)
-	SELECT id, account_id, market_id, condition_id, question, outcome, token_id, side, COALESCE(kind, 'manual'), COALESCE(exit_kind, ''),
+	SELECT id, account_id, market_id, event_id, condition_id, question, outcome, token_id, side, COALESCE(kind, 'manual'), COALESCE(exit_kind, ''),
 		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at, end_date, realized_pnl, unrealized_pnl
 	FROM positions;
 	DROP TABLE positions;
@@ -321,6 +329,7 @@ func (s *SQLite) migrateOrderStatus(ctx context.Context) error {
 		account_id INTEGER NOT NULL REFERENCES accounts(id),
 		position_id INTEGER REFERENCES positions(id),
 		market_id TEXT NOT NULL,
+		event_id TEXT NOT NULL DEFAULT '',
 		question TEXT NOT NULL,
 		outcome TEXT NOT NULL,
 		token_id TEXT NOT NULL,
@@ -336,9 +345,9 @@ func (s *SQLite) migrateOrderStatus(ctx context.Context) error {
 		external_id TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL
 	);
-	INSERT INTO orders_new(id, account_id, position_id, market_id, question, outcome, token_id, kind, type, action,
+	INSERT INTO orders_new(id, account_id, position_id, market_id, event_id, question, outcome, token_id, kind, type, action,
 		amount, price, shares, fee, status, reason, external_id, created_at)
-	SELECT id, account_id, position_id, market_id, question, outcome, token_id, kind, type, COALESCE(action, ''),
+	SELECT id, account_id, position_id, market_id, event_id, question, outcome, token_id, kind, type, COALESCE(action, ''),
 		amount, price, shares, fee, status, reason, external_id, created_at
 	FROM orders;
 	DROP TABLE orders;
@@ -557,6 +566,9 @@ func (s *SQLite) LoadSystemSettings(ctx context.Context) (engine.SystemSettings,
 	if settings.Live.PrivateKey, err = decrypt(settings.Live.PrivateKey); err != nil {
 		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
 	}
+	if settings.Live.APIKey, err = decrypt(settings.Live.APIKey); err != nil {
+		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
+	}
 	if settings.Live.APISecret, err = decrypt(settings.Live.APISecret); err != nil {
 		return engine.SystemSettings{}, fmt.Errorf("读取系统设置: %w", err)
 	}
@@ -565,6 +577,9 @@ func (s *SQLite) LoadSystemSettings(ctx context.Context) (engine.SystemSettings,
 	}
 	for v, entry := range settings.Venues {
 		if entry.Live.PrivateKey, err = decrypt(entry.Live.PrivateKey); err != nil {
+			return engine.SystemSettings{}, fmt.Errorf("读取 %s 系统设置: %w", v.Label(), err)
+		}
+		if entry.Live.APIKey, err = decrypt(entry.Live.APIKey); err != nil {
 			return engine.SystemSettings{}, fmt.Errorf("读取 %s 系统设置: %w", v.Label(), err)
 		}
 		if entry.Live.APISecret, err = decrypt(entry.Live.APISecret); err != nil {
@@ -612,6 +627,9 @@ func (s *SQLite) SaveSystemSettings(ctx context.Context, settings engine.SystemS
 		if stored.Live.PrivateKey, err = s.secrets.Encrypt(stored.Live.PrivateKey); err != nil {
 			return fmt.Errorf("加密实盘私钥: %w", err)
 		}
+		if stored.Live.APIKey, err = s.secrets.Encrypt(stored.Live.APIKey); err != nil {
+			return fmt.Errorf("加密实盘 API Key: %w", err)
+		}
 		if stored.Live.APISecret, err = s.secrets.Encrypt(stored.Live.APISecret); err != nil {
 			return fmt.Errorf("加密 L2 API Secret: %w", err)
 		}
@@ -623,6 +641,9 @@ func (s *SQLite) SaveSystemSettings(ctx context.Context, settings engine.SystemS
 			for v, entry := range stored.Venues {
 				if entry.Live.PrivateKey, err = s.secrets.Encrypt(entry.Live.PrivateKey); err != nil {
 					return fmt.Errorf("加密 %s 实盘私钥: %w", v.Label(), err)
+				}
+				if entry.Live.APIKey, err = s.secrets.Encrypt(entry.Live.APIKey); err != nil {
+					return fmt.Errorf("加密 %s 实盘 API Key: %w", v.Label(), err)
 				}
 				if entry.Live.APISecret, err = s.secrets.Encrypt(entry.Live.APISecret); err != nil {
 					return fmt.Errorf("加密 %s L2 API Secret: %w", v.Label(), err)
@@ -778,6 +799,18 @@ func (s *SQLite) UpdateAccountBaseline(ctx context.Context, id int64, value floa
 	return err
 }
 
+// InitializeAccountBaseline is the compare-and-set used by the live baseline
+// bootstrap. Unconditional writes let a Dashboard that read stale positions
+// replace a baseline committed by a scan.
+func (s *SQLite) InitializeAccountBaseline(ctx context.Context, id int64, value float64) (bool, error) {
+	result, err := s.db.ExecContext(ctx, "UPDATE accounts SET baseline_equity = ? WHERE id = ? AND baseline_equity = 0", value, id)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed > 0, err
+}
+
 type accountScanner interface {
 	Scan(dest ...any) error
 }
@@ -868,11 +901,11 @@ type orderInserter interface {
 
 func insertOrder(ctx context.Context, db orderInserter, order engine.Order) (int64, error) {
 	result, err := db.ExecContext(ctx, `INSERT INTO orders(
-		account_id, venue, currency, position_id, market_id, question, outcome, token_id, kind, type, action,
+		account_id, venue, currency, position_id, market_id, event_id, question, outcome, token_id, kind, type, action,
 		amount, price, shares, fee, status, reason, external_id, created_at
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		order.AccountID, order.EffectiveVenue(), order.EffectiveCurrency(), order.PositionID, order.MarketID,
-		order.Question, order.Outcome, order.TokenID, order.Kind, order.Type, order.Action, order.Amount,
+		order.EventID, order.Question, order.Outcome, order.TokenID, order.Kind, order.Type, order.Action, order.Amount,
 		order.Price, order.Shares, order.Fee, order.Status, order.Reason, order.ExternalID, formatTime(order.CreatedAt))
 	if err != nil {
 		return 0, err
@@ -952,7 +985,7 @@ func orderStatusClause(status string) (string, []any) {
 	}
 }
 
-const orderColumns = `SELECT id, account_id, venue, currency, position_id, market_id, question, outcome,
+const orderColumns = `SELECT id, account_id, venue, currency, position_id, market_id, event_id, question, outcome,
 	token_id, kind, type, action, amount, price, shares, fee, status, reason, external_id, created_at
 	FROM orders`
 
@@ -963,7 +996,7 @@ func scanOrderRows(rows *sql.Rows) ([]engine.Order, error) {
 		var positionID sql.NullInt64
 		var createdAt string
 		if err := rows.Scan(&order.ID, &order.AccountID, &order.Venue, &order.Currency, &positionID, &order.MarketID,
-			&order.Question, &order.Outcome, &order.TokenID, &order.Kind, &order.Type, &order.Action, &order.Amount,
+			&order.EventID, &order.Question, &order.Outcome, &order.TokenID, &order.Kind, &order.Type, &order.Action, &order.Amount,
 			&order.Price, &order.Shares, &order.Fee, &order.Status, &order.Reason, &order.ExternalID, &createdAt); err != nil {
 			return nil, err
 		}
@@ -978,6 +1011,26 @@ func scanOrderRows(rows *sql.Rows) ([]engine.Order, error) {
 		orders = append(orders, order)
 	}
 	return orders, rows.Err()
+}
+
+func scanOrderRow(row *sql.Row) (engine.Order, error) {
+	var order engine.Order
+	var positionID sql.NullInt64
+	var createdAt string
+	if err := row.Scan(&order.ID, &order.AccountID, &order.Venue, &order.Currency, &positionID, &order.MarketID,
+		&order.EventID, &order.Question, &order.Outcome, &order.TokenID, &order.Kind, &order.Type, &order.Action, &order.Amount,
+		&order.Price, &order.Shares, &order.Fee, &order.Status, &order.Reason, &order.ExternalID, &createdAt); err != nil {
+		return engine.Order{}, err
+	}
+	if positionID.Valid {
+		order.PositionID = &positionID.Int64
+	}
+	parsed, err := parseTime(createdAt)
+	if err != nil {
+		return engine.Order{}, err
+	}
+	order.CreatedAt = parsed
+	return order, nil
 }
 
 func (s *SQLite) ListOrders(ctx context.Context, accountID int64, status string, limit, offset int, v market.Venue) ([]engine.Order, error) {
@@ -998,6 +1051,22 @@ func (s *SQLite) ListOrders(ctx context.Context, accountID int64, status string,
 	}
 	defer rows.Close()
 	return scanOrderRows(rows)
+}
+
+// RedeemIntent looks up the redemption row for one position directly. The
+// engine must never send a second on-chain redemption because the first one
+// scrolled past the recent-orders page.
+func (s *SQLite) RedeemIntent(ctx context.Context, accountID, positionID int64) (engine.Order, bool, error) {
+	row := s.db.QueryRowContext(ctx, orderColumns+` WHERE account_id = ? AND type = 'settle' AND action = 'redeem'
+		AND position_id = ? AND status IN ('pending', 'unknown', 'filled') ORDER BY id DESC LIMIT 1`, accountID, positionID)
+	order, err := scanOrderRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return engine.Order{}, false, nil
+	}
+	if err != nil {
+		return engine.Order{}, false, err
+	}
+	return order, true, nil
 }
 
 func (s *SQLite) CountOrders(ctx context.Context, accountID int64, status string, v market.Venue) (int64, error) {
@@ -1039,7 +1108,7 @@ func (s *SQLite) EarliestAutoBuyAt(ctx context.Context, accountID int64) (*time.
 }
 
 func (s *SQLite) ListUnresolvedOrders(ctx context.Context, accountID int64) ([]engine.Order, error) {
-	rows, err := s.db.QueryContext(ctx, orderColumns+" WHERE account_id = ? AND status IN ('pending', 'unknown') AND external_id <> '' ORDER BY id ASC", accountID)
+	rows, err := s.db.QueryContext(ctx, orderColumns+" WHERE account_id = ? AND status IN ('pending', 'unknown') ORDER BY id ASC", accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -1069,9 +1138,10 @@ func (s *SQLite) FinalizeLiveBuy(ctx context.Context, orderID int64, p engine.Po
 		return engine.Position{}, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE orders SET position_id = ?, amount = ?, price = ?, shares = ?, fee = ?,
-		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END
+		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END,
+		event_id = CASE WHEN event_id = '' THEN ? ELSE event_id END
 		WHERE id = ? AND status IN ('pending', 'unknown')`,
-		p.ID, fill.Cost, fill.Price, fill.Shares, fill.Fee, liveFillReason(p, "实盘成交"), fill.OrderID, orderID)
+		p.ID, fill.Cost, fill.Price, fill.Shares, fill.Fee, liveFillReason(p, "实盘成交"), fill.OrderID, p.EventID, orderID)
 	if err != nil {
 		return engine.Position{}, err
 	}
@@ -1134,9 +1204,10 @@ func (s *SQLite) FinalizeLiveSell(ctx context.Context, orderID int64, p engine.P
 		return engine.Position{}, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE orders SET position_id = ?, amount = ?, price = ?, shares = ?, fee = ?,
-		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END
+		status = 'filled', reason = ?, external_id = CASE WHEN external_id = '' THEN ? ELSE external_id END,
+		event_id = CASE WHEN event_id = '' THEN ? ELSE event_id END
 		WHERE id = ? AND status IN ('pending', 'unknown')`,
-		p.ID, fill.Cost, fill.Price, fill.Shares, fill.Fee, liveFillReason(p, "止损成交"), fill.OrderID, orderID)
+		p.ID, fill.Cost, fill.Price, fill.Shares, fill.Fee, liveFillReason(p, "止损成交"), fill.OrderID, p.EventID, orderID)
 	if err != nil {
 		return engine.Position{}, err
 	}

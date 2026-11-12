@@ -446,6 +446,17 @@ func TestWinnerRequiresTerminalResolution(t *testing.T) {
 	}
 }
 
+func TestSettlementPriceRequiresFinalResolution(t *testing.T) {
+	for _, status := range []string{"", "active", "proposed", "disputed", "pending"} {
+		item := binaryForTest(1, 0)
+		item.Closed = true
+		item.ResolutionStatus = status
+		if price, ok := item.SettlementPrice("yes"); ok {
+			t.Fatalf("status %q settled at %v without a final verdict", status, price)
+		}
+	}
+}
+
 func TestSettlementPriceHandlesEqualSplit(t *testing.T) {
 	item := binaryForTest(0.5, 0.5)
 	item.Closed = true

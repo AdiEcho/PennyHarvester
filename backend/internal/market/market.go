@@ -109,6 +109,15 @@ type Market struct {
 	// example Predict.fun's categorySlug). Empty means the engine derives one
 	// from tags and heuristics, which is what Polymarket markets rely on.
 	Category string `json:"category,omitempty"`
+
+	// FetchedAt is when this row's source view was last successfully fetched.
+	// It is never advanced by a cache fallback, so its age is meaningful.
+	FetchedAt time.Time `json:"-"`
+	// Stale is true when the provider served this row from an expired cache
+	// because the upstream refresh failed.
+	Stale bool `json:"-"`
+	// StaleReason is the upstream failure that caused the stale fallback.
+	StaleReason string `json:"-"`
 }
 
 // IsV2 reports whether the market trades on Polymarket Protocol V2. Those
@@ -216,14 +225,32 @@ func (m Market) finalResolutionData() bool {
 	if !m.Closed || len(m.Outcomes) != 2 {
 		return false
 	}
-	status := strings.ToLower(strings.TrimSpace(m.ResolutionStatus))
-	return status == "" || status == "resolved"
+	// Closing trading is not a final verdict: a market can be closed while a
+	// resolution is still pending or disputed. Only the venue's explicit final
+	// status lets the engine book a payout.
+	return strings.EqualFold(strings.TrimSpace(m.ResolutionStatus), "resolved")
 }
 
 type Provider interface {
 	ListOpen(ctx context.Context, maxDays int) ([]Market, error)
 	Get(ctx context.Context, id string) (Market, error)
 	Name() string
+}
+
+// DataHealth describes the quality of the most recent open-market scan.
+// Rejected counts rows that failed validation, while StaleViews counts views
+// that fell back to an expired cache after an upstream failure.
+type DataHealth struct {
+	At         time.Time `json:"at"`
+	Degraded   bool      `json:"degraded"`
+	Reason     string    `json:"reason,omitempty"`
+	Rejected   int       `json:"rejected,omitempty"`
+	StaleViews int       `json:"stale_views,omitempty"`
+}
+
+// HealthProvider is implemented by providers that expose scan data quality.
+type HealthProvider interface {
+	Health() DataHealth
 }
 
 // BatchProvider is implemented by providers that can resolve several market

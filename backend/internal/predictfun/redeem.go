@@ -246,7 +246,9 @@ func (o *OnChain) Redeem(ctx context.Context, request RedeemRequest) (RedeemTx, 
 	}
 	hash, err := o.sendCall(ctx, client, nonce, gasPrice, call)
 	if err != nil {
-		return RedeemTx{}, err
+		// Hash is set as soon as signing succeeds; keep it so callers can
+		// report an unknown broadcast instead of an anonymous failure.
+		return RedeemTx{Hash: hash, Method: plan.method}, err
 	}
 	return RedeemTx{Hash: hash, Method: plan.method}, nil
 }

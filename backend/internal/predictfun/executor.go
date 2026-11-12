@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,7 @@ type Executor struct {
 	now       func() time.Time
 
 	mu             sync.Mutex
+	generation     uint64
 	snapshot       venue.CashSnapshot
 	snapshotAt     time.Time
 	approvalKnown  bool
@@ -167,6 +169,7 @@ func (e *Executor) rebuildChain() {
 	chain, err := NewOnChain(e.client.current().raw)
 	e.mu.Lock()
 	e.chain, e.chainErr = chain, err
+	e.generation++
 	e.approvalKnown = false
 	e.approvalsReady = false
 	e.snapshotAt = time.Time{}
@@ -188,6 +191,25 @@ func (e *Executor) chainNow() (*OnChain, error) {
 		return nil, fmt.Errorf("Predict.fun 链上配置未初始化")
 	}
 	return chain, nil
+}
+
+// chainSnapshot returns the on-chain client together with the configuration
+// generation it belongs to. A balance read must not cache its result if the
+// wallet or network changed while the RPC call was in flight.
+func (e *Executor) chainSnapshot() (*OnChain, uint64, error) {
+	if e == nil || e.client == nil {
+		return nil, 0, fmt.Errorf("Predict.fun 链上配置未初始化")
+	}
+	e.mu.Lock()
+	chain, err, generation := e.chain, e.chainErr, e.generation
+	e.mu.Unlock()
+	if chain == nil {
+		if err != nil {
+			return nil, generation, err
+		}
+		return nil, generation, fmt.Errorf("Predict.fun 链上配置未初始化")
+	}
+	return chain, generation, nil
 }
 
 // New builds a provider and an executor that share one REST client. It is the
@@ -342,7 +364,12 @@ func (e *Executor) Redeem(ctx context.Context, request venue.RedeemRequest) (ven
 	if !(request.Shares > 0) {
 		return venue.RedeemResult{}, fmt.Errorf("赎回数量必须大于 0")
 	}
-	meta, err := e.provider.marketMeta(ctx, request.TokenID, request.ConditionID)
+	meta, err := e.provider.marketMetaByID(ctx, request.MarketID)
+	if err != nil {
+		// Older callers and persisted requests may not carry the market id;
+		// the token/condition index still works when it is warm.
+		meta, err = e.provider.marketMeta(ctx, request.TokenID, request.ConditionID)
+	}
 	if err != nil {
 		return venue.RedeemResult{}, err
 	}
@@ -366,14 +393,17 @@ func (e *Executor) Redeem(ctx context.Context, request venue.RedeemRequest) (ven
 		Shares:  venue.Scale(request.Shares, venue.USDTDecimals),
 		NegRisk: meta.NegRisk,
 	})
-	if err != nil {
-		return venue.RedeemResult{}, err
-	}
-	return venue.RedeemResult{
+	result := venue.RedeemResult{
 		Venue:  market.VenuePredictFun,
-		TxHash: tx.Hash.Hex(),
 		Method: tx.Method,
-	}, nil
+	}
+	if tx.Hash != (common.Hash{}) {
+		result.TxHash = tx.Hash.Hex()
+	}
+	if err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 // indexSetFor maps an outcome token id onto the CTF index set that redemption
@@ -620,14 +650,33 @@ func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares
 	return e.submit(ctx, meta, order, limit, shares, false, onSigned)
 }
 
-// submit signs once, submits the same signature, and maps the acknowledgement
-// onto a fill.
+// submit signs once and submits that same signature. A create acknowledgement
+// is only proof of acceptance, not proof of execution.
 //
-// The callback runs after the exchange accepted the submission, per the
-// interface contract. When submission itself fails the returned fill still
-// carries the order hash as its id and status "unknown": the order may be live
-// even though the HTTP call failed, and a caller must reconcile instead of
-// assuming nothing happened.
+// The callback runs after signing and before the order leaves the process, so
+// a crash can never lose an order that may have reached the exchange. When
+// submission itself fails the returned fill still carries the order hash as its
+// id and status "unknown": the order may be live even though the HTTP call
+// failed, and a caller must reconcile instead of assuming nothing happened.
+// pricePerShareWei renders a decimal price as the official 18-decimal integer
+// string. Sending "0.51" where the exchange expects 510000000000000000 is a
+// contract violation even though both are numeric strings.
+func pricePerShareWei(price float64) (string, error) {
+	if math.IsNaN(price) || math.IsInf(price, 0) || price <= 0 || price > 1 {
+		return "", fmt.Errorf("Predict.fun 下单价格 %v 不在 0..1 范围内", price)
+	}
+	rat, ok := new(big.Rat).SetString(strconv.FormatFloat(price, 'f', -1, 64))
+	if !ok {
+		return "", fmt.Errorf("Predict.fun 下单价格 %v 无法精确表示", price)
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	rat.Mul(rat, new(big.Rat).SetInt(scale))
+	if !rat.IsInt() {
+		return "", fmt.Errorf("Predict.fun 下单价格 %v 超过 18 位小数", price)
+	}
+	return rat.Num().String(), nil
+}
+
 func (e *Executor) submit(ctx context.Context, meta marketMeta, order Order, limit, shares float64, buy bool, onSigned func(orderID string) error) (venue.Fill, error) {
 	if e.signOrder == nil {
 		return venue.Fill{}, fmt.Errorf("Predict.fun 签名器未初始化")
@@ -639,13 +688,20 @@ func (e *Executor) submit(ctx context.Context, meta marketMeta, order Order, lim
 		return venue.Fill{}, fmt.Errorf("签名 Predict.fun 订单: %w", err)
 	}
 	localID := hash.Hex()
+	signed := order.signedOrder(signature)
+	signed.Hash = localID
 	minOut := true
-	request := SignedOrderRequest{
-		Order:          order.signedOrder(signature),
-		PricePerShare:  formatPrice(limit),
-		SlippageBps:    int(defaultSlippageBPS),
-		IsMinAmountOut: &minOut,
+	pricePerShare, err := pricePerShareWei(limit)
+	if err != nil {
+		return venue.Fill{}, err
 	}
+	request := CreateOrderRequest{Data: CreateOrderData{
+		Order:          &signed,
+		PricePerShare:  pricePerShare,
+		Strategy:       StrategyMarket,
+		SlippageBps:    strconv.Itoa(defaultSlippageBPS),
+		IsMinAmountOut: &minOut,
+	}}
 	// Persist the signed order *before* it leaves the process, exactly like the
 	// Polymarket executor: an order the exchange accepts but the ledger never
 	// recorded cannot be reconciled, and the next scan would buy the same market
@@ -655,8 +711,7 @@ func (e *Executor) submit(ctx context.Context, meta marketMeta, order Order, lim
 			return venue.Fill{}, fmt.Errorf("持久化待确认 Predict.fun 订单失败: %w", hookErr)
 		}
 	}
-	ack, err := e.client.PlaceOrder(ctx, request)
-	if err != nil {
+	if _, err := e.client.PlaceOrder(ctx, request); err != nil {
 		// The POST may have reached the exchange even though the response was
 		// lost. Reconcile the local id before reporting a failure so a live order
 		// becomes a position instead of an orphan pending row.
@@ -675,21 +730,12 @@ func (e *Executor) submit(ctx context.Context, meta marketMeta, order Order, lim
 		return venue.Fill{OrderID: localID, Status: "unknown"},
 			fmt.Errorf("提交 Predict.fun 订单（订单 %s，结果可能未知）: %w", localID, err)
 	}
-	fill := e.fillFromAck(meta, ack, localID, limit, shares, buy)
-	// A partially filled GTD order can rest for the rest of its 300s window. Book
-	// the filled part (the caller does that from this fill) and cancel the
-	// remainder so a later match cannot arrive unbooked.
-	if fill.Shares > 0 && strings.EqualFold(normalizeOrderStatus(ack.Status), "partially_filled") {
-		_ = e.CancelOrder(ctx, fill.OrderID)
-	}
-	if strings.EqualFold(fill.Status, "rejected") {
-		reason := strings.TrimSpace(ack.ErrorMessage)
-		if reason == "" {
-			reason = "Predict.fun 拒绝了订单"
-		}
-		return fill, fmt.Errorf("%s（订单 %s）", reason, fill.OrderID)
-	}
-	return fill, nil
+	// Acceptance is not an execution fact. The create response carries an order
+	// identity but no filled quantity, price or fee, so the only honest result is
+	// a zero-share unknown fill; reconciliation will replace it once matches are
+	// settled. Falling back to the requested shares or limit here would book a
+	// trade that may never have happened.
+	return venue.Fill{OrderID: localID, Status: "unknown"}, nil
 }
 
 // rejectedByExchange reports whether the exchange answered with a definitive
@@ -706,71 +752,207 @@ func rejectedByExchange(err error) bool {
 	return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500
 }
 
-// fillFromAck converts an order acknowledgement into a fill.
+// fillFromOrder turns a nested order and its settled matches into the only
+// kind of fill the ledger may book: a terminal, fully accounted one.
 //
-// Amounts are only trusted when the API reports them. A resting order keeps
-// Shares=0 so the engine books nothing for it; a MATCHED order without an
-// explicit filled amount falls back to the share count this build signed, which
-// is exactly what a full match executes. The price is the API's own price when
-// present and the signed limit otherwise, which is the same conservative
-// estimate the Polymarket executor uses for an order without trade rows.
-func (e *Executor) fillFromAck(meta marketMeta, ack OrderAck, fallbackID string, limit, expectedShares float64, buy bool) venue.Fill {
-	status := normalizeOrderStatus(ack.Status)
-	sell := ack.sideIsSell(!buy)
-	price := parsePrice(ack.PricePerShare, priceDecimalsFor(meta.Tick))
-	if price <= 0 {
-		// The signed amounts are the price actually agreed, so prefer them over
-		// the requested limit when the response omits pricePerShare.
-		price = ack.ImpliedPrice(sell)
-	}
-	if price <= 0 {
-		price = limit
-	}
-	shares := ack.FilledShares()
-	if status == "filled" && shares <= 0 {
-		shares = expectedShares
-	}
-	if shares <= 0 && status == "filled" {
-		shares = ack.ImpliedShares(sell)
-	}
-	if price <= 0 {
-		price = ack.ImpliedPrice(sell)
-	}
-	if status == "" {
-		if shares > 0 {
-			status = "filled"
-		} else {
-			status = "open"
-		}
-	}
-	fill := venue.Fill{
-		OrderID: firstNonEmpty(ack.IDString(), fallbackID),
-		Shares:  shares,
-		Price:   price,
-		Status:  status,
-	}
-	if shares <= 0 || price <= 0 {
-		// No executed size is not a rejection: a resting order may still fill and
-		// a partial fill may grow. Reporting "rejected" here would mark the order
-		// dead in the ledger while real shares exist on chain, so report the
-		// honest "unknown" and let reconciliation decide.
-		switch status {
-		case "filled", "open", "partially_filled":
-			fill.Status = "unknown"
-		}
+// amountFilled is a share total without a price or cost. It is useful for
+// reconciliation only after every attributable match leg has been collected.
+// The matches endpoint returns whole transactions (including other makers), so
+// each match contributes exactly one leg whose hash equals this order's hash.
+// If the legs do not sum exactly to amountFilled, the evidence is incomplete
+// and the result stays unknown; request size and limit price are never
+// substitutes for execution facts.
+func (e *Executor) fillFromOrder(order OrderData, matches []MatchData, fallbackID string) venue.Fill {
+	orderID := firstNonEmpty(fallbackID, order.ID)
+	fill := venue.Fill{OrderID: orderID, Status: "unknown"}
+	if order.Order == nil {
 		return fill
 	}
-	fee := e.feeFor(meta, price, shares)
-	if reported := ack.FeePaid(); reported > 0 {
-		fee = reported
+	inner := order.Order
+	innerHash := strings.TrimSpace(inner.Hash)
+	if innerHash != "" && fallbackID != "" && !strings.EqualFold(innerHash, fallbackID) {
+		return fill
 	}
-	fill.Fee = fee
-	// Cost is the gross notional and the fee travels separately, for both sides.
-	// The engine folds the fee in exactly once when it books the position or the
-	// realized proceeds, which keeps the two booking paths (direct fill and
-	// reconciliation) from disagreeing by one fee.
-	fill.Cost = shares * price
+	// The hash on the nested order is optional in the official schema. The
+	// lookup path used the local hash, so it is still valid identity evidence
+	// when the response leaves the field out.
+	hash := firstNonEmpty(innerHash, fallbackID)
+	if hash != "" {
+		fill.OrderID = firstNonEmpty(fallbackID, innerHash, order.ID)
+	}
+	if inner.Side != uint8(SideBuy) && inner.Side != uint8(SideSell) {
+		return fill
+	}
+	status := normalizeOrderStatus(order.Status)
+	switch status {
+	case "filled", "cancelled", "expired", "rejected", "invalidated":
+	default:
+		// OPEN can keep growing and an unknown status is not evidence. Never
+		// finalize on the first positive amountFilled.
+		return fill
+	}
+	filled, ok := parseWeiAmount(order.AmountFilled)
+	if !ok {
+		if status == "filled" {
+			return fill
+		}
+		fill.Status = status
+		return fill
+	}
+	if filled.Sign() == 0 {
+		if status == "filled" {
+			return fill
+		}
+		fill.Status = status
+		return fill
+	}
+	if hash == "" {
+		return fill
+	}
+	totalShares := new(big.Rat)
+	totalCost := new(big.Rat)
+	totalFeeShares := new(big.Rat)
+	totalFeeCash := new(big.Rat)
+	attributed := 0
+	for _, match := range matches {
+		leg, ok := attributedLeg(match, hash)
+		if !ok {
+			return fill
+		}
+		if leg == nil {
+			continue
+		}
+		amount, ok := parseWeiAmount(leg.Amount)
+		if !ok || amount.Sign() <= 0 {
+			return fill
+		}
+		price, ok := parseDecimalRat(leg.Price)
+		if !ok || price.Sign() <= 0 || price.Cmp(big.NewRat(1, 1)) > 0 {
+			return fill
+		}
+		feeShares, feeCash, ok := feeLeg(leg.Fee, price)
+		if !ok {
+			return fill
+		}
+		shares := new(big.Rat).SetFrac(amount, oneUSDT)
+		totalShares.Add(totalShares, shares)
+		totalCost.Add(totalCost, new(big.Rat).Mul(shares, price))
+		totalFeeShares.Add(totalFeeShares, feeShares)
+		totalFeeCash.Add(totalFeeCash, feeCash)
+		attributed++
+	}
+	if attributed == 0 {
+		return fill
+	}
+	if totalShares.Cmp(new(big.Rat).SetFrac(filled, oneUSDT)) != 0 {
+		return fill
+	}
+	grossShares, _ := totalShares.Float64()
+	grossCost, _ := totalCost.Float64()
+	price, _ := new(big.Rat).Quo(totalCost, totalShares).Float64()
+	if grossShares <= 0 || grossCost <= 0 || price <= 0 || price > 1 {
+		return fill
+	}
+	if inner.Side == uint8(SideBuy) {
+		// A buy fee is charged in shares ("you receive fewer shares"), whether
+		// the match reports SHARES directly or COLLATERAL that must be converted
+		// at the execution price. Cost remains gross, Fee stays zero: the net
+		// share count already carries the charge, and the engine also adds Fee
+		// to a buy's cost.
+		feeShares, _ := totalFeeShares.Float64()
+		netShares := grossShares - feeShares
+		if netShares <= 0 {
+			return fill
+		}
+		fill.Shares = netShares
+		fill.Cost = grossCost
+		fill.Price = price
+		fill.Status = "filled"
+		return fill
+	}
+	// A sell fee is charged in quote collateral. Shares stay gross, proceeds are
+	// net, and Fee stays zero because the engine would subtract it again.
+	feeCash, _ := totalFeeCash.Float64()
+	netCost := grossCost - feeCash
+	if netCost <= 0 {
+		return fill
+	}
+	fill.Shares = grossShares
+	fill.Cost = netCost
+	fill.Price = price
+	fill.Status = "filled"
 	return fill
+}
+
+// attributedLeg returns the one leg in a match that belongs to hash. The taker
+// leg and any maker leg could not both be the same order, so that shape is
+// ambiguous and rejected. A nil leg with ok=true means this match belongs to
+// other orders and contributes nothing.
+func attributedLeg(match MatchData, hash string) (*OrderFillData, bool) {
+	taker := strings.EqualFold(strings.TrimSpace(match.Taker.Hash), hash)
+	maker := -1
+	for i := range match.Makers {
+		if !strings.EqualFold(strings.TrimSpace(match.Makers[i].Hash), hash) {
+			continue
+		}
+		if maker >= 0 {
+			return nil, false
+		}
+		maker = i
+	}
+	if taker && maker >= 0 {
+		return nil, false
+	}
+	if taker {
+		return &match.Taker, true
+	}
+	if maker >= 0 {
+		return &match.Makers[maker], true
+	}
+	return nil, true
+}
+
+func parseWeiAmount(value Number) (*big.Int, bool) {
+	text := strings.TrimSpace(value.String())
+	if text == "" {
+		return nil, false
+	}
+	amount, ok := new(big.Int).SetString(text, 10)
+	if !ok || amount.Sign() < 0 {
+		return nil, false
+	}
+	return amount, true
+}
+
+func parseDecimalRat(value Number) (*big.Rat, bool) {
+	text := strings.TrimSpace(value.String())
+	if text == "" || strings.ContainsAny(text, "/eE") {
+		return nil, false
+	}
+	rat, ok := new(big.Rat).SetString(text)
+	if !ok || rat.Sign() < 0 {
+		return nil, false
+	}
+	return rat, true
+}
+
+func feeLeg(fee *Fee, price *big.Rat) (shares *big.Rat, cash *big.Rat, ok bool) {
+	if fee == nil {
+		return nil, nil, false
+	}
+	amount, ok := parseWeiAmount(fee.Amount)
+	if !ok {
+		return nil, nil, false
+	}
+	value := new(big.Rat).SetFrac(amount, oneUSDT)
+	switch strings.ToUpper(strings.TrimSpace(fee.Type)) {
+	case "SHARES":
+		return new(big.Rat).Set(value), new(big.Rat).Mul(value, price), true
+	case "COLLATERAL":
+		return new(big.Rat).Quo(value, price), new(big.Rat).Set(value), true
+	default:
+		return nil, nil, false
+	}
 }
 
 // LookupOrder reconciles one order. A 404 is "not found" rather than an error,
@@ -783,24 +965,23 @@ func (e *Executor) LookupOrder(ctx context.Context, orderID, conditionID string)
 	if trimmed == "" {
 		return venue.Fill{}, false, nil
 	}
-	ack, err := e.client.Order(ctx, trimmed)
+	order, err := e.client.Order(ctx, trimmed)
 	if err != nil {
 		if IsNotFound(err) {
 			return venue.Fill{}, false, nil
 		}
 		return venue.Fill{}, false, err
 	}
-	// Metadata is best-effort here: a reconciliation that cannot find the market
-	// still returns the order's own shares and price, just without a computed
-	// fee. Refusing to reconcile would leave a possibly-filled order stuck.
-	meta := marketMeta{}
-	if e.provider != nil {
-		if resolved, metaErr := e.provider.marketMeta(ctx, "", conditionID); metaErr == nil {
-			meta = resolved
-		}
+	matches, complete, err := e.client.AllMatchesForOrder(ctx, trimmed)
+	if err != nil {
+		return venue.Fill{OrderID: trimmed, Status: "unknown"}, true, err
 	}
-	side, _ := ack.Side.Int64()
-	return e.fillFromAck(meta, ack, trimmed, 0, 0, side != int64(SideSell)), true, nil
+	if !complete {
+		// A page cap or repeated cursor means the match set is not provably
+		// whole. Book nothing and leave the order pending for the next lookup.
+		return venue.Fill{OrderID: trimmed, Status: "unknown"}, true, nil
+	}
+	return e.fillFromOrder(order, matches, trimmed), true, nil
 }
 
 // EstimateBuyFee returns the taker fee for a buy of amount USDT at price, using
@@ -915,7 +1096,7 @@ func (e *Executor) Quote(ctx context.Context, tokenID, conditionID string, amoun
 // exchange family. The snapshot is cached briefly because the engine reads it
 // before every order.
 func (e *Executor) Collateral(ctx context.Context) (venue.CashSnapshot, error) {
-	chain, err := e.chainNow()
+	chain, generation, err := e.chainSnapshot()
 	if err != nil {
 		return venue.CashSnapshot{}, err
 	}
@@ -939,6 +1120,11 @@ func (e *Executor) Collateral(ctx context.Context) (venue.CashSnapshot, error) {
 		At:        e.now().UTC(),
 	}
 	e.mu.Lock()
+	if e.generation != generation {
+		e.mu.Unlock()
+		return venue.CashSnapshot{Amount: cached.Amount, Allowance: cached.Allowance, At: cached.At, Stale: true},
+			fmt.Errorf("Predict.fun 配置已变更，余额读取结果已丢弃")
+	}
 	e.snapshot = snapshot
 	e.snapshotAt = snapshot.At
 	e.approvalKnown = true

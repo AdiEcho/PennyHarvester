@@ -185,6 +185,22 @@ func (o *OnChain) ethClient(ctx context.Context) (*ethclient.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("连接 BSC RPC %s 失败: %w", o.settings.rpcURL, err)
 	}
+	// A non-empty RPC override can point at the other network. Signing is bound
+	// to settings.chainID, but balance/nonce/allowance reads are not, so verify
+	// the endpoint before the client is used for any read or transaction.
+	chainID, err := client.ChainID(ctx)
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("读取 RPC %s 的 chainId 失败: %w", o.settings.rpcURL, err)
+	}
+	if chainID == nil || chainID.Int64() != o.settings.chainID {
+		client.Close()
+		got := "未知"
+		if chainID != nil {
+			got = chainID.String()
+		}
+		return nil, fmt.Errorf("BSC RPC %s 的 chainId 为 %s，与配置网络 chainId %d 不一致，已拒绝使用", o.settings.rpcURL, got, o.settings.chainID)
+	}
 	o.client = client
 	return client, nil
 }
@@ -452,13 +468,58 @@ func (o *OnChain) sendCall(ctx context.Context, client *ethclient.Client, nonce 
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("签名 %s 交易失败: %w", call.action, err)
 	}
+	// The signature fixes the hash before the node sees the transaction. Once
+	// signing succeeds, every error must carry that hash: a send error can mean
+	// the node accepted and then dropped the connection, and the operator needs
+	// an identity to check before signing a replacement with a new nonce.
+	hash := signed.Hash()
 	if err := client.SendTransaction(ctx, signed); err != nil {
-		return common.Hash{}, fmt.Errorf("发送 %s 交易失败: %w", call.action, err)
+		return hash, &TxError{Hash: hash, Action: call.action, Phase: "broadcast", Err: err}
 	}
-	if err := o.waitForReceipt(ctx, client, signed.Hash()); err != nil {
-		return signed.Hash(), err
+	if err := o.waitForReceipt(ctx, client, hash); err != nil {
+		return hash, &TxError{Hash: hash, Action: call.action, Phase: "receipt", Err: err}
 	}
-	return signed.Hash(), nil
+	return hash, nil
+}
+
+// TxError is a chain transaction failure that still knows the signed hash.
+// Callers must surface the hash and must not silently retry with a fresh nonce:
+// the transaction may already be in a block.
+type TxError struct {
+	Hash   common.Hash
+	Action string
+	Phase  string
+	Err    error
+}
+
+func (e *TxError) Error() string {
+	if e == nil {
+		return "链上交易失败"
+	}
+	if e.Hash == (common.Hash{}) {
+		return fmt.Sprintf("%s失败: %v", e.Action, e.Err)
+	}
+	return fmt.Sprintf("%s在%s阶段失败（交易 %s）: %v", e.Action, e.Phase, e.Hash.Hex(), e.Err)
+}
+
+func (e *TxError) Unwrap() error { return e.Err }
+
+// TransactionHash exposes the signed hash through an interface, so packages
+// that must not import this adapter can still report the identity.
+func (e *TxError) TransactionHash() string {
+	if e == nil || e.Hash == (common.Hash{}) {
+		return ""
+	}
+	return e.Hash.Hex()
+}
+
+// TxHashOf extracts the signed transaction hash from a chain error.
+func TxHashOf(err error) (common.Hash, bool) {
+	var txErr *TxError
+	if errors.As(err, &txErr) && txErr.Hash != (common.Hash{}) {
+		return txErr.Hash, true
+	}
+	return common.Hash{}, false
 }
 
 // waitForReceipt polls for a receipt every two seconds for at most three

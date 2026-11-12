@@ -375,10 +375,12 @@ type Tag struct {
 	Label string `json:"label"`
 }
 
-// SignedOrder is the wire form of the EIP-712 Order struct plus its signature.
-// Every uint256 is a decimal string: the 77-digit token id and an 18-decimal
-// amount do not round-trip through a JSON number in every client.
-type SignedOrder struct {
+// ContractOrder is the signed EIP-712 order as it travels on the wire. It is
+// deliberately separate from the REST envelope: the order struct is what the
+// signature commits to, while CreateOrderData adds the unsigned execution
+// hints. Every uint256 is a decimal string, except expiration which the public
+// contract defines as a Unix-second integer.
+type ContractOrder struct {
 	Salt          string `json:"salt"`
 	Maker         string `json:"maker"`
 	Signer        string `json:"signer"`
@@ -386,150 +388,150 @@ type SignedOrder struct {
 	TokenID       string `json:"tokenId"`
 	MakerAmount   string `json:"makerAmount"`
 	TakerAmount   string `json:"takerAmount"`
-	Expiration    string `json:"expiration"`
+	Expiration    int64  `json:"expiration"`
 	Nonce         string `json:"nonce"`
 	FeeRateBps    string `json:"feeRateBps"`
 	Side          uint8  `json:"side"`
 	SignatureType uint8  `json:"signatureType"`
-	Signature     string `json:"signature"`
+	Hash          string `json:"hash,omitempty"`
+	Signature     string `json:"signature,omitempty"`
 }
 
-// SignedOrderRequest is the POST /v1/orders payload.
-//
-// Only Order is signed; the three companion fields are the hints the SDK sends
-// with a marketable order (price in decimal form, the slippage that produced
-// the signed amounts, and whether the taker amount is a minimum output). The
-// server re-checks them against the signed struct, so a wrong hint is rejected
-// rather than executed at a different price.
-type SignedOrderRequest struct {
-	Order          SignedOrder `json:"data"`
-	PricePerShare  string      `json:"pricePerShare,omitempty"`
-	SlippageBps    int         `json:"slippageBps,omitempty"`
-	IsMinAmountOut *bool       `json:"isMinAmountOut,omitempty"`
+// SignedOrder is kept as an alias for the signed contract order. The name is
+// historical; callers should use ContractOrder for new code.
+type SignedOrder = ContractOrder
+
+// OrderStrategy is the execution strategy sent alongside a signed order.
+type OrderStrategy string
+
+const (
+	StrategyMarket OrderStrategy = "MARKET"
+	StrategyLimit  OrderStrategy = "LIMIT"
+)
+
+// CreateOrderData is the required data object of POST /v1/orders. Order is a
+// pointer so a missing required object can be rejected before anything is
+// signed or sent.
+type CreateOrderData struct {
+	Order          *ContractOrder `json:"order"`
+	PricePerShare  string         `json:"pricePerShare"`
+	Strategy       OrderStrategy  `json:"strategy"`
+	SlippageBps    string         `json:"slippageBps,omitempty"`
+	IsMinAmountOut *bool          `json:"isMinAmountOut,omitempty"`
 }
 
-// OrderAck is an order as the API reports it. Several optional spellings are
-// decoded because the create and read endpoints are not documented field for
-// field; treat the zero value as "not reported", never as zero.
-type OrderAck struct {
-	ID          Number `json:"id"`
-	OrderID     Number `json:"orderId"`
-	Status      string `json:"status"`
-	MarketID    Number `json:"marketId"`
-	ConditionID string `json:"conditionId"`
-	// OnChainID is the traded token id when the API echoes it.
-	OnChainID     string `json:"onChainId"`
-	Side          Number `json:"side"`
-	PricePerShare Number `json:"pricePerShare"`
-	MakerAmount   Number `json:"makerAmount"`
-	TakerAmount   Number `json:"takerAmount"`
-	// AmountFilled and AmountMatched are the 18-decimal filled share counts
-	// under two different upstream names.
-	AmountFilled  Number `json:"amountFilled"`
-	AmountMatched Number `json:"amountMatched"`
-	Fee           Number `json:"fee"`
-	FeeAmount     Number `json:"feeAmount"`
-	TxHash        string `json:"txHash"`
-	CreatedAt     string `json:"createdAt"`
-	ErrorMessage  string `json:"errorMessage"`
+// CreateOrderRequest is the POST /v1/orders envelope. It is distinct from the
+// signed ContractOrder; sending the order itself as data is the old, rejected
+// shape.
+type CreateOrderRequest struct {
+	Data CreateOrderData `json:"data"`
 }
 
-// IDString returns the exchange order id under whichever field carries it.
-func (a OrderAck) IDString() string {
-	if id := strings.TrimSpace(a.ID.String()); id != "" && id != "0" {
-		return id
-	}
-	return strings.TrimSpace(a.OrderID.String())
+// CreateOrderResponseData is the accepted-order acknowledgement. It carries
+// identity only: no fill quantity, price or fee is implied by a successful
+// create.
+type CreateOrderResponseData struct {
+	Code               string `json:"code"`
+	OrderID            string `json:"orderId"`
+	OrderHash          string `json:"orderHash"`
+	RemovalLockedUntil string `json:"removalLockedUntil,omitempty"`
 }
 
-// FilledShares returns the filled share count, unscaled from 18 decimals.
-// A wire value with a fractional part is tolerated here (a fill report is a
-// display quantity, not a signed amount): assuming zero would mark a real fill
-// as a rejection.
-func (a OrderAck) FilledShares() float64 {
-	raw := a.AmountFilled
-	if raw.IsZero() {
-		raw = a.AmountMatched
-	}
-	value, err := raw.BigInt()
-	if err != nil || value.Sign() <= 0 {
-		if decimal, floatErr := raw.Float64(); floatErr == nil && decimal > 0 {
-			return decimal / 1e18
-		}
-		return 0
-	}
-	return unscale18(value)
+// CreateOrderResponse is the top-level POST /v1/orders response.
+type CreateOrderResponse struct {
+	Success bool                     `json:"success"`
+	Data    *CreateOrderResponseData `json:"data"`
 }
 
-// sideIsSell reports whether the ack describes a sell. The side is absent on
-// some responses, in which case the caller falls back to what it asked for.
-func (a OrderAck) sideIsSell(fallback bool) bool {
-	// "" means the response carried no side at all, and it must fall back to the
-	// caller's intent: decoding it as a number yields 0 (a buy) with no error,
-	// which would swap the maker/taker amounts of a sell. An explicit "0" is a
-	// real buy and must be honoured.
-	if strings.TrimSpace(string(a.Side)) == "" {
-		return fallback
-	}
-	side, err := a.Side.Int64()
-	if err != nil {
-		return fallback
-	}
-	return side == int64(SideSell)
+// Fee is the fee attached to one side of a match. Type says which asset was
+// charged; Amount is always an 18-decimal integer string.
+type Fee struct {
+	Amount Number `json:"amount"`
+	Type   string `json:"type"`
 }
 
-// ImpliedPrice derives the execution price from the signed maker/taker amounts,
-// which every order response echoes. It is the last resort before giving up on
-// an otherwise fill-bearing response: a reconciliation with price 0 used to
-// leave the order unresolved forever, which froze the account's stop-loss.
-func (a OrderAck) ImpliedPrice(sell bool) float64 {
-	shares, collateral, err := a.amountPair(sell)
-	if err != nil || shares <= 0 || collateral <= 0 {
-		return 0
-	}
-	return collateral / shares
+// OrderFillData is one order's leg inside a match event. A match event covers a
+// whole transaction, so only the leg whose Hash equals this order may be
+// attributed to it.
+type OrderFillData struct {
+	QuoteType string          `json:"quoteType"`
+	Amount    Number          `json:"amount"`
+	Price     Number          `json:"price"`
+	Outcome   json.RawMessage `json:"outcome"`
+	Signer    string          `json:"signer"`
+	Hash      string          `json:"hash"`
+	Fee       *Fee            `json:"fee"`
 }
 
-// ImpliedShares derives the order size from the signed amounts. It is used when
-// a filled response omits the executed quantity.
-func (a OrderAck) ImpliedShares(sell bool) float64 {
-	shares, _, err := a.amountPair(sell)
-	if err != nil || shares <= 0 {
-		return 0
-	}
-	return shares
+// MatchData is one settled match event returned by GET /v1/orders/matches.
+type MatchData struct {
+	Market          json.RawMessage `json:"market"`
+	Taker           OrderFillData   `json:"taker"`
+	AmountFilled    Number          `json:"amountFilled"`
+	PriceExecuted   Number          `json:"priceExecuted"`
+	Makers          []OrderFillData `json:"makers"`
+	TransactionHash string          `json:"transactionHash"`
+	SettlementID    string          `json:"settlementId,omitempty"`
+	ExecutedAt      string          `json:"executedAt"`
 }
 
-// amountPair reads (shares, collateral) from the ack. On a buy the maker gives
-// collateral and the taker gives shares; on a sell they swap.
-func (a OrderAck) amountPair(sell bool) (shares, collateral float64, err error) {
-	maker, err := a.MakerAmount.BigInt()
-	if err != nil {
-		return 0, 0, err
-	}
-	taker, err := a.TakerAmount.BigInt()
-	if err != nil {
-		return 0, 0, err
-	}
-	if sell {
-		return unscale18(maker), unscale18(taker), nil
-	}
-	return unscale18(taker), unscale18(maker), nil
+// MatchesResponse is the paginated GET /v1/orders/matches response.
+type MatchesResponse struct {
+	Success bool        `json:"success"`
+	Cursor  string      `json:"cursor"`
+	Data    []MatchData `json:"data"`
 }
 
-// FeePaid returns the fee the API charged, if it reported one. It is a
-// 18-decimal collateral amount; the executor recomputes the fee from the market
-// rate when this is absent.
-func (a OrderAck) FeePaid() float64 {
-	raw := a.Fee
-	if raw.IsZero() {
-		raw = a.FeeAmount
-	}
-	value, err := raw.BigInt()
-	if err != nil || value.Sign() <= 0 {
-		return 0
-	}
-	return unscale18(value)
+// OrderData is the nested GET /v1/orders/{hash} payload. The outer fields are
+// lifecycle and cumulative totals; the signed order and its side are nested,
+// and the API does not expose an execution price or cost on this object.
+type OrderData struct {
+	Order             *ContractOrder `json:"order"`
+	ID                string         `json:"id"`
+	MarketID          int64          `json:"marketId"`
+	Currency          string         `json:"currency"`
+	Amount            Number         `json:"amount"`
+	AmountFilled      Number         `json:"amountFilled"`
+	IsNegRisk         bool           `json:"isNegRisk"`
+	IsYieldBearing    bool           `json:"isYieldBearing"`
+	Strategy          OrderStrategy  `json:"strategy"`
+	Status            string         `json:"status"`
+	RewardEarningRate int32          `json:"rewardEarningRate"`
+}
+
+// OrderResponse is the top-level GET /v1/orders/{hash} response.
+type OrderResponse struct {
+	Success bool       `json:"success"`
+	Data    *OrderData `json:"data"`
+}
+
+// RemoveOrdersData is the required data object of POST /v1/orders/remove.
+type RemoveOrdersData struct {
+	IDs []string `json:"ids"`
+}
+
+// RemoveOrdersRequest is the POST /v1/orders/remove envelope.
+type RemoveOrdersRequest struct {
+	Data RemoveOrdersData `json:"data"`
+}
+
+// RemoveOrdersResponse reports the outcome per submitted order. The arrays are
+// pointers so a missing required field is distinguishable from an empty list.
+type RemoveOrdersResponse struct {
+	Success  bool      `json:"success"`
+	Removed  *[]string `json:"removed"`
+	Noop     *[]string `json:"noop"`
+	Rejected *[]string `json:"rejected"`
+}
+
+// CancelRejectedError means the order is still inside its market's removal lock
+// window. It is retryable and must not be reported as cancelled.
+type CancelRejectedError struct {
+	OrderID string
+}
+
+func (e *CancelRejectedError) Error() string {
+	return fmt.Sprintf("Predict.fun 撤单被拒绝（订单 %s 仍在撤单锁定窗口内，可稍后重试）", e.OrderID)
 }
 
 // Position is one open position. It is decoded for diagnostics only; trading
@@ -677,9 +679,10 @@ type Client struct {
 	hookMu sync.RWMutex
 	hooks  []func()
 
-	mu        sync.Mutex
-	token     string
-	expiresAt time.Time
+	mu         sync.Mutex
+	token      string
+	expiresAt  time.Time
+	generation uint64
 
 	// base is the configuration the process started with (environment only).
 	// ResetLiveSettings returns to it, which is the only baseline the client can
@@ -902,6 +905,7 @@ func (c *Client) apply(resolved settings) {
 	c.mu.Lock()
 	c.token = ""
 	c.expiresAt = time.Time{}
+	c.generation++
 	c.mu.Unlock()
 	c.hookMu.RLock()
 	hooks := append([]func(){}, c.hooks...)
@@ -938,6 +942,9 @@ type apiRequest struct {
 	path   string
 	query  url.Values
 	body   any
+	// whole decodes the complete response instead of only envelope.data. The
+	// create/cancel endpoints carry required fields outside data.
+	whole bool
 	// authed requests carry the bearer token and are retried once after a 401.
 	authed bool
 }
@@ -1026,8 +1033,9 @@ func (c *Client) roundTrip(ctx context.Context, request apiRequest, out any) (st
 			}
 		}
 
+		trimmed := bytes.TrimSpace(raw)
 		var envelope apiEnvelope
-		if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 {
+		if len(trimmed) > 0 {
 			if err := json.Unmarshal(trimmed, &envelope); err != nil {
 				return "", fmt.Errorf("解析 Predict.fun %s 响应: %w（%s）", request.path, err, snippet(string(raw)))
 			}
@@ -1049,9 +1057,15 @@ func (c *Client) roundTrip(ctx context.Context, request apiRequest, out any) (st
 				Body:       detail,
 			}
 		}
-		if out != nil && len(bytes.TrimSpace(envelope.Data)) > 0 && string(bytes.TrimSpace(envelope.Data)) != "null" {
-			if err := json.Unmarshal(envelope.Data, out); err != nil {
-				return "", fmt.Errorf("解析 Predict.fun %s 数据: %w", request.path, err)
+		if out != nil {
+			payload := envelope.Data
+			if request.whole {
+				payload = trimmed
+			}
+			if len(bytes.TrimSpace(payload)) > 0 && string(bytes.TrimSpace(payload)) != "null" {
+				if err := json.Unmarshal(payload, out); err != nil {
+					return "", fmt.Errorf("解析 Predict.fun %s 数据: %w", request.path, err)
+				}
 			}
 		}
 		return envelope.Cursor, nil
@@ -1174,6 +1188,9 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	}
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
+	c.mu.Lock()
+	generation := c.generation
+	c.mu.Unlock()
 	// Pin one configuration snapshot: signing with a key that was swapped out
 	// between reading the address and hashing the message would produce a
 	// signature from the wrong account.
@@ -1202,7 +1219,7 @@ func (c *Client) Authenticate(ctx context.Context) error {
 		method: http.MethodPost,
 		path:   "/v1/auth",
 		body: map[string]string{
-			"signer":    c.Signer(),
+			"signer":    signer,
 			"message":   message,
 			"signature": signature,
 		},
@@ -1216,9 +1233,15 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	}
 	expiresAt := c.tokenExpiry(token, data.ExpiresAt, data.ExpiresIn)
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.generation != generation {
+		// A configuration switch happened while the old wallet was logging in.
+		// Caching that bearer token would authenticate the new host as the old
+		// account; the next request starts a fresh login instead.
+		return fmt.Errorf("Predict.fun 配置已变更，请重试")
+	}
 	c.token = token
 	c.expiresAt = expiresAt
-	c.mu.Unlock()
 	return nil
 }
 
@@ -1268,7 +1291,9 @@ func (c *Client) Markets(ctx context.Context, query MarketQuery) ([]Market, stri
 	}
 	values := url.Values{"first": {strconv.Itoa(first)}}
 	if query.Cursor != "" {
-		values.Set("cursor", query.Cursor)
+		// The public API names the page parameter "after"; "cursor" is the name
+		// of the response field and is ignored by the server.
+		values.Set("after", query.Cursor)
 	}
 	if query.Status != "" {
 		values.Set("status", query.Status)
@@ -1418,76 +1443,300 @@ func (c *Client) Stats(ctx context.Context, marketID string) (Stats, error) {
 	return stats, nil
 }
 
-// PlaceOrder submits one signed order. The payload is built once by the caller;
-// the 401/429 retries inside roundTrip resend the same signature, which is what
-// makes a retry safe (a re-signed order would be a second order).
-func (c *Client) PlaceOrder(ctx context.Context, request SignedOrderRequest) (OrderAck, error) {
-	var raw json.RawMessage
+// PlaceOrder submits one signed order. The payload is built once by the
+// caller; the 401/429 retries inside roundTrip resend the same signature, which
+// is what makes a retry safe (a re-signed order would be a second order).
+//
+// A successful create only proves acceptance. It deliberately returns no fill:
+// the acknowledgement has no executed quantity, price or fee, so treating it as
+// a fill would manufacture facts the exchange never reported.
+func (c *Client) PlaceOrder(ctx context.Context, request CreateOrderRequest) (CreateOrderResponseData, error) {
+	if err := validateCreateOrderRequest(request); err != nil {
+		return CreateOrderResponseData{}, err
+	}
+	var response CreateOrderResponse
 	if _, err := c.roundTrip(ctx, apiRequest{
 		method: http.MethodPost,
 		path:   "/v1/orders",
 		body:   request,
 		authed: true,
-	}, &raw); err != nil {
-		return OrderAck{}, err
+		whole:  true,
+	}, &response); err != nil {
+		return CreateOrderResponseData{}, err
 	}
-	return decodeOrderAck(raw)
+	if response.Data == nil {
+		return CreateOrderResponseData{}, fmt.Errorf("解析 Predict.fun 下单响应: 缺少 data")
+	}
+	if strings.TrimSpace(response.Data.OrderID) == "" && strings.TrimSpace(response.Data.OrderHash) == "" {
+		return CreateOrderResponseData{}, fmt.Errorf("解析 Predict.fun 下单响应: 缺少订单身份")
+	}
+	return *response.Data, nil
 }
 
-// Order reads one order by id. A 404 is returned as *APIError; callers use
+// Order reads one order by hash. A 404 is returned as *APIError; callers use
 // IsNotFound to distinguish "unknown order" from a transport failure.
-func (c *Client) Order(ctx context.Context, orderID string) (OrderAck, error) {
-	trimmed := strings.TrimSpace(orderID)
+func (c *Client) Order(ctx context.Context, orderHash string) (OrderData, error) {
+	trimmed := strings.TrimSpace(orderHash)
 	if trimmed == "" {
-		return OrderAck{}, fmt.Errorf("缺少 Predict.fun 订单 ID")
+		return OrderData{}, fmt.Errorf("缺少 Predict.fun 订单哈希")
 	}
-	var raw json.RawMessage
+	var response OrderResponse
 	if _, err := c.roundTrip(ctx, apiRequest{
 		method: http.MethodGet,
 		path:   "/v1/orders/" + url.PathEscape(trimmed),
 		authed: true,
-	}, &raw); err != nil {
-		return OrderAck{}, err
+		whole:  true,
+	}, &response); err != nil {
+		return OrderData{}, err
 	}
-	return decodeOrderAck(raw)
+	if response.Data == nil {
+		return OrderData{}, fmt.Errorf("解析 Predict.fun 订单: 缺少 data")
+	}
+	if strings.TrimSpace(response.Data.ID) == "" {
+		return OrderData{}, fmt.Errorf("解析 Predict.fun 订单: 缺少外层 id")
+	}
+	if response.Data.Order == nil {
+		return OrderData{}, fmt.Errorf("解析 Predict.fun 订单: 缺少内层 order")
+	}
+	return *response.Data, nil
 }
 
-// decodeOrderAck tolerates both the flat order object and a {"order": {...}}
-// wrapper.
-func decodeOrderAck(raw json.RawMessage) (OrderAck, error) {
-	var ack OrderAck
-	if err := json.Unmarshal(raw, &ack); err != nil {
-		return OrderAck{}, fmt.Errorf("解析 Predict.fun 订单: %w", err)
-	}
-	if ack.IDString() == "" {
-		var wrapped struct {
-			Order OrderAck `json:"order"`
-		}
-		if err := json.Unmarshal(raw, &wrapped); err != nil {
-			return OrderAck{}, fmt.Errorf("解析 Predict.fun 订单: %w", err)
-		}
-		if wrapped.Order.IDString() != "" {
-			ack = wrapped.Order
-		}
-	}
-	return ack, nil
+// MatchQuery is one GET /v1/orders/matches page. Hashes are matched against
+// both maker and taker legs, so callers must still attribute each leg.
+type MatchQuery struct {
+	OrderHashes []string
+	First       int
+	After       string
 }
 
-// CancelOrder removes one order. The request body shape is the SDK's
-// {orderId} form; a server that expects a list is a contract change and will
-// answer with a 400 rather than silently cancelling something else.
+func validateCreateOrderRequest(request CreateOrderRequest) error {
+	data := request.Data
+	if data.Order == nil {
+		return fmt.Errorf("Predict.fun 下单请求缺少 data.order")
+	}
+	if strings.TrimSpace(data.PricePerShare) == "" {
+		return fmt.Errorf("Predict.fun 下单请求缺少 data.pricePerShare")
+	}
+	rawPrice := strings.TrimSpace(data.PricePerShare)
+	price, ok := new(big.Rat).SetString(rawPrice)
+	limit := new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+	if !ok || !price.IsInt() || price.Sign() <= 0 || price.Cmp(limit) > 0 {
+		return fmt.Errorf("Predict.fun 下单请求的 data.pricePerShare 必须是 0..1e18 的整数字符串: %q", data.PricePerShare)
+	}
+	switch data.Strategy {
+	case StrategyMarket, StrategyLimit:
+	default:
+		return fmt.Errorf("Predict.fun 下单请求的 data.strategy 必须是 MARKET 或 LIMIT")
+	}
+	if data.SlippageBps != "" {
+		bps, err := strconv.Atoi(strings.TrimSpace(data.SlippageBps))
+		if err != nil || bps < 0 || bps > 10000 {
+			return fmt.Errorf("Predict.fun 下单请求的 data.slippageBps 必须是 0..10000 的字符串")
+		}
+	}
+	order := data.Order
+	required := []struct {
+		name  string
+		value string
+	}{
+		{"salt", order.Salt},
+		{"maker", order.Maker},
+		{"signer", order.Signer},
+		{"taker", order.Taker},
+		{"tokenId", order.TokenID},
+		{"makerAmount", order.MakerAmount},
+		{"takerAmount", order.TakerAmount},
+		{"nonce", order.Nonce},
+		{"feeRateBps", order.FeeRateBps},
+		{"signature", order.Signature},
+	}
+	for _, field := range required {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("Predict.fun 下单请求的 data.order.%s 不能为空", field.name)
+		}
+	}
+	if order.Expiration <= 0 {
+		return fmt.Errorf("Predict.fun 下单请求的 data.order.expiration 必须是正整数 Unix 秒")
+	}
+	if order.Side != uint8(SideBuy) && order.Side != uint8(SideSell) {
+		return fmt.Errorf("Predict.fun 下单请求的 data.order.side 无效: %d", order.Side)
+	}
+	if order.SignatureType != uint8(SignatureTypeEOA) {
+		return fmt.Errorf("Predict.fun 下单请求仅支持 EOA 签名（signatureType=0）")
+	}
+	return nil
+}
+
+// Matches reads one page of settled match events. The API returns whole
+// transactions, including other makers; callers must select the leg belonging
+// to their own order hash.
+func (c *Client) Matches(ctx context.Context, query MatchQuery) ([]MatchData, string, error) {
+	hashes := make([]string, 0, len(query.OrderHashes))
+	for _, hash := range query.OrderHashes {
+		trimmed := strings.TrimSpace(hash)
+		if trimmed == "" {
+			return nil, "", fmt.Errorf("Predict.fun 成交流水查询包含空订单哈希")
+		}
+		hashes = append(hashes, trimmed)
+	}
+	if len(hashes) == 0 {
+		return nil, "", fmt.Errorf("Predict.fun 成交流水查询缺少订单哈希")
+	}
+	if len(hashes) > 25 {
+		return nil, "", fmt.Errorf("Predict.fun 成交流水查询最多支持 25 个订单哈希")
+	}
+	first := query.First
+	if first <= 0 {
+		first = 50
+	}
+	if first > 150 {
+		first = 150
+	}
+	values := url.Values{}
+	values.Set("first", strconv.Itoa(first))
+	if after := strings.TrimSpace(query.After); after != "" {
+		values.Set("after", after)
+	}
+	for _, hash := range hashes {
+		values.Add("orderHashes", hash)
+	}
+	var response MatchesResponse
+	cursor, err := c.roundTrip(ctx, apiRequest{
+		method: http.MethodGet,
+		path:   "/v1/orders/matches",
+		query:  values,
+		authed: true,
+		whole:  true,
+	}, &response)
+	if err != nil {
+		return nil, "", err
+	}
+	if response.Cursor == "" {
+		response.Cursor = cursor
+	}
+	return response.Data, response.Cursor, nil
+}
+
+// AllMatchesForOrder follows every matches page for one order hash. It reports
+// complete=false when a page cap or repeated cursor prevents proving the set is
+// whole; an incomplete set must never be summed as if it were final.
+func (c *Client) AllMatchesForOrder(ctx context.Context, orderHash string) ([]MatchData, bool, error) {
+	const maxPages = 20
+	hash := strings.TrimSpace(orderHash)
+	if hash == "" {
+		return nil, false, fmt.Errorf("缺少 Predict.fun 订单哈希")
+	}
+	seenCursors := map[string]bool{}
+	var all []MatchData
+	after := ""
+	for page := 0; page < maxPages; page++ {
+		matches, cursor, err := c.Matches(ctx, MatchQuery{
+			OrderHashes: []string{hash},
+			First:       150,
+			After:       after,
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		all = append(all, matches...)
+		cursor = strings.TrimSpace(cursor)
+		if cursor == "" {
+			return dedupeMatches(all), true, nil
+		}
+		if seenCursors[cursor] {
+			return dedupeMatches(all), false, nil
+		}
+		seenCursors[cursor] = true
+		after = cursor
+	}
+	return dedupeMatches(all), false, nil
+}
+
+func dedupeMatches(matches []MatchData) []MatchData {
+	out := make([]MatchData, 0, len(matches))
+	seen := map[string]bool{}
+	for _, match := range matches {
+		key := strings.ToLower(match.TransactionHash) + "|" + match.SettlementID + "|" +
+			match.ExecutedAt + "|" + strings.ToLower(match.Taker.Hash) + "|" +
+			match.Taker.Amount.String() + "|" + match.Taker.Price.String() + "|" +
+			match.AmountFilled.String() + "|" + match.PriceExecuted.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, match)
+	}
+	return out
+}
+
+// CancelOrders removes up to 100 orders. The response reports per-id outcomes;
+// callers must inspect it rather than treating HTTP 200 as cancellation.
+func (c *Client) CancelOrders(ctx context.Context, orderIDs []string) (RemoveOrdersResponse, error) {
+	ids := make([]string, 0, len(orderIDs))
+	seen := map[string]bool{}
+	for _, id := range orderIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			return RemoveOrdersResponse{}, fmt.Errorf("Predict.fun 撤单请求包含空订单 ID")
+		}
+		if seen[trimmed] {
+			return RemoveOrdersResponse{}, fmt.Errorf("Predict.fun 撤单请求包含重复订单 ID: %s", trimmed)
+		}
+		seen[trimmed] = true
+		ids = append(ids, trimmed)
+	}
+	if len(ids) == 0 || len(ids) > 100 {
+		return RemoveOrdersResponse{}, fmt.Errorf("Predict.fun 撤单请求需要 1..100 个订单 ID")
+	}
+	var response RemoveOrdersResponse
+	if _, err := c.roundTrip(ctx, apiRequest{
+		method: http.MethodPost,
+		path:   "/v1/orders/remove",
+		body:   RemoveOrdersRequest{Data: RemoveOrdersData{IDs: ids}},
+		authed: true,
+		whole:  true,
+	}, &response); err != nil {
+		return RemoveOrdersResponse{}, err
+	}
+	if response.Removed == nil || response.Noop == nil || response.Rejected == nil {
+		return RemoveOrdersResponse{}, fmt.Errorf("解析 Predict.fun 撤单响应: 缺少 removed/noop/rejected")
+	}
+	return response, nil
+}
+
+// CancelOrder removes one order. removed and noop are successful outcomes;
+// rejected means the order is still locked and must remain recoverable.
 func (c *Client) CancelOrder(ctx context.Context, orderID string) error {
 	trimmed := strings.TrimSpace(orderID)
 	if trimmed == "" {
 		return fmt.Errorf("缺少 Predict.fun 订单 ID，无法撤单")
 	}
-	_, err := c.roundTrip(ctx, apiRequest{
-		method: http.MethodPost,
-		path:   "/v1/orders/remove",
-		body:   map[string]string{"orderId": trimmed},
-		authed: true,
-	}, nil)
-	return err
+	response, err := c.CancelOrders(ctx, []string{trimmed})
+	if err != nil {
+		return err
+	}
+	removed := containsString(*response.Removed, trimmed)
+	noop := containsString(*response.Noop, trimmed)
+	rejected := containsString(*response.Rejected, trimmed)
+	if rejected {
+		return &CancelRejectedError{OrderID: trimmed}
+	}
+	if removed && noop {
+		return fmt.Errorf("Predict.fun 撤单响应自相矛盾（订单 %s 同时为 removed 和 noop）", trimmed)
+	}
+	if removed || noop {
+		return nil
+	}
+	return fmt.Errorf("Predict.fun 撤单响应未包含订单 %s 的结果", trimmed)
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Positions reads the account's positions. Nothing in this build trades from

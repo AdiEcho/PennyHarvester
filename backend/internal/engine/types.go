@@ -85,6 +85,9 @@ type Account struct {
 	LiveSigner     string `json:"live_signer"`
 	LiveMaker      string `json:"live_maker"`
 	LiveError      string `json:"live_error"`
+	// LiveTestnet distinguishes a Predict.fun testnet signer from mainnet
+	// money. Paper accounts and Polymarket leave it false.
+	LiveTestnet bool `json:"live_testnet"`
 }
 
 // EffectiveVenue defaults an unset venue to Polymarket. Every account rows that
@@ -565,7 +568,7 @@ func (s VenueSystemSettings) Merge(previous VenueSystemSettings) VenueSystemSett
 	if s.Live.SignatureType == nil {
 		s.Live.SignatureType = previous.Live.SignatureType
 	}
-	if s.Live.APIKey == "" {
+	if keep(s.Live.APIKey) {
 		s.Live.APIKey = previous.Live.APIKey
 	}
 	if keep(s.Live.APISecret) {
@@ -700,6 +703,12 @@ func (s LiveSettings) Redacted() LiveSettings {
 	if s.PrivateKey != "" {
 		s.PrivateKey = netproxy.RedactedSecret
 	}
+	// The API key identifies the credential set; returning it adds no display
+	// value and leaks a usable identifier. The *_configured flags tell the UI
+	// whether one is stored.
+	if s.APIKey != "" {
+		s.APIKey = netproxy.RedactedSecret
+	}
 	if s.APISecret != "" {
 		s.APISecret = netproxy.RedactedSecret
 	}
@@ -716,6 +725,9 @@ func (s LiveSettings) MergeSecret(previous LiveSettings) LiveSettings {
 	previous = previous.Normalize()
 	if s.PrivateKey == netproxy.RedactedSecret {
 		s.PrivateKey = previous.PrivateKey
+	}
+	if s.APIKey == netproxy.RedactedSecret {
+		s.APIKey = previous.APIKey
 	}
 	if s.APISecret == netproxy.RedactedSecret {
 		s.APISecret = previous.APISecret
@@ -870,6 +882,9 @@ type LiveProbe struct {
 	Cash          float64 `json:"cash"`
 	Allowance     float64 `json:"allowance"`
 	LatencyMS     float64 `json:"latency_ms"`
+	// Testnet reports the network the probe actually used. Without it the UI
+	// cannot tell a testnet success from a mainnet one.
+	Testnet bool `json:"testnet"`
 }
 
 // RelayerProbe is the result of checking a Relayer API key. A relayer key only
@@ -983,23 +998,26 @@ type Opportunity struct {
 	MarketID string `json:"market_id"`
 	// EventID groups the markets that resolve together. Several tail entries in
 	// one event are one correlated bet, so they share an exposure cap.
-	EventID        string    `json:"event_id,omitempty"`
-	ConditionID    string    `json:"condition_id"`
-	Question       string    `json:"question"`
-	QuestionZH     string    `json:"question_zh"`
-	GroupItemTitle string    `json:"group_item_title"`
-	EventTitleZH   string    `json:"event_title_zh"`
-	Slug           string    `json:"slug"`
-	Outcome        string    `json:"outcome"`
-	OutcomeZH      string    `json:"outcome_zh"`
-	TokenID        string    `json:"token_id"`
-	Price          float64   `json:"price"`
-	Liquidity      float64   `json:"liquidity"`
-	Volume         float64   `json:"volume"`
-	EndDate        time.Time `json:"end_date"`
-	DaysToEnd      float64   `json:"days_to_end"`
-	GrossYield     float64   `json:"gross_yield"`
-	URL            string    `json:"url"`
+	EventID        string `json:"event_id,omitempty"`
+	ConditionID    string `json:"condition_id"`
+	Question       string `json:"question"`
+	QuestionZH     string `json:"question_zh"`
+	GroupItemTitle string `json:"group_item_title"`
+	EventTitleZH   string `json:"event_title_zh"`
+	Slug           string `json:"slug"`
+	Outcome        string `json:"outcome"`
+	OutcomeZH      string `json:"outcome_zh"`
+	TokenID        string `json:"token_id"`
+	// NegRisk selects the exchange that settles this market. Approvals are
+	// per exchange, so the offer's risk type decides which allowance applies.
+	NegRisk    bool      `json:"neg_risk,omitempty"`
+	Price      float64   `json:"price"`
+	Liquidity  float64   `json:"liquidity"`
+	Volume     float64   `json:"volume"`
+	EndDate    time.Time `json:"end_date"`
+	DaysToEnd  float64   `json:"days_to_end"`
+	GrossYield float64   `json:"gross_yield"`
+	URL        string    `json:"url"`
 	// Category and the risk flags are derived from Polymarket event tags and
 	// local heuristics during the scan.
 	Category       string   `json:"category"`
@@ -1017,6 +1035,10 @@ type Opportunity struct {
 	// FeeRateBPS is the taker rate the venue reported for this market. Zero
 	// means the venue did not report one and the settings default applies.
 	FeeRateBPS float64 `json:"fee_rate_bps,omitempty"`
+	// Stale marks a row served from an expired cache after an upstream failure.
+	// It stays visible on the radar but is never an execution basis.
+	Stale     bool      `json:"stale,omitempty"`
+	FetchedAt time.Time `json:"fetched_at,omitempty"`
 }
 
 // EffectiveVenue defaults an unset venue to Polymarket.
@@ -1119,11 +1141,14 @@ type Order struct {
 	Currency   market.Currency `json:"currency"`
 	PositionID *int64          `json:"position_id"`
 	MarketID   string          `json:"market_id"`
-	Question   string          `json:"question"`
-	Outcome    string          `json:"outcome"`
-	TokenID    string          `json:"token_id"`
-	Kind       string          `json:"kind"`
-	Type       string          `json:"type"`
+	// EventID groups the markets of one settlement event. Buy orders carry the
+	// opportunity's event id so unresolved orders can reserve event exposure.
+	EventID  string `json:"event_id,omitempty"`
+	Question string `json:"question"`
+	Outcome  string `json:"outcome"`
+	TokenID  string `json:"token_id"`
+	Kind     string `json:"kind"`
+	Type     string `json:"type"`
 	// Action is empty for buys/settlements and "stop" for a stop-loss sell.
 	// Type stays settle so the orders CHECK constraint remains unchanged.
 	Action string  `json:"action"`
@@ -1207,6 +1232,9 @@ type EngineStatus struct {
 type SourceStatus struct {
 	Name       string     `json:"name"`
 	LastSyncAt *time.Time `json:"last_sync_at"`
+	// Health reports the most recent per-venue scan quality. A degraded result
+	// with stale rows means the radar is showing cached data, not a fresh book.
+	Health map[market.Venue]market.DataHealth `json:"health,omitempty"`
 }
 
 type Dashboard struct {
@@ -1313,12 +1341,20 @@ type Repository interface {
 	SetDefaultAccount(context.Context, int64) error
 	DeleteAccount(context.Context, int64) error
 	UpdateAccountBaseline(context.Context, int64, float64) error
+	// InitializeAccountBaseline writes the first live baseline only when the
+	// account still has none, so a concurrent Dashboard cannot overwrite a
+	// baseline another path already committed.
+	InitializeAccountBaseline(context.Context, int64, float64) (bool, error)
 
 	CreatePosition(context.Context, Position) (Position, error)
 	CreatePositionWithOrder(context.Context, Position, Order) (Position, Order, error)
 	CreateOrder(context.Context, Order) (Order, error)
 	ListPositions(context.Context, int64, string, market.Venue) ([]Position, error)
 	ListOrders(context.Context, int64, string, int, int, market.Venue) ([]Order, error)
+	// RedeemIntent returns the pending or filled redemption for one position.
+	// A position-scoped lookup is bounded by the index, unlike scanning the
+	// account's recent orders where an old intent can fall off the page.
+	RedeemIntent(context.Context, int64, int64) (Order, bool, error)
 	CountOrders(context.Context, int64, string, market.Venue) (int64, error)
 	// EarliestAutoBuyAt returns the creation time of the account's first
 	// automatic buy, which is the start of the strategy's live performance
@@ -1347,7 +1383,7 @@ func opportunityFor(m market.Market, outcome market.Outcome, now time.Time) Oppo
 		Liquidity: m.Liquidity, Volume: m.Volume, EndDate: m.EndDate, DaysToEnd: days,
 		GrossYield: grossYield, URL: m.URL(), PriceChange24h: m.PriceChange24h,
 		Version: m.Version, Venue: m.EffectiveVenue(), Currency: m.EffectiveCurrency(),
-		FeeRateBPS: m.FeeRateBPS,
+		FeeRateBPS: m.FeeRateBPS, Stale: m.Stale, FetchedAt: m.FetchedAt, NegRisk: m.NegRisk,
 	}
 }
 

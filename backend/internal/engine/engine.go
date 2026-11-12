@@ -29,6 +29,10 @@ const (
 	// must report stale cash instead of holding the request open until the HTTP
 	// client gives up.
 	liveBalanceTimeout = 5 * time.Second
+	// ledgerWriteTimeout bounds the final database writes of a scan. The market
+	// requests may be cancelled by an HTTP client, but a settlement or mark that
+	// was already computed must still reach the ledger.
+	ledgerWriteTimeout = 15 * time.Second
 )
 
 type Engine struct {
@@ -177,6 +181,22 @@ func (e *Engine) supportsSettlement(v market.Venue) bool {
 // sourceName is the aggregate label the radar and dashboard render. With one
 // registered venue it is exactly that provider's name, which keeps the
 // Polymarket label byte-identical.
+// dataHealth reports each venue's most recent scan quality without triggering a
+// scan. Providers that cannot describe their data are omitted rather than
+// reported as healthy.
+func (e *Engine) dataHealth() map[market.Venue]market.DataHealth {
+	health := make(map[market.Venue]market.DataHealth)
+	for _, v := range e.Venues() {
+		if provider, ok := e.data(v).(market.HealthProvider); ok {
+			health[v] = provider.Health()
+		}
+	}
+	if len(health) == 0 {
+		return nil
+	}
+	return health
+}
+
 func (e *Engine) sourceName() string {
 	names := make([]string, 0, len(e.Venues()))
 	for _, v := range e.Venues() {
@@ -499,6 +519,18 @@ func (e *Engine) validateStopLossExit(settings Settings) error {
 	return nil
 }
 
+// requireConfiguration refuses money-moving operations while the engine knows
+// the runtime configuration diverged from what is stored (a failed apply or a
+// failed rollback). Restarting or a successful configuration save clears it.
+func (e *Engine) requireConfiguration() error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.systemError == "" {
+		return nil
+	}
+	return fmt.Errorf("%w: 运行时配置状态未确认，已阻止交易：%s", ErrInvalidOrder, e.systemError)
+}
+
 func (e *Engine) SystemSettings() SystemSettings {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -520,31 +552,50 @@ func cloneVenueSystemSettings(in map[market.Venue]VenueSystemSettings) map[marke
 	return out
 }
 
-// UpdateSystemSettings persists the runtime egress, endpoint and live-trading
-// configuration and applies it without a restart. Values are applied before
-// the row is saved so an unusable URL or credential set never lands in the
-// database; a failed save rolls the live clients back to the previous state.
-func (e *Engine) UpdateSystemSettings(ctx context.Context, settings SystemSettings) error {
-	settings = settings.Normalize()
-	if err := settings.Validate(); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidSettings, err)
-	}
+// PatchSystemSettings reads, mutates, validates, applies and persists the
+// system configuration under one lock. Callers that submit a partial patch use
+// this instead of reading a snapshot and writing it back, so two independent
+// updates cannot overwrite each other with a stale copy.
+func (e *Engine) PatchSystemSettings(ctx context.Context, mutate func(*SystemSettings) error) (SystemSettings, error) {
 	// Serialize with scans and order placement so a live order cannot be
 	// signed with one credential set while the client is being rebuilt for
 	// another.
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
 	previous := e.SystemSettings()
-	if err := e.applyRuntimeSettings(settings); err != nil {
-		// applyRuntimeSettings rolls back internally on a partial failure.
-		return fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	candidate := previous
+	if err := mutate(&candidate); err != nil {
+		return previous, err
 	}
-	if err := e.repo.SaveSystemSettings(ctx, settings); err != nil {
-		_ = e.applyRuntimeSettings(previous)
-		return err
+	candidate = candidate.Normalize()
+	if err := candidate.Validate(); err != nil {
+		return previous, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
+	if err := e.applyRuntimeSettings(candidate); err != nil {
+		// A candidate can fail after the first executor was already switched;
+		// restore every applied object before reporting the rejected patch.
+		if rollbackErr := e.applyRuntimeSettings(previous); rollbackErr != nil {
+			e.mu.Lock()
+			e.systemError = fmt.Sprintf("配置应用失败且回滚失败，交易已阻断：%v", rollbackErr)
+			e.mu.Unlock()
+			return previous, fmt.Errorf("%w: 配置应用失败且回滚失败: %v", ErrInvalidSettings, rollbackErr)
+		}
+		e.mu.Lock()
+		e.systemError = ""
+		e.mu.Unlock()
+		return previous, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
+	if err := e.repo.SaveSystemSettings(ctx, candidate); err != nil {
+		if rollbackErr := e.applyRuntimeSettings(previous); rollbackErr != nil {
+			e.mu.Lock()
+			e.systemError = fmt.Sprintf("保存配置失败且回滚失败，交易已阻断：%v", rollbackErr)
+			e.mu.Unlock()
+			return previous, fmt.Errorf("%w: 保存配置失败且回滚失败: %v", ErrInvalidSettings, rollbackErr)
+		}
+		return previous, err
 	}
 	e.mu.Lock()
-	e.system = settings
+	e.system = candidate
 	e.systemError = ""
 	e.mu.Unlock()
 	for _, v := range e.Venues() {
@@ -552,7 +603,19 @@ func (e *Engine) UpdateSystemSettings(ctx context.Context, settings SystemSettin
 			reloader.ReloadProxy()
 		}
 	}
-	return nil
+	return candidate, nil
+}
+
+// UpdateSystemSettings persists the runtime egress, endpoint and live-trading
+// configuration and applies it without a restart. Values are applied before
+// the row is saved so an unusable URL or credential set never lands in the
+// database; a failed save rolls the live clients back to the previous state.
+func (e *Engine) UpdateSystemSettings(ctx context.Context, settings SystemSettings) error {
+	_, err := e.PatchSystemSettings(ctx, func(candidate *SystemSettings) error {
+		*candidate = settings
+		return nil
+	})
+	return err
 }
 
 // ProbeLive checks candidate live credentials against the venue's trading API
@@ -588,9 +651,12 @@ func (e *Engine) ApproveVenue(ctx context.Context, v market.Venue) (venue.Approv
 	}
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
+	if err := e.requireConfiguration(); err != nil {
+		return venue.Approval{}, err
+	}
 	approval, err := approver.GrantApprovals(ctx)
 	if err != nil {
-		return venue.Approval{}, fmt.Errorf("%w: %s 链上授权失败: %v", ErrUpstream, label, err)
+		return venue.Approval{}, fmt.Errorf("%w: %s 链上授权失败: %w", ErrUpstream, label, err)
 	}
 	return approval, nil
 }
@@ -601,6 +667,9 @@ func (e *Engine) ApproveVenue(ctx context.Context, v market.Venue) (venue.Approv
 // second redemption of the same position: the transaction costs gas and a
 // duplicate would revert on chain after being paid for.
 func (e *Engine) RedeemPosition(ctx context.Context, accountID, positionID int64) (venue.RedeemResult, error) {
+	if err := e.requireConfiguration(); err != nil {
+		return venue.RedeemResult{}, err
+	}
 	account, err := e.repo.AccountByID(ctx, accountID)
 	if err != nil {
 		return venue.RedeemResult{}, err
@@ -647,25 +716,21 @@ func (e *Engine) RedeemPosition(ctx context.Context, accountID, positionID int64
 	if !exec.Configured() {
 		return venue.RedeemResult{}, fmt.Errorf("%w: %s 未配置实盘凭据，无法赎回", ErrVenueNotConfigured, label)
 	}
+	// Approving and ordering both mutate chain state for the same wallet, so a
+	// redemption takes the same lock as an order. Taking it before the lookup
+	// and pending insert makes duplicate detection and intent creation one
+	// critical section: two concurrent clicks cannot both observe "no intent"
+	// and then broadcast two transactions.
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
 	// A redemption already on its way must not be re-sent: the second
-	// transaction would burn nothing and still cost gas. This scans the account's
-	// recent order book for the venue; the chain stays the real authority, since
-	// redeeming burned shares is a no-op rather than a double payment.
-	orders, err := e.repo.ListOrders(ctx, accountID, "", 500, 0, v)
-	if err != nil {
+	// transaction would burn nothing and still cost gas. The chain stays the
+	// real authority, but the intent row is the local guard. The orders table
+	// stores a redemption as a settle action named "redeem".
+	if existing, ok, err := e.repo.RedeemIntent(ctx, accountID, position.ID); err != nil {
 		return venue.RedeemResult{}, err
-	}
-	for _, order := range orders {
-		// The orders table checks type in ('buy','settle'); a redemption is
-		// bookkeeping on a settled position, so it is stored as a settle action
-		// named "redeem" rather than as a new row type that would force a table
-		// rebuild on every existing database.
-		if order.Type != "settle" || order.Action != "redeem" || order.PositionID == nil || *order.PositionID != position.ID {
-			continue
-		}
-		if order.Status == "pending" || order.Status == "filled" {
-			return venue.RedeemResult{}, fmt.Errorf("%w: 该仓位已经提交过赎回（工单 %d）", ErrInvalidOrder, order.ID)
-		}
+	} else if ok {
+		return venue.RedeemResult{}, fmt.Errorf("%w: 该仓位已经提交过赎回（工单 %d）", ErrInvalidOrder, existing.ID)
 	}
 	intent, err := e.repo.CreateOrder(ctx, Order{
 		AccountID: accountID, Venue: v, Currency: position.EffectiveCurrency(),
@@ -679,21 +744,39 @@ func (e *Engine) RedeemPosition(ctx context.Context, accountID, positionID int64
 	if err != nil {
 		return venue.RedeemResult{}, err
 	}
-	// Approving and ordering both mutate chain state for the same wallet, so a
-	// redemption takes the same lock as an order.
-	e.tradeMu.Lock()
-	defer e.tradeMu.Unlock()
 	result, err := redeemer.Redeem(ctx, venue.RedeemRequest{
+		MarketID:    position.MarketID,
 		ConditionID: position.ConditionID,
 		TokenID:     position.TokenID,
 		Shares:      position.Shares,
 	})
 	if err != nil {
-		_ = e.repo.MarkOrderStatus(ctx, intent.ID, "rejected", clampReason(err.Error()))
-		return venue.RedeemResult{}, fmt.Errorf("%w: %s 赎回失败: %v", ErrUpstream, label, err)
+		// A signed transaction whose broadcast or receipt is uncertain must not
+		// become a rejection: that would invite a second transaction with a new
+		// nonce while the first may still land. Keep the row unresolved and
+		// return the hash so an operator can check the chain.
+		status := "rejected"
+		reason := clampReason(err.Error())
+		if txHash := transactionHashOf(err); txHash != "" {
+			status = "unknown"
+			reason = clampReason("广播或回执结果未知，交易 " + txHash + "，请先核对链上状态")
+			result.TxHash = txHash
+		}
+		_ = e.repo.MarkOrderStatus(ctx, intent.ID, status, reason)
+		return result, fmt.Errorf("%w: %s 赎回失败: %w", ErrUpstream, label, err)
 	}
 	_ = e.repo.MarkOrderStatus(ctx, intent.ID, "filled", "链上赎回交易已提交 "+result.TxHash)
 	return result, nil
+}
+
+// transactionHashOf reads the signed hash from a chain adapter error without
+// importing the adapter (which would create an engine/venue dependency cycle).
+func transactionHashOf(err error) string {
+	var hasher interface{ TransactionHash() string }
+	if errors.As(err, &hasher) {
+		return hasher.TransactionHash()
+	}
+	return ""
 }
 
 // clampReason bounds an error string before it becomes an order reason. The
@@ -734,7 +817,7 @@ func (e *Engine) approver(v market.Venue) (venue.Approver, string, error) {
 func (e *Engine) ProbeLiveVenue(ctx context.Context, v market.Venue, settings VenueLiveSettings, clobBaseURL string) (LiveProbe, error) {
 	v = effectiveVenue(v)
 	if v == market.VenuePredictFun {
-		return e.probePredictFunLive(ctx, v, settings)
+		return e.probePredictFunLive(ctx, v, settings, clobBaseURL)
 	}
 	flat := settings.LiveSettings.MergeSecret(e.SystemSettings().Live).Normalize()
 	if err := flat.Validate(); err != nil {
@@ -811,13 +894,40 @@ func (e *Engine) applyRuntimeSettings(settings SystemSettings) error {
 		baseURL  string
 	}
 	var restored []restore
-	rollback := func() {
+	// Roll back every object that may already have been switched, not only the
+	// data-source URLs. A Polymarket executor updated before a Predict.fun
+	// failure would otherwise keep signing with the rejected candidate.
+	rollback := func() error {
+		var errs []error
 		for i := len(restored) - 1; i >= 0; i-- {
-			_ = restored[i].provider.SetBaseURL(restored[i].baseURL)
+			if err := restored[i].provider.SetBaseURL(restored[i].baseURL); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		if e.proxy != nil {
-			_ = e.proxy.Apply(previous.Proxy)
+			if err := e.proxy.Apply(previous.Proxy); err != nil {
+				errs = append(errs, err)
+			}
 		}
+		if updater, ok := e.venues.Executor(market.VenuePolymarket).(liveSettingsRuntime); ok && updater != nil {
+			pm := previous.Venues[market.VenuePolymarket]
+			if err := updater.UpdateSettings(pm.Live.LiveSettings, pm.DataSource.CLOBBaseURL); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if updater, ok := e.venues.Executor(market.VenuePredictFun).(venueCredentialResetter); ok && updater != nil {
+			if err := updater.ResetLiveSettings(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if pf, ok := previous.Venues[market.VenuePredictFun]; ok {
+			if updater, ok := e.venues.Executor(market.VenuePredictFun).(venueCredentialRuntime); ok && updater != nil {
+				if err := updater.ApplyLiveSettings(pf.Live.APIKey, pf.Live.PrivateKey, pf.Live.SmartWallet, pf.Live.Testnet, pf.DataSource.BaseURL); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+		return errors.Join(errs...)
 	}
 	for _, v := range e.Venues() {
 		provider, ok := e.data(v).(dataSourceRuntime)
@@ -826,15 +936,13 @@ func (e *Engine) applyRuntimeSettings(settings SystemSettings) error {
 		}
 		restored = append(restored, restore{provider: provider, baseURL: provider.BaseURL()})
 		if err := provider.SetBaseURL(venueBaseURL(settings, v)); err != nil {
-			rollback()
-			return err
+			return errors.Join(err, rollback())
 		}
 	}
 	if updater, ok := e.venues.Executor(market.VenuePolymarket).(liveSettingsRuntime); ok && updater != nil {
 		pm := settings.Venues[market.VenuePolymarket]
 		if err := updater.UpdateSettings(pm.Live.LiveSettings, pm.DataSource.CLOBBaseURL); err != nil {
-			rollback()
-			return err
+			return errors.Join(err, rollback())
 		}
 	}
 	// Predict.fun shares one configuration between its data client and its
@@ -846,8 +954,7 @@ func (e *Engine) applyRuntimeSettings(settings SystemSettings) error {
 		if updater, ok := e.venues.Executor(market.VenuePredictFun).(venueCredentialRuntime); ok && updater != nil {
 			err := updater.ApplyLiveSettings(pf.Live.APIKey, pf.Live.PrivateKey, pf.Live.SmartWallet, pf.Live.Testnet, pf.DataSource.BaseURL)
 			if err != nil {
-				rollback()
-				return err
+				return errors.Join(err, rollback())
 			}
 		}
 	}
@@ -873,7 +980,7 @@ type venueCredentialResetter interface {
 // candidate is applied, the collateral balance is read through the chain
 // endpoint, and the stored credentials are restored afterwards so a test never
 // leaves the executor half-configured.
-func (e *Engine) probePredictFunLive(ctx context.Context, v market.Venue, candidate VenueLiveSettings) (LiveProbe, error) {
+func (e *Engine) probePredictFunLive(ctx context.Context, v market.Venue, candidate VenueLiveSettings, baseURL string) (LiveProbe, error) {
 	// The probe swaps credentials on the executor that live orders also use, so
 	// it runs under the same mutex: a scan must not sign an order with the
 	// candidate key, and a half-applied probe must not race a settings save.
@@ -898,7 +1005,13 @@ func (e *Engine) probePredictFunLive(ctx context.Context, v market.Venue, candid
 	privateKey := value(candidate.PrivateKey, stored.PrivateKey)
 	smartWallet := value(strings.TrimSpace(candidate.SmartWallet), stored.SmartWallet)
 	testnet := candidate.Testnet
-	if err := runtime.ApplyLiveSettings(apiKey, privateKey, smartWallet, testnet, ""); err != nil {
+	effectiveTestnet := false
+	if testnet != nil {
+		effectiveTestnet = *testnet
+	} else if stored.Testnet != nil {
+		effectiveTestnet = *stored.Testnet
+	}
+	if err := runtime.ApplyLiveSettings(apiKey, privateKey, smartWallet, testnet, strings.TrimSpace(baseURL)); err != nil {
 		return LiveProbe{}, fmt.Errorf("%w: %v", ErrInvalidSettings, err)
 	}
 	defer e.restoreLiveCredentials(v, exec, runtime, stored)
@@ -919,6 +1032,7 @@ func (e *Engine) probePredictFunLive(ctx context.Context, v market.Venue, candid
 		Cash:      snapshot.Amount,
 		Allowance: snapshot.Allowance,
 		LatencyMS: float64(time.Since(start).Milliseconds()),
+		Testnet:   effectiveTestnet,
 	}, nil
 }
 
@@ -1255,6 +1369,9 @@ func (e *Engine) decorateAccount(account Account) Account {
 	account.LiveReady = account.LiveConfigured && account.LiveError == ""
 	account.LiveSigner = exec.Signer()
 	account.LiveMaker = exec.Maker()
+	if reporter, ok := exec.(interface{ Testnet() bool }); ok {
+		account.LiveTestnet = reporter.Testnet()
+	}
 	return account
 }
 
@@ -1517,6 +1634,7 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 	venues := e.venueList(scanSettings, options.Venue)
 	markets := make([]market.Market, 0)
 	byID := make(map[string]market.Market)
+	staleMarkets := make(map[string]bool)
 	scanned := make([]market.Venue, 0, len(venues))
 	failures := make([]string, 0)
 	succeeded := 0
@@ -1549,14 +1667,14 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 			}
 			markets = append(markets, item)
 			byID[marketKey(v, item.ID)] = item
+			if item.Stale {
+				staleMarkets[marketKey(v, item.ID)] = true
+			}
 		}
 	}
 	venueFailure := strings.Join(failures, "; ")
 	if venueFailure != "" {
 		e.recordScan(now, errors.New(venueFailure))
-		if succeeded == 0 {
-			return summary, fmt.Errorf("%w: %s", ErrUpstream, venueFailure)
-		}
 	} else {
 		e.recordScan(now, nil)
 	}
@@ -1666,12 +1784,12 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 				// Stop-loss is independent of the auto-entry switch: an operator
 				// who only buys manually still needs an automatic exit. It runs
 				// before new entries so a breached position is reduced first.
-				stopErr := e.runStopLoss(ctx, account, plan.settings)
+				stopErr := e.runStopLoss(ctx, account, plan.settings, staleMarkets)
 				if stopErr != nil {
 					appendError(fmt.Sprintf("%s 止损: %v", account.Name, stopErr))
 				}
 				// Do not add risk while an exit is failing.
-				if autoEnabled && stopErr == nil {
+				if autoEnabled && stopErr == nil && len(opportunitiesByAccount[account.ID]) > 0 {
 					outcome, tradeErr := e.autoTrade(ctx, account, opportunitiesByAccount[account.ID], plan.settings)
 					summary.OrdersPlaced += outcome.Placed
 					summary.SkippedHeld += outcome.SkippedHeld
@@ -1696,6 +1814,12 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 		e.setProcessingError(venueFailure)
 	default:
 		e.setProcessingError(venueFailure + "; " + processing)
+	}
+	if venueFailure != "" && succeeded == 0 {
+		// Every venue failed discovery. Maintenance above still reconciled
+		// orders and refreshed positions from per-market reads, but the caller
+		// must see that this scan produced no radar data.
+		return summary, fmt.Errorf("%w: %s", ErrUpstream, venueFailure)
 	}
 	return summary, nil
 }
@@ -1857,6 +1981,21 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 	if err != nil {
 		return err
 	}
+	// Final ledger writes must survive a cancelled HTTP request: marks and
+	// settlements were already computed from upstream data, so losing the write
+	// would leave positions and cash inconsistent.
+	writeCtx, cancelWrites := context.WithTimeout(context.WithoutCancel(ctx), ledgerWriteTimeout)
+	defer cancelWrites()
+	unresolvedOrders, err := e.repo.ListUnresolvedOrders(writeCtx, accountID)
+	if err != nil {
+		return fmt.Errorf("加载未确认订单: %w", err)
+	}
+	unresolvedByPosition := make(map[int64]int, len(unresolvedOrders))
+	for _, order := range unresolvedOrders {
+		if order.PositionID != nil {
+			unresolvedByPosition[*order.PositionID]++
+		}
+	}
 	// Resolve the markets the scan view did not carry in one batch per venue. A
 	// position in a market that already ended but is still open upstream never
 	// appears in the open-market scan, so the old code spent one GET per
@@ -1892,6 +2031,7 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 			for _, id := range ids {
 				item, ok := items[id]
 				if !ok {
+					errs = append(errs, fmt.Sprintf("%s: 行情未返回该市场 %s", v.Label(), id))
 					continue
 				}
 				item.Venue = v
@@ -1943,11 +2083,32 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 			errs = append(errs, position.MarketID+": 持仓 token 已不存在")
 			continue
 		}
+		// A cached, expired snapshot is display-only: never book a final payout
+		// from it. The position stays open until a fresh scan confirms closure.
+		if item.Stale {
+			unrealized := outcome.Price*position.Shares - position.Cost
+			if err := e.repo.UpdateMark(writeCtx, position.ID, outcome.Price, unrealized); err != nil {
+				errs = append(errs, err.Error())
+			}
+			continue
+		}
 		// Settle only when this venue can resolve from reference data. A venue
 		// without a settlement feed keeps its positions open instead of being
 		// guessed closed from another exchange's prices.
 		if e.supportsSettlement(v) {
 			if settlementPrice, resolved := item.SettlementPrice(position.TokenID); resolved {
+				if pending := unresolvedByPosition[position.ID]; pending > 0 {
+					// A stopped sell may already have moved these shares. Freeze the
+					// mark at the resolved value instead of paying out a second time;
+					// the order stays unresolved until reconciliation books or voids it.
+					position.CurrentPrice = settlementPrice
+					unrealized := settlementPrice*position.Shares - position.Cost
+					if err := e.repo.UpdateMark(writeCtx, position.ID, settlementPrice, unrealized); err != nil {
+						errs = append(errs, err.Error())
+					}
+					errs = append(errs, fmt.Sprintf("%s: 持仓已结算但存在未确认卖单，已冻结结算等待对账（未确认订单 %d 笔）", position.MarketID, pending))
+					continue
+				}
 				closedAt := time.Now().UTC()
 				position.ClosedAt = &closedAt
 				position.UnrealizedPNL = 0
@@ -1970,19 +2131,19 @@ func (e *Engine) refreshPositions(ctx context.Context, accountID int64, markets 
 				}
 				order := Order{
 					AccountID: accountID, Venue: v, Currency: position.EffectiveCurrency(),
-					PositionID: &position.ID, MarketID: position.MarketID, Question: position.Question,
-					Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "settle",
+					PositionID: &position.ID, MarketID: position.MarketID, EventID: position.EventID,
+					Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "settle",
 					Amount: payout, Price: position.CurrentPrice, Shares: position.Shares, Status: "settled",
 					Reason: fmt.Sprintf("依据公开结算数据按 %.4f 结算", settlementPrice), CreatedAt: closedAt,
 				}
-				if err := e.repo.SettlePosition(ctx, position, order); err != nil {
+				if err := e.repo.SettlePosition(writeCtx, position, order); err != nil {
 					errs = append(errs, err.Error())
 				}
 				continue
 			}
 		}
 		unrealized := outcome.Price*position.Shares - position.Cost
-		if err := e.repo.UpdateMark(ctx, position.ID, outcome.Price, unrealized); err != nil {
+		if err := e.repo.UpdateMark(writeCtx, position.ID, outcome.Price, unrealized); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -1999,14 +2160,22 @@ type autoTradeOutcome struct {
 }
 
 func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (autoTradeOutcome, error) {
+	if err := e.requireConfiguration(); err != nil {
+		return autoTradeOutcome{}, err
+	}
 	// One account belongs to one venue, so only that venue's rows may be
 	// traded. Mixing them would spend USDC on a USDT market.
 	venue := account.EffectiveVenue()
 	scoped := make([]Opportunity, 0, len(opportunities))
 	for _, opportunity := range opportunities {
-		if opportunity.EffectiveVenue() == venue {
-			scoped = append(scoped, opportunity)
+		if opportunity.EffectiveVenue() != venue {
+			continue
 		}
+		if opportunity.Stale {
+			// Keep stale rows on the radar, but they are not an execution basis.
+			continue
+		}
+		scoped = append(scoped, opportunity)
 	}
 	if account.Mode == AccountModeLive {
 		return e.autoLiveTrade(ctx, account, scoped, settings)
@@ -2251,7 +2420,11 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		if cost > cash+1e-9 {
 			return outcome, fmt.Errorf("%w: 实盘策略资金不足（含预估手续费）", ErrInvalidOrder)
 		}
-		if snapshot.Allowance > 0 && cost > snapshot.Allowance+1e-9 {
+		allowance, hasAllowance := snapshot.AllowanceFor(opportunity.NegRisk)
+		if hasAllowance && cost > allowance+1e-9 {
+			break
+		}
+		if !hasAllowance && snapshot.Allowance > 0 && cost > snapshot.Allowance+1e-9 {
 			break
 		}
 		position, err := e.executeLiveBuy(ctx, account, opportunity, "auto", budget, settings)
@@ -2279,7 +2452,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 // interval bounds how quickly a breach is noticed, and a gap can fill far below
 // the trigger. Only accounts with automatic trading enabled are allowed to sell
 // without an explicit click.
-func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Settings) error {
+func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Settings, staleMarkets map[string]bool) error {
 	if !settings.StopLossEnabled {
 		return nil
 	}
@@ -2290,6 +2463,12 @@ func (e *Engine) runStopLoss(ctx context.Context, account Account, settings Sett
 	var errs []string
 	for _, position := range positions {
 		if position.Shares <= 0 || position.EntryPrice <= 0 || position.CurrentPrice <= 0 {
+			continue
+		}
+		if staleMarkets[marketKey(position.EffectiveVenue(), position.MarketID)] {
+			// A stale mark may be hours old. Exiting on it can turn a healthy
+			// position into a loss, so wait for a fresh scan instead.
+			errs = append(errs, fmt.Sprintf("持仓 %d: 行情陈旧，暂停止损判断", position.ID))
 			continue
 		}
 		// A sell is a limit order the venue floors by shares, so a position
@@ -2358,7 +2537,7 @@ func applySellFill(position Position, fill LiveFill, action, reason string, now 
 	}
 	order := Order{
 		AccountID: position.AccountID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
-		PositionID: &position.ID, MarketID: position.MarketID,
+		PositionID: &position.ID, MarketID: position.MarketID, EventID: position.EventID,
 		Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
 		Kind: "auto", Type: "settle", Action: action, Amount: fill.Cost, Price: fill.Price, Shares: sold,
 		Fee: fill.Fee, Status: "filled", Reason: reason, CreatedAt: now,
@@ -2427,7 +2606,7 @@ func (e *Engine) executeLiveSell(ctx context.Context, account Account, position 
 	fill, err := exec.Sell(ctx, position.TokenID, position.ConditionID, position.Shares, func(orderID string) error {
 		created, createErr := e.repo.CreateOrder(ctx, Order{
 			AccountID: account.ID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
-			PositionID: &position.ID, MarketID: position.MarketID,
+			PositionID: &position.ID, MarketID: position.MarketID, EventID: position.EventID,
 			Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
 			Kind: "auto", Type: "settle", Action: "stop", Price: position.CurrentPrice, Shares: position.Shares,
 			Status: "pending", Reason: "实盘止损卖单已签名，等待成交回报",
@@ -2492,7 +2671,7 @@ func (e *Engine) executeLiveSell(ctx context.Context, account Account, position 
 func (e *Engine) rejectSellOrder(ctx context.Context, accountID int64, position Position, reason string) error {
 	_, _ = e.repo.CreateOrder(ctx, Order{
 		AccountID: accountID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
-		PositionID: &position.ID, MarketID: position.MarketID,
+		PositionID: &position.ID, MarketID: position.MarketID, EventID: position.EventID,
 		Question: position.Question, Outcome: position.Outcome, TokenID: position.TokenID,
 		Kind: "auto", Type: "settle", Action: "stop", Price: position.CurrentPrice, Shares: position.Shares,
 		Status: "rejected", Reason: reason, CreatedAt: time.Now().UTC(),
@@ -2519,6 +2698,9 @@ type OrderRequest struct {
 func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderRequest) (Position, error) {
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
+	if err := e.requireConfiguration(); err != nil {
+		return Position{}, err
+	}
 	if request.Amount <= 0 || math.IsNaN(request.Amount) || math.IsInf(request.Amount, 0) {
 		return Position{}, fmt.Errorf("%w: 金额必须为有限正数", ErrInvalidOrder)
 	}
@@ -2555,6 +2737,9 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 	if err != nil {
 		return Position{}, err
 	}
+	if opportunity.Stale {
+		return Position{}, fmt.Errorf("%w: 行情陈旧，禁止下单", ErrInvalidOrder)
+	}
 	if opportunity.EffectiveVenue() != v {
 		return Position{}, fmt.Errorf("%w", ErrVenueMismatch)
 	}
@@ -2562,9 +2747,53 @@ func (e *Engine) PlaceOrder(ctx context.Context, accountID int64, request OrderR
 		return Position{}, err
 	}
 	if account.Mode == AccountModeLive {
+		// Manual entries must see the exchange's latest fill state before their
+		// own risk checks. A reconcile failure is fatal: continuing could reserve
+		// exposure that is already spent by an order the ledger still calls open.
+		if _, err := e.reconcileLiveOrders(ctx, account, nil); err != nil {
+			return Position{}, fmt.Errorf("实盘对账失败，暂不允许新开仓: %w", err)
+		}
 		return e.executeLiveBuy(ctx, account, opportunity, "manual", request.Amount, settings)
 	}
 	return e.executePaperBuy(ctx, account, opportunity, "manual", request.Amount, settings)
+}
+
+// unresolvedOrderExposure is the risk already promised to the venue but not yet
+// confirmed in the local ledger. Conflict flags are side-agnostic: even a
+// pending sell means the position's shares are in motion and a new entry in the
+// same market or event must wait for reconciliation.
+type unresolvedOrderExposure struct {
+	market, event, total float64
+	marketConflict       bool
+	eventConflict        bool
+}
+
+func unresolvedOrderRisk(orders []Order, venue market.Venue, marketID, eventID string) unresolvedOrderExposure {
+	key := marketKey(venue, marketID)
+	event := eventKey(venue, eventID)
+	var risk unresolvedOrderExposure
+	for _, order := range orders {
+		orderVenue := order.EffectiveVenue()
+		if marketKey(orderVenue, order.MarketID) == key {
+			risk.marketConflict = true
+		}
+		orderEvent := eventKey(orderVenue, order.EventID)
+		if event != "" && orderEvent == event {
+			risk.eventConflict = true
+		}
+		if order.Type != "buy" {
+			continue
+		}
+		amount := order.Amount + order.Fee
+		risk.total += amount
+		if marketKey(orderVenue, order.MarketID) == key {
+			risk.market += amount
+		}
+		if event != "" && orderEvent == event {
+			risk.event += amount
+		}
+	}
+	return risk
 }
 
 func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64, settings Settings) (Position, error) {
@@ -2579,6 +2808,13 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	shares := amount / fillPrice
 	fee := paperFee(opportunity, settings, shares, fillPrice)
 	cost := amount + fee
+	unresolved, err := e.repo.ListUnresolvedOrders(ctx, account.ID)
+	if err != nil {
+		// A ledger read failure must never look like zero pending risk.
+		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法读取未确认订单，拒绝下单："+err.Error(), "")
+		return Position{}, fmt.Errorf("读取未确认订单失败: %w", err)
+	}
+	risk := unresolvedOrderRisk(unresolved, opportunity.EffectiveVenue(), opportunity.MarketID, opportunity.EventID)
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return Position{}, err
@@ -2598,6 +2834,9 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 			}
 		}
 	}
+	totalExposure += risk.total
+	marketExposure += risk.market
+	eventExposure += risk.event
 	baseline := account.BaselineEquity
 	if baseline <= 0 {
 		baseline = settings.InitialBankroll
@@ -2605,6 +2844,10 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	cash := baseline + realized - totalExposure
 	reason := ""
 	switch {
+	case risk.marketConflict:
+		reason = "该市场存在未确认订单，暂不允许新开仓"
+	case risk.eventConflict:
+		reason = "该事件存在未确认订单，暂不允许新开仓"
 	case cost > cash+1e-9:
 		reason = "模拟可用现金不足"
 	case totalExposure+cost > effective.MaxExposure+1e-9:
@@ -2631,7 +2874,7 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	}
 	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
 		AccountID: account.ID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
-		MarketID: position.MarketID, Question: position.Question,
+		MarketID: position.MarketID, EventID: position.EventID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
 		Amount: cost, Price: fillPrice, Shares: shares, Fee: fee, Status: "filled",
 		Reason: "模拟成交；未发送任何真实订单", CreatedAt: now,
@@ -2673,12 +2916,19 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 			"该市场属于 Polymarket Protocol V2（positionId + ExchangeV3），当前实盘执行器只支持 CTF（v1）市场；请改用模拟账户或等待 V2 签名支持", "")
 	}
 	effective := settings.For(v)
+	unresolved, err := e.repo.ListUnresolvedOrders(ctx, account.ID)
+	if err != nil {
+		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法读取未确认订单，拒绝下单："+err.Error(), "")
+		return Position{}, fmt.Errorf("读取未确认订单失败: %w", err)
+	}
+	risk := unresolvedOrderRisk(unresolved, v, opportunity.MarketID, opportunity.EventID)
 	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
 	if err != nil {
 		return Position{}, err
 	}
 	key := marketKey(v, opportunity.MarketID)
-	marketExposure, totalExposure, realized := 0.0, 0.0, 0.0
+	event := eventKey(v, opportunity.EventID)
+	marketExposure, eventExposure, totalExposure, realized := 0.0, 0.0, 0.0, 0.0
 	for _, position := range positions {
 		realized += position.RealizedPNL
 		if position.Status == "open" {
@@ -2686,8 +2936,14 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 			if marketKey(position.EffectiveVenue(), position.MarketID) == key {
 				marketExposure += position.Cost
 			}
+			if event != "" && eventKey(position.EffectiveVenue(), position.EventID) == event {
+				eventExposure += position.Cost
+			}
 		}
 	}
+	totalExposure += risk.total
+	marketExposure += risk.market
+	eventExposure += risk.event
 	if account.BaselineEquity <= 0 {
 		account = e.ensureLiveBaseline(ctx, account, totalExposure, realized)
 	}
@@ -2707,22 +2963,31 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	}
 	totalCost := amount + estimatedFee
 	cash := math.Min(strategyCash, snapshot.Amount)
+	allowance, hasAllowance := snapshot.AllowanceFor(opportunity.NegRisk)
 	switch {
+	case risk.marketConflict:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "该市场存在未确认订单，暂不允许新开仓", "")
+	case risk.eventConflict:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "该事件存在未确认订单，暂不允许新开仓", "")
 	case totalCost > cash+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘策略资金不足（含预估手续费）", "")
-	case snapshot.Allowance > 0 && totalCost > snapshot.Allowance+1e-9:
+	case hasAllowance && totalCost > allowance+1e-9:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘授权额度不足，请先在 "+v.Label()+" 完成授权", "")
+	case !hasAllowance && snapshot.Allowance > 0 && totalCost > snapshot.Allowance+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "实盘授权额度不足，请先在 "+v.Label()+" 完成授权", "")
 	case totalExposure+totalCost > effective.MaxExposure+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过总敞口上限（含预估手续费）", "")
 	case marketExposure+totalCost > effective.MaxPosition+1e-9:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过单市场敞口上限（含预估手续费）", "")
+	case event != "" && settings.MaxEventExposure > 0 && eventExposure+totalCost > settings.MaxEventExposure+1e-9:
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过单事件敞口上限（含预估手续费）", "")
 	}
 
 	var pending Order
 	fill, err := exec.Buy(ctx, opportunity.TokenID, opportunity.ConditionID, amount, settings.MaxPrice, func(orderID string) error {
 		created, createErr := e.repo.CreateOrder(ctx, Order{
 			AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
-			MarketID: opportunity.MarketID, Question: opportunity.Question,
+			MarketID: opportunity.MarketID, EventID: opportunity.EventID, Question: opportunity.Question,
 			Outcome: opportunity.Outcome, TokenID: opportunity.TokenID, Kind: kind, Type: "buy",
 			Amount: amount, Price: opportunity.Price, Status: "pending",
 			Reason: "实盘订单已签名，等待成交回报", ExternalID: orderID, CreatedAt: time.Now().UTC(),
@@ -2787,7 +3052,7 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	// real implementation always persists the pending order first.
 	position, _, err = e.repo.CreatePositionWithOrder(ctx, position, Order{
 		AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
-		MarketID: position.MarketID, Question: position.Question,
+		MarketID: position.MarketID, EventID: position.EventID, Question: position.Question,
 		Outcome: position.Outcome, TokenID: position.TokenID, Kind: kind, Type: "buy",
 		Amount: fill.Cost, Price: fill.Price, Shares: fill.Shares, Fee: fill.Fee, Status: "filled",
 		Reason: v.Label() + " CLOB 实盘成交", ExternalID: fill.OrderID, CreatedAt: now,
@@ -2802,20 +3067,29 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 // whose CLOB status was still unknown. It returns the number of orders that
 // remain unresolved; callers must not auto-trade that account while it is > 0.
 func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, markets map[string]market.Market) (int, error) {
-	orders, err := e.repo.ListUnresolvedOrders(ctx, account.ID)
+	// Reconciliation frequently finishes after the HTTP client that triggered
+	// it has gone away. The exchange lookup uses ctx; every ledger write below
+	// uses a bounded context detached from that cancellation.
+	writeCtx, cancelWrites := context.WithTimeout(context.WithoutCancel(ctx), ledgerWriteTimeout)
+	defer cancelWrites()
+	orders, err := e.repo.ListUnresolvedOrders(writeCtx, account.ID)
 	if err != nil {
 		return 0, err
 	}
 	if len(orders) == 0 {
 		return 0, nil
 	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
+	positions, err := e.repo.ListPositions(writeCtx, account.ID, "all", "")
 	if err != nil {
 		return len(orders), err
 	}
 	positionsByID := make(map[int64]Position, len(positions))
+	closedMarkets := make(map[string]bool)
 	for _, position := range positions {
 		positionsByID[position.ID] = position
+		if position.Status != "open" {
+			closedMarkets[marketKey(position.EffectiveVenue(), position.MarketID)] = true
+		}
 	}
 	var errs []string
 	remaining := 0
@@ -2863,7 +3137,7 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 		}
 		if !found {
 			if time.Since(order.CreatedAt) >= 2*time.Minute {
-				if markErr := e.repo.MarkOrderStatus(ctx, order.ID, "rejected", "CLOB 未找到该订单，按未成交处理"); markErr != nil {
+				if markErr := e.repo.MarkOrderStatus(writeCtx, order.ID, "rejected", "CLOB 未找到该订单，按未成交处理"); markErr != nil {
 					errs = append(errs, markErr.Error())
 					remaining++
 				}
@@ -2879,10 +3153,14 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 			}
 			position, positionOK := positionsByID[positionID]
 			if !positionOK || position.Status != "open" {
-				if markErr := e.repo.MarkOrderStatus(ctx, order.ID, "rejected", "止损订单对应的持仓已不存在，请人工核对"); markErr != nil {
+				// A late sell fill after settlement must not reopen or re-settle a
+				// closed position. Keep the order unresolved and make the unbooked
+				// shares visible to an operator.
+				reason := fmt.Sprintf("持仓已结算/已关闭，迟到成交 %g 份未入账，请人工核对", fill.Shares)
+				if markErr := e.repo.MarkOrderStatus(writeCtx, order.ID, "unknown", reason); markErr != nil {
 					errs = append(errs, markErr.Error())
-					remaining++
 				}
+				remaining++
 				continue
 			}
 			// LookupOrder reports the gross proceeds; net the taker fee the same
@@ -2894,7 +3172,7 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 				remaining++
 				continue
 			}
-			if _, finalizeErr := e.repo.FinalizeLiveSell(ctx, order.ID, updated, fill); finalizeErr != nil {
+			if _, finalizeErr := e.repo.FinalizeLiveSell(writeCtx, order.ID, updated, fill); finalizeErr != nil {
 				errs = append(errs, fmt.Sprintf("订单 %s 对账写入失败: %v", order.ExternalID, finalizeErr))
 				remaining++
 			}
@@ -2904,6 +3182,22 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 			// LookupOrder reports the gross notional; a buy pays the taker fee on
 			// top, exactly as the direct buy path does.
 			fill.Cost += fill.Fee
+			closedPosition := false
+			if order.PositionID != nil {
+				position, ok := positionsByID[*order.PositionID]
+				closedPosition = !ok || position.Status != "open"
+			}
+			if item.Closed || closedMarkets[marketKey(orderVenue, order.MarketID)] || closedPosition {
+				// A fill reported after the market or its position closed cannot be
+				// booked as a fresh position. Leave it unresolved instead of dropping
+				// the shares silently.
+				reason := fmt.Sprintf("市场或持仓已关闭，迟到买入成交 %g 份未入账，请人工核对", fill.Shares)
+				if markErr := e.repo.MarkOrderStatus(writeCtx, order.ID, "unknown", reason); markErr != nil {
+					errs = append(errs, markErr.Error())
+				}
+				remaining++
+				continue
+			}
 			outcome, outcomeOK := item.OutcomeByToken(order.TokenID)
 			if !outcomeOK {
 				errs = append(errs, fmt.Sprintf("订单 %s 的 token 已不在市场中", order.ExternalID))
@@ -2920,13 +3214,13 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 			}
 			position := Position{
 				AccountID: account.ID, Venue: orderVenue, Currency: order.EffectiveCurrency(),
-				MarketID: order.MarketID, ConditionID: item.ConditionID,
+				MarketID: order.MarketID, EventID: item.EventID, ConditionID: item.ConditionID,
 				Question: order.Question, Outcome: order.Outcome, TokenID: order.TokenID,
 				Side: "BUY", Kind: kind, EntryPrice: fill.Price, CurrentPrice: outcome.Price,
 				Shares: fill.Shares, Cost: fill.Cost, Fee: fill.Fee, Status: "open", OpenedAt: openedAt,
 				EndDate: item.EndDate, UnrealizedPNL: outcome.Price*fill.Shares - fill.Cost,
 			}
-			if _, finalizeErr := e.repo.FinalizeLiveBuy(ctx, order.ID, position, fill); finalizeErr != nil {
+			if _, finalizeErr := e.repo.FinalizeLiveBuy(writeCtx, order.ID, position, fill); finalizeErr != nil {
 				errs = append(errs, fmt.Sprintf("订单 %s 对账写入失败: %v", order.ExternalID, finalizeErr))
 				remaining++
 			}
@@ -2934,7 +3228,7 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 		}
 		switch strings.ToLower(strings.TrimSpace(fill.Status)) {
 		case "canceled", "cancelled", "rejected", "expired":
-			if markErr := e.repo.MarkOrderStatus(ctx, order.ID, "rejected", "实盘订单未成交："+fill.Status); markErr != nil {
+			if markErr := e.repo.MarkOrderStatus(writeCtx, order.ID, "rejected", "实盘订单未成交："+fill.Status); markErr != nil {
 				errs = append(errs, markErr.Error())
 				remaining++
 			}
@@ -2951,7 +3245,7 @@ func (e *Engine) reconcileLiveOrders(ctx context.Context, account Account, marke
 func (e *Engine) rejectOrder(ctx context.Context, accountID int64, opportunity Opportunity, kind string, amount float64, reason, externalID string) error {
 	_, _ = e.repo.CreateOrder(ctx, Order{
 		AccountID: accountID, Venue: opportunity.EffectiveVenue(), Currency: opportunity.EffectiveCurrency(),
-		MarketID: opportunity.MarketID, Question: opportunity.Question,
+		MarketID: opportunity.MarketID, EventID: opportunity.EventID, Question: opportunity.Question,
 		Outcome: opportunity.Outcome, TokenID: opportunity.TokenID, Kind: kind, Type: "buy",
 		Amount: amount, Price: opportunity.Price, Status: "rejected", Reason: reason,
 		ExternalID: externalID, CreatedAt: time.Now().UTC(),
@@ -3113,6 +3407,7 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	e.mu.RLock()
 	source := SourceStatus{Name: e.sourceName(), LastSyncAt: e.lastSyncAt}
 	e.mu.RUnlock()
+	source.Health = e.dataHealth()
 	return Dashboard{
 		Account: e.decorateAccount(account),
 		Metrics: metrics,
@@ -3137,7 +3432,16 @@ func (e *Engine) ensureLiveBaseline(ctx context.Context, account Account, openEx
 	if baseline <= 0 {
 		return account
 	}
-	if err := e.repo.UpdateAccountBaseline(ctx, account.ID, baseline); err != nil {
+	updated, err := e.repo.InitializeAccountBaseline(ctx, account.ID, baseline)
+	if err != nil {
+		return account
+	}
+	if !updated {
+		// Another path won the bootstrap. Its value is authoritative; do not
+		// overwrite it with this possibly stale exposure view.
+		if fresh, err := e.repo.AccountByID(ctx, account.ID); err == nil {
+			return fresh
+		}
 		return account
 	}
 	account.BaselineEquity = baseline

@@ -223,6 +223,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const [scanPrompt, setScanPrompt] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [orderError, setOrderError] = useState('')
+  const [orderErrorUnknown, setOrderErrorUnknown] = useState(false)
   const [quotes, setQuotes] = useState<Record<string, QuoteState>>({})
   const [settings, setSettings] = useState<Settings | null>(null)
   const scanController = useRef<AbortController | null>(null)
@@ -258,6 +259,14 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     quoteControllers.current.forEach((controller) => controller.abort())
     quoteControllers.current.clear()
   }, [])
+
+  // Quotes are account-scoped: a quote computed for one wallet's size or
+  // venue must not survive an account switch.
+  useEffect(() => {
+    quoteControllers.current.forEach((controller) => controller.abort())
+    quoteControllers.current.clear()
+    setQuotes({})
+  }, [accountId])
 
   useEffect(() => {
     persistMarketLanguage(marketLanguage)
@@ -299,6 +308,11 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
   const selectedVenue = selected ? venueOf(selected) : accountVenue
   const selectedQuote = selected ? quotes[tokenKey(selected)]?.quote : undefined
   const selectedHeld = selected ? heldByToken.get(tokenKey(selected)) : undefined
+  // The server quote carries the amount it was computed for. After the user
+  // edits the amount the old numbers must not look current, and a quote older
+  // than a minute may already be behind the book.
+  const quoteAmountStale = Boolean(selectedQuote && validAmount && Math.abs(selectedQuote.amount - numericAmount) > 0.005)
+  const quoteTimeStale = Boolean(selectedQuote && Date.now() - new Date(selectedQuote.quoted_at).getTime() > 60_000)
 
   const fetchQuote = async (item: Opportunity, quoteAmount?: number) => {
     const key = tokenKey(item)
@@ -322,6 +336,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     setAmount('')
     setConfirmed(false)
     setOrderError('')
+    setOrderErrorUnknown(false)
   }
 
   const runScan = async (execute: boolean) => {
@@ -366,6 +381,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
     orderController.current = controller
     setSubmitting(true)
     setOrderError('')
+    setOrderErrorUnknown(false)
     try {
       if (!account) throw new Error('尚未选择账户')
       const position = await api.createOrder(account.id, {
@@ -380,7 +396,14 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
       onOrderCreated()
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return
-      setOrderError(caught instanceof Error ? caught.message : (isLive ? '实盘订单提交失败，请重试。' : '模拟订单提交失败，请重试。'))
+      // A lost response is not a rejected order. Network failures and explicit
+      // unknown outcomes must prompt a position refresh before any retry;
+      // otherwise the operator can double-submit a live order.
+      const message = caught instanceof Error ? caught.message : ''
+      const unknown = caught instanceof TypeError || /timeout|timed out|未知|network|failed to fetch/i.test(message)
+      setOrderErrorUnknown(unknown)
+      if (unknown) refreshHeld()
+      setOrderError(message || (isLive ? '实盘订单提交失败，请重试。' : '模拟订单提交失败，请重试。'))
     } finally {
       if (orderController.current === controller) setSubmitting(false)
     }
@@ -539,18 +562,20 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
             </div>
             <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-3.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs font-medium text-emerald-900">真实净收益（{venueMeta(selectedVenue).label} 盘口 + 手续费）</span>
+                <span className="text-xs font-medium text-emerald-900">盘口估算净收益（{venueMeta(selectedVenue).label} 盘口 + 手续费，随金额变化刷新）</span>
                 <button type="button" onClick={() => fetchQuote(selected, validAmount ? numericAmount : (orderSizeFor(selectedVenue) || undefined))} disabled={quotes[tokenKey(selected)]?.loading} className="rounded-md px-1.5 py-0.5 text-[11px] font-medium text-emerald-800 underline-offset-2 transition hover:bg-emerald-100 hover:underline disabled:opacity-50">
                   {quotes[tokenKey(selected)]?.loading ? '读取中…' : `按 ${validAmount ? fmtMoney(numericAmount, selectedVenue) : orderSizeFor(selectedVenue) > 0 ? `单笔 ${fmtMoney(orderSizeFor(selectedVenue), selectedVenue)}` : '单笔金额'} 获取`}
                 </button>
               </div>
-              {selectedQuote ? <>
+              {selectedQuote && !quoteAmountStale ? <>
                 <div className="mt-1.5 flex items-baseline justify-between gap-3"><span className="text-sm font-semibold tabular-nums text-emerald-800">{formatPercent(selectedQuote.net_yield, 2, true)}</span><span className="text-[11px] tabular-nums text-emerald-800/80">净利 {fmtMoney(selectedQuote.net_profit, selectedVenue)}</span></div>
                 <p className="mt-1 text-[11px] leading-5 text-emerald-800/80">按 {fmtMoney(selectedQuote.amount, selectedVenue)} · 成交均价 {formatPrice(selectedQuote.fill_price)} · 限价 {formatPrice(selectedQuote.limit_price)} · 手续费 {fmtMoney(selectedQuote.fee, selectedVenue)} · 总成本 {fmtMoney(selectedQuote.total_cost, selectedVenue)}</p>
                 {selectedQuote.exceeds_max_price && <p className="mt-1 text-[11px] leading-5 text-rose-700">盘口成交价超过最高买入价 {formatPrice(selectedQuote.max_price)}，实盘会被拒单。</p>}
                 {!selectedQuote.fully_filled && <p className="mt-1 text-[11px] leading-5 text-amber-700">盘口深度仅 {fmtMoney(selectedQuote.available_notional, selectedVenue)}，无法一次成交该金额。</p>}
+                {quoteTimeStale && <p className="mt-1 text-[11px] leading-5 text-amber-700" role="status">报价已超过 1 分钟，盘口可能变化；请重新获取。</p>}
                 {!isLive && <p className="mt-1 text-[11px] leading-5 text-emerald-800/60">模拟账户仍按参数设置中的滑点与费率记账，此处仅供对照实盘口径。</p>}
-              </> : <p className="mt-1 text-[11px] leading-5 text-emerald-800/70">读取 {venueMeta(selectedVenue).label} 实时盘口与手续费后显示，不会提交订单。</p>}
+              </> : quoteAmountStale ? <p className="mt-1 text-[11px] leading-5 text-amber-700" role="status">金额已变更，旧报价已隐藏；请按当前金额重新获取。</p>
+                : <p className="mt-1 text-[11px] leading-5 text-emerald-800/70">读取 {venueMeta(selectedVenue).label} 实时盘口与手续费后显示，不会提交订单。</p>}
               {quotes[tokenKey(selected)]?.error && <p className="mt-1 break-words text-[11px] leading-5 text-rose-700">报价失败：{quotes[tokenKey(selected)]?.error}</p>}
             </div>
             <RiskNotice compact />
@@ -559,7 +584,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
               <span className="text-xs leading-5 text-slate-600">{isLive ? <><span className="font-medium text-rose-800">我确认这是真实资金实盘买入。</span> 我理解订单会立即提交到 {venueMeta(selectedVenue).label}，使用 {currencyOf(selectedVenue)} 结算，且高价结果失败时可能损失大部分本金。</> : <><span className="font-medium text-slate-800">我确认这是模拟买入。</span> 仅使用虚拟资金；当前价格不保证最终结算。</>}</span>
             </label>
             {!venueReady(selectedVenue) && <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="font-medium">{account?.live_configured ? '实盘凭据未就绪。' : '实盘凭据未配置。'}</span> {account?.live_configured ? (account.live_error || `请检查 ${venueMeta(selectedVenue).label} 的钱包、Funder 与 API 凭据。`) : `可在「系统设置 → 实盘交易凭据」中填写 ${venueMeta(selectedVenue).label} 的私钥，或设置 ${venueMeta(selectedVenue).envHint} 后重启服务。`}</span></div>}
-            {orderError && <div className="break-words rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><span className="font-medium">订单未提交：</span>{orderError}</div>}
+            {orderError && <div className="break-words rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm leading-6 text-rose-700" role="alert"><span className="font-medium">{orderErrorUnknown ? '订单结果未知，请先刷新持仓核对：' : '订单未提交：'}</span>{orderError}</div>}
             <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
               <Button variant="secondary" onClick={() => setSelected(null)} disabled={submitting}>取消</Button>
               <Button variant={isLive ? 'danger' : 'primary'} onClick={submitOrder} loading={submitting} disabled={!validAmount || !confirmed || !venueReady(selectedVenue)}><CheckCircle2 className="h-4 w-4" />{submitting ? (isLive ? '正在提交实盘订单…' : '正在记录…') : `${isLive ? '确认实盘买入' : '确认模拟买入'}${validAmount ? ` ${fmtMoney(numericAmount, selectedVenue)}` : ''}`}</Button>

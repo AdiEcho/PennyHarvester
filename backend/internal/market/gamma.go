@@ -5,17 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"pennyharvester/backend/internal/netproxy"
 )
 
 const maxResponseBytes = 8 << 20
+
+const (
+	maxHealthReason = 160
+	maxStaleReason  = 240
+)
 
 // Broad views (volume and liquidity) describe the whole book and change far
 // more slowly than the near-end view. Reusing them for a minute removes four of
@@ -62,8 +69,113 @@ type gammaView struct {
 }
 
 type gammaViewCache struct {
-	at      time.Time
-	markets []Market
+	fetchedAt     time.Time
+	lastAttemptAt time.Time
+	markets       []Market
+}
+
+// healthTracker accumulates one ListOpen attempt. The atomic pointer below
+// publishes the current attempt while the mutex serializes the individual
+// view goroutines that contribute to it.
+type healthTracker struct {
+	mu         sync.Mutex
+	at         time.Time
+	degraded   bool
+	rejected   int
+	staleViews int
+	reasons    []string
+}
+
+func newHealthTracker(at time.Time) *healthTracker {
+	return &healthTracker{at: at}
+}
+
+func (h *healthTracker) reject(id string, err error) {
+	if err == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.degraded = true
+	h.rejected++
+	id = strings.TrimSpace(id)
+	if id == "" {
+		h.addReasonLocked("rejected row: " + err.Error())
+		return
+	}
+	h.addReasonLocked("rejected market " + id + ": " + err.Error())
+}
+
+func (h *healthTracker) failure(err error) {
+	if err == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.degraded = true
+	h.addReasonLocked(err.Error())
+}
+
+func (h *healthTracker) stale(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.degraded = true
+	h.staleViews++
+	reason := "stale cache"
+	if err != nil {
+		reason += ": " + err.Error()
+	}
+	h.addReasonLocked(reason)
+}
+
+func (h *healthTracker) addReasonLocked(reason string) {
+	reason = truncateReason(reason, maxHealthReason)
+	if reason == "" {
+		return
+	}
+	for _, existing := range h.reasons {
+		if existing == reason {
+			return
+		}
+	}
+	if len(h.reasons) < 3 {
+		h.reasons = append(h.reasons, reason)
+	}
+}
+
+func (h *healthTracker) snapshot() DataHealth {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return DataHealth{
+		At:         h.at,
+		Degraded:   h.degraded,
+		Reason:     strings.Join(h.reasons, "; "),
+		Rejected:   h.rejected,
+		StaleViews: h.staleViews,
+	}
+}
+
+func truncateReason(raw string, max int) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || max <= 0 {
+		return ""
+	}
+	runes := []rune(raw)
+	if len(runes) <= max {
+		return raw
+	}
+	return string(runes[:max]) + "..."
+}
+
+func rowsWithState(items []Market, fetchedAt time.Time, stale bool, reason string) []Market {
+	rows := make([]Market, len(items))
+	copy(rows, items)
+	for i := range rows {
+		rows[i].FetchedAt = fetchedAt
+		rows[i].Stale = stale
+		rows[i].StaleReason = reason
+	}
+	return rows
 }
 
 type GammaClient struct {
@@ -75,7 +187,12 @@ type GammaClient struct {
 
 	cacheMu   sync.Mutex
 	viewCache map[string]gammaViewCache
+
+	clock  func() time.Time
+	health atomic.Pointer[healthTracker]
 }
+
+var _ HealthProvider = (*GammaClient)(nil)
 
 // NewGammaClient keeps the public Gamma API on the outbound egress configured
 // in the system settings. A nil manager keeps the Go default behaviour, which
@@ -89,7 +206,25 @@ func NewGammaClient(baseURL string, proxy *netproxy.Manager) *GammaClient {
 		proxy:          proxy,
 		client:         &http.Client{Timeout: 15 * time.Second},
 		viewCache:      make(map[string]gammaViewCache),
+		clock:          time.Now,
 	}
+}
+
+func (g *GammaClient) now() time.Time {
+	if g.clock != nil {
+		return g.clock().UTC()
+	}
+	return time.Now().UTC()
+}
+
+// Health returns the quality state of the most recent ListOpen attempt. It is
+// always safe to call, even before the first scan.
+func (g *GammaClient) Health() DataHealth {
+	tracker := g.health.Load()
+	if tracker == nil {
+		return DataHealth{}
+	}
+	return tracker.snapshot()
 }
 
 func normalizeBaseURL(raw string) string {
@@ -219,7 +354,9 @@ type gammaEventTags struct {
 }
 
 func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, error) {
-	now := time.Now().UTC()
+	now := g.now()
+	tracker := newHealthTracker(now)
+	g.health.Store(tracker)
 	endMin := now.Format(time.RFC3339)
 	endMax := now.AddDate(0, 0, maxDays).Format(time.RFC3339)
 
@@ -253,14 +390,15 @@ func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, erro
 	results := make([]viewResult, len(views))
 	var wait sync.WaitGroup
 	for i, view := range views {
+		key := cacheKey(view)
 		if view.cache {
-			if items, ok := g.cachedView(cacheKey(view), broadViewTTL); ok {
-				results[i] = viewResult{items: items}
+			if entry, ok := g.cachedView(key, broadViewTTL, now); ok {
+				results[i] = viewResult{items: rowsWithState(entry.markets, entry.fetchedAt, false, "")}
 				continue
 			}
 		}
 		wait.Add(1)
-		go func(index int, view gammaView) {
+		go func(index int, view gammaView, key string) {
 			defer wait.Done()
 			viewEnd := endMax
 			if view.horizon > 0 {
@@ -274,24 +412,40 @@ func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, erro
 			var items []Market
 			var err error
 			if view.events {
-				items, err = g.listEventMarkets(viewCtx, endMin, viewEnd, view.order, view.ascending, view.pages)
+				items, err = g.listEventMarketsTracked(viewCtx, endMin, viewEnd, view.order, view.ascending, view.pages, tracker)
 			} else {
-				items, err = g.listMarkets(viewCtx, endMin, viewEnd, view.order, view.ascending, view.pages)
+				items, err = g.listMarketsTracked(viewCtx, endMin, viewEnd, view.order, view.ascending, view.pages, tracker)
 			}
 			cancel()
 			if err != nil && view.cache {
 				// A failed broad refresh must not blank the radar. Use the last
-				// good copy if one exists; the near-end view still reports fresh
-				// trading candidates.
-				if stale, ok := g.cachedView(cacheKey(view), 0); ok {
-					items, err = stale, nil
+				// good copy if one exists, but keep its original fetch time and
+				// mark it stale so it cannot pass for a fresh scan.
+				if entry, ok := g.cachedView(key, 0, g.now()); ok {
+					attemptAt := g.now()
+					staleReason := truncateReason(err.Error(), maxStaleReason)
+					g.markViewAttempt(key, attemptAt)
+					tracker.stale(err)
+					results[index] = viewResult{items: rowsWithState(entry.markets, entry.fetchedAt, true, staleReason)}
+					return
 				}
 			}
-			if err == nil && view.cache {
-				g.storeView(cacheKey(view), items)
+			if err != nil {
+				tracker.failure(err)
+				results[index] = viewResult{err: err}
+				return
 			}
-			results[index] = viewResult{items: items, err: err}
-		}(i, view)
+			fetchedAt := g.now()
+			for j := range items {
+				items[j].FetchedAt = fetchedAt
+				items[j].Stale = false
+				items[j].StaleReason = ""
+			}
+			if view.cache {
+				g.storeView(key, items, fetchedAt)
+			}
+			results[index] = viewResult{items: items}
+		}(i, view, key)
 	}
 	wait.Wait()
 
@@ -318,27 +472,40 @@ func (g *GammaClient) ListOpen(ctx context.Context, maxDays int) ([]Market, erro
 }
 
 // cachedView returns a cached view. A zero ttl accepts a stale entry, which is
-// the fallback used when a broad refresh fails.
-func (g *GammaClient) cachedView(key string, ttl time.Duration) ([]Market, bool) {
+// the fallback used when a broad refresh fails. The ttl is measured from the
+// last successful fetch, never from a failed refresh attempt.
+func (g *GammaClient) cachedView(key string, ttl time.Duration, now time.Time) (gammaViewCache, bool) {
 	g.cacheMu.Lock()
 	defer g.cacheMu.Unlock()
 	entry, ok := g.viewCache[key]
 	if !ok {
-		return nil, false
+		return gammaViewCache{}, false
 	}
-	if ttl > 0 && time.Since(entry.at) > ttl {
-		return nil, false
+	if ttl > 0 && now.Sub(entry.fetchedAt) > ttl {
+		return gammaViewCache{}, false
 	}
-	return entry.markets, true
+	return entry, true
 }
 
-func (g *GammaClient) storeView(key string, markets []Market) {
+func (g *GammaClient) storeView(key string, markets []Market, fetchedAt time.Time) {
+	cached := rowsWithState(markets, fetchedAt, false, "")
 	g.cacheMu.Lock()
 	defer g.cacheMu.Unlock()
 	if len(g.viewCache) >= maxViewCacheEntries {
 		g.viewCache = make(map[string]gammaViewCache)
 	}
-	g.viewCache[key] = gammaViewCache{at: time.Now(), markets: markets}
+	g.viewCache[key] = gammaViewCache{fetchedAt: fetchedAt, markets: cached}
+}
+
+func (g *GammaClient) markViewAttempt(key string, at time.Time) {
+	g.cacheMu.Lock()
+	defer g.cacheMu.Unlock()
+	entry, ok := g.viewCache[key]
+	if !ok {
+		return
+	}
+	entry.lastAttemptAt = at
+	g.viewCache[key] = entry
 }
 
 // listMarkets pages one Gamma view with /markets/keyset. Polymarket replaced
@@ -347,6 +514,10 @@ func (g *GammaClient) storeView(key string, markets []Market) {
 // ignores `active`, which is why ListOpen does not send it; the engine filters
 // on the parsed Active flag.
 func (g *GammaClient) listMarkets(ctx context.Context, endMin, endMax, order, ascending string, pages int) ([]Market, error) {
+	return g.listMarketsTracked(ctx, endMin, endMax, order, ascending, pages, nil)
+}
+
+func (g *GammaClient) listMarketsTracked(ctx context.Context, endMin, endMax, order, ascending string, pages int, health *healthTracker) ([]Market, error) {
 	markets := make([]Market, 0, pages*100)
 	cursor := ""
 	for page := 0; page < pages; page++ {
@@ -368,16 +539,25 @@ func (g *GammaClient) listMarkets(ctx context.Context, endMin, endMax, order, as
 		}
 		if err := g.getJSON(ctx, "/markets/keyset?"+query.Encode(), &response); err != nil {
 			// Page one is still useful when the cursor page stalls. Returning
-			// the parsed rows keeps the near-end view populated for this scan.
+			// the parsed rows keeps the near-end view populated for this scan,
+			// while health records that the view was only partially read.
 			if len(markets) > 0 {
+				if health != nil {
+					health.failure(err)
+				}
 				return markets, nil
 			}
 			return nil, err
 		}
 		for _, item := range response.Markets {
-			if parsed, err := parseGammaMarket(item); err == nil {
-				markets = append(markets, parsed)
+			parsed, err := parseGammaMarket(item)
+			if err != nil {
+				if health != nil {
+					health.reject(item.ID, err)
+				}
+				continue
 			}
+			markets = append(markets, parsed)
 		}
 		if response.NextCursor == "" || response.NextCursor == cursor || len(response.Markets) == 0 {
 			break
@@ -399,6 +579,10 @@ func (g *GammaClient) listMarkets(ctx context.Context, endMin, endMax, order, as
 // cannot resolve event tags, and without the tags the crypto window falls back
 // to the much wider default entry window.
 func (g *GammaClient) listEventMarkets(ctx context.Context, endMin, endMax, order, ascending string, pages int) ([]Market, error) {
+	return g.listEventMarketsTracked(ctx, endMin, endMax, order, ascending, pages, nil)
+}
+
+func (g *GammaClient) listEventMarketsTracked(ctx context.Context, endMin, endMax, order, ascending string, pages int, health *healthTracker) ([]Market, error) {
 	markets := make([]Market, 0, pages*200)
 	cursor := ""
 	for page := 0; page < pages; page++ {
@@ -421,6 +605,9 @@ func (g *GammaClient) listEventMarkets(ctx context.Context, endMin, endMax, orde
 			// Page one is still useful when the cursor page stalls, exactly as in
 			// listMarkets: keep whatever arrived rather than blanking the view.
 			if len(markets) > 0 {
+				if health != nil {
+					health.failure(err)
+				}
 				return markets, nil
 			}
 			return nil, err
@@ -434,9 +621,14 @@ func (g *GammaClient) listEventMarkets(ctx context.Context, endMin, endMax, orde
 				if len(item.Tags) == 0 {
 					item.Tags = event.Tags
 				}
-				if parsed, err := parseGammaMarket(item); err == nil {
-					markets = append(markets, parsed)
+				parsed, err := parseGammaMarket(item)
+				if err != nil {
+					if health != nil {
+						health.reject(item.ID, err)
+					}
+					continue
 				}
+				markets = append(markets, parsed)
 			}
 		}
 		if response.NextCursor == "" || response.NextCursor == cursor || len(response.Events) == 0 {
@@ -607,7 +799,7 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 	if err := decodeStringArray(raw.Outcomes, &names); err != nil {
 		return Market{}, fmt.Errorf("解析 outcomes: %w", err)
 	}
-	tokenIDs, err := gammaOutcomeIDs(raw)
+	version, tokenIDs, err := gammaProtocol(raw)
 	if err != nil {
 		return Market{}, err
 	}
@@ -631,8 +823,24 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 	}
 
 	outcomes := make([]Outcome, len(names))
+	seenTokens := make(map[string]struct{}, len(names))
 	for i := range names {
-		outcomes[i] = Outcome{Name: names[i], TokenID: tokenIDs[i], Price: prices[i]}
+		if strings.TrimSpace(names[i]) == "" {
+			return Market{}, fmt.Errorf("市场 %s 的第 %d 个结果名称为空", raw.ID, i)
+		}
+		tokenID := strings.TrimSpace(tokenIDs[i])
+		if tokenID == "" {
+			return Market{}, fmt.Errorf("市场 %s 的第 %d 个结果标识为空", raw.ID, i)
+		}
+		if _, exists := seenTokens[tokenID]; exists {
+			return Market{}, fmt.Errorf("市场 %s 的结果标识 %q 重复", raw.ID, tokenID)
+		}
+		seenTokens[tokenID] = struct{}{}
+		price := prices[i]
+		if math.IsNaN(price) || math.IsInf(price, 0) || price < 0 || price > 1 {
+			return Market{}, fmt.Errorf("市场 %s 的第 %d 个结果价格 %v 超出 [0,1]", raw.ID, i, price)
+		}
+		outcomes[i] = Outcome{Name: names[i], TokenID: tokenID, Price: price}
 	}
 	liquidity := raw.LiquidityNum
 	if liquidity == 0 && raw.Liquidity != "" {
@@ -659,7 +867,7 @@ func parseGammaMarket(raw gammaMarket) (Market, error) {
 		GameStartTime: parseGammaTime(raw.GameStartTime), PriceChange24h: raw.OneDayPriceChange,
 		Liquidity: liquidity, Volume: volume, Active: raw.Active,
 		Closed: raw.Closed, ResolutionStatus: resolutionStatus,
-		Version: strings.ToLower(strings.TrimSpace(raw.Version)), AcceptingOrders: raw.AcceptingOrders,
+		Version: version, AcceptingOrders: raw.AcceptingOrders,
 		Venue: VenuePolymarket, Currency: CurrencyUSDC, NegRisk: raw.NegRisk,
 		TickSize: gammaTickSize(raw.OrderPriceMinTickSize), MinNotional: 1,
 	}, nil
@@ -675,29 +883,56 @@ func gammaTickSize(raw *float64) float64 {
 	return *raw
 }
 
-// gammaOutcomeIDs resolves the trading identifier Gamma publishes for each
-// outcome. Polymarket Protocol V2 markets trade position IDs and set
-// clobTokenIds to null, while CTF markets publish a JSON-encoded clobTokenIds.
-// Version decides which field to read because a market can carry both; treating
-// presence as the selector would mix a V2 position ID with a CTF token ID.
-func gammaOutcomeIDs(raw gammaMarket) ([]string, error) {
+// gammaProtocol resolves both the protocol version and the trading identifier
+// Gamma publishes for each outcome. Polymarket Protocol V2 markets trade
+// position IDs and set clobTokenIds to null, while CTF markets publish a
+// JSON-encoded clobTokenIds. Version decides which field to read because a
+// market can carry both; treating presence as the selector would mix a V2
+// position ID with a CTF token ID. When the version is absent, the populated
+// identifier field determines it so an empty Version never accompanies token
+// IDs.
+func gammaProtocol(raw gammaMarket) (string, []string, error) {
 	version := strings.ToLower(strings.TrimSpace(raw.Version))
 	switch version {
 	case "v2":
-		return decodeOutcomeIDs(raw.PositionIDs, "positionIds")
+		ids, err := decodeOutcomeIDs(raw.PositionIDs, "positionIds")
+		return "v2", ids, err
 	case "v1":
-		return decodeOutcomeIDs(raw.ClobTokenIDs, "clobTokenIds")
-	case "":
-		// Older mirrors do not send version. Keep working with whichever field
-		// they populated, preferring the CTF field.
 		ids, err := decodeOutcomeIDs(raw.ClobTokenIDs, "clobTokenIds")
-		if err != nil || len(ids) > 0 {
-			return ids, err
+		return "v1", ids, err
+	case "":
+		if hasOutcomeIDs(raw.ClobTokenIDs) {
+			ids, err := decodeOutcomeIDs(raw.ClobTokenIDs, "clobTokenIds")
+			if err != nil {
+				return "", nil, err
+			}
+			if len(ids) > 0 {
+				return "v1", ids, nil
+			}
 		}
-		return decodeOutcomeIDs(raw.PositionIDs, "positionIds")
+		if hasOutcomeIDs(raw.PositionIDs) {
+			ids, err := decodeOutcomeIDs(raw.PositionIDs, "positionIds")
+			if err != nil {
+				return "", nil, err
+			}
+			if len(ids) > 0 {
+				return "v2", ids, nil
+			}
+		}
+		return "", nil, fmt.Errorf("市场 %s 缺少协议版本与结果标识", raw.ID)
 	default:
-		return nil, fmt.Errorf("市场 %s 的协议版本 %q 不受支持", raw.ID, raw.Version)
+		return "", nil, fmt.Errorf("市场 %s 的协议版本 %q 不受支持", raw.ID, raw.Version)
 	}
+}
+
+func gammaOutcomeIDs(raw gammaMarket) ([]string, error) {
+	_, ids, err := gammaProtocol(raw)
+	return ids, err
+}
+
+func hasOutcomeIDs(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null" && trimmed != `""`
 }
 
 func decodeOutcomeIDs(raw json.RawMessage, field string) ([]string, error) {

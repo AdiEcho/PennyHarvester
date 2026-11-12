@@ -93,7 +93,9 @@ interface PredictFunDraft {
 function toPredictFunDraft(system: SystemSettings): PredictFunDraft {
   const loaded = system.venues?.predictfun
   return {
-    base_url: loaded?.data_source?.base_url || venueMeta('predictfun').defaults.baseURL || '',
+    // Keep an inherited endpoint empty. Filling the mainnet default here would
+    // turn a testnet deployment into an explicit mainnet override on save.
+    base_url: loaded?.data_source?.base_url || '',
     testnet: loaded?.live?.testnet ?? loaded?.data_source?.testnet,
     api_key: '',
     private_key: '',
@@ -210,6 +212,41 @@ function liveValidation(draft: LiveSettings, environment: LiveEnvironment): stri
   return null
 }
 
+function effectiveFunder(draft: LiveSettings, environment: LiveEnvironment): string {
+  return (draft.funder.trim() || environment.funder.trim()).toLowerCase()
+}
+
+// Dirty checks compare the editable draft with the applied draft, never with
+// stored plaintext secrets (the browser only receives masks or blanks). A
+// blank secret that arrived blank therefore stays clean; clearing a mask or
+// typing a new value is still an edit.
+function liveDraftDirty(draft: LiveSettings, applied: LiveSettings, environment: LiveEnvironment): boolean {
+  return effectiveSignatureType(draft, environment) !== effectiveSignatureType(applied, environment)
+    || effectiveFunder(draft, environment) !== effectiveFunder(applied, environment)
+    || draft.private_key !== applied.private_key
+    || draft.api_key !== applied.api_key
+    || draft.api_secret !== applied.api_secret
+    || draft.api_passphrase !== applied.api_passphrase
+}
+
+function predictFunLiveDraftDirty(draft: PredictFunDraft, applied: PredictFunDraft): boolean {
+  return draft.testnet !== applied.testnet
+    || draft.private_key !== applied.private_key
+    || draft.api_key !== applied.api_key
+    || draft.smart_wallet !== applied.smart_wallet
+}
+
+function endpointDraftDirty(draft: DataSourceSettings, applied: DataSourceSettings): boolean {
+  return draft.gamma_base_url !== applied.gamma_base_url
+    || draft.clob_base_url !== applied.clob_base_url
+}
+
+function proxyDraftDirty(draft: ProxyConfig, applied: ProxyConfig): boolean {
+  return draft.mode !== applied.mode
+    || draft.url !== applied.url
+    || draft.no_proxy !== applied.no_proxy
+}
+
 function EndpointSection({ system, draft, dirty, saving, busy, onChange, onDiscard, onClear, onSave }: {
   system: SystemSettings
   draft: DataSourceSettings
@@ -271,17 +308,24 @@ function EndpointSection({ system, draft, dirty, saving, busy, onChange, onDisca
   )
 }
 
-function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, onChange, onReset, onSave }: {
+function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, revisionRef, onDraftEdit, onChange, onReset, onSave }: {
   system: SystemSettings
   draft: LiveSettings
   dirty: boolean
   saving: boolean
   busy: boolean
   clobBaseURL: string
+  revisionRef: { current: number }
+  onDraftEdit: () => void
   onChange: (patch: Partial<LiveSettings>) => void
   onReset: () => void
   onSave: () => void
 }) {
+  // A stale request may finish after a newer one started. Revision suppresses
+  // its data, but its finally must not clear the newer request's busy state.
+  const detectionSeq = useRef(0)
+  const relayerSeq = useRef(0)
+  const probeSeq = useRef(0)
   const { toast } = useToast()
   const [testing, setTesting] = useState(false)
   const [probe, setProbe] = useState<LiveProbeResult | null>(null)
@@ -327,8 +371,13 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
       return
     }
     setDetectingWallet(true)
+    const revision = revisionRef.current
+    const attempt = ++detectionSeq.current
     try {
       const result = await api.detectWallet(draft, clobBaseURL)
+      // A newer edit supersedes this detection; applying its wallet type or
+      // funder would overwrite the operator's current draft.
+      if (revisionRef.current !== revision) return
       setDetection(result)
       if (!result.ok) {
         if (!options.silent) {
@@ -359,11 +408,12 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
         })
       }
     } catch (caught) {
+      if (revisionRef.current !== revision) return
       if (!options.silent) {
         toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
       }
     } finally {
-      setDetectingWallet(false)
+      if (attempt === detectionSeq.current) setDetectingWallet(false)
     }
   }
 
@@ -402,8 +452,11 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
   const testRelayer = async () => {
     setRelayerTesting(true)
     setRelayerProbe(null)
+    const revision = revisionRef.current
+    const attempt = ++relayerSeq.current
     try {
       const result = await api.testRelayer(draft, clobBaseURL, relayerKey.trim(), relayerAddress.trim(), 'polymarket')
+      if (revisionRef.current !== revision) return
       setRelayerProbe(result)
       toast({
         title: result.ok ? 'Relayer 密钥有效' : 'Relayer 密钥检测失败',
@@ -413,9 +466,10 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
         variant: result.ok ? 'success' : 'error',
       })
     } catch (caught) {
+      if (revisionRef.current !== revision) return
       toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
     } finally {
-      setRelayerTesting(false)
+      if (attempt === relayerSeq.current) setRelayerTesting(false)
     }
   }
 
@@ -427,8 +481,11 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
     }
     setTesting(true)
     setProbe(null)
+    const revision = revisionRef.current
+    const attempt = ++probeSeq.current
     try {
       const result = await api.testLive(draft, clobBaseURL, 'polymarket')
+      if (revisionRef.current !== revision) return
       setProbe(result)
       toast({
         title: result.ok ? '实盘凭据可用' : '实盘凭据检测失败',
@@ -438,9 +495,10 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
         variant: result.ok ? 'success' : 'error',
       })
     } catch (caught) {
+      if (revisionRef.current !== revision) return
       toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
     } finally {
-      setTesting(false)
+      if (attempt === probeSeq.current) setTesting(false)
     }
   }
 
@@ -673,7 +731,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
             <Input
               value={relayerKey}
-              onChange={(event) => { setRelayerKey(event.target.value); setRelayerProbe(null) }}
+              onChange={(event) => { onDraftEdit(); setRelayerKey(event.target.value); setRelayerProbe(null) }}
               placeholder="01a18d94-7b45-7bc6-..."
               spellCheck={false}
               autoComplete="off"
@@ -682,7 +740,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, o
             />
             <Input
               value={relayerAddress}
-              onChange={(event) => { setRelayerAddress(event.target.value); setRelayerProbe(null) }}
+              onChange={(event) => { onDraftEdit(); setRelayerAddress(event.target.value); setRelayerProbe(null) }}
               placeholder={probe?.signer || '0x...（签名者地址，不是 Funder）'}
               spellCheck={false}
               autoComplete="off"
@@ -767,12 +825,12 @@ function PredictFunEndpointSection({ draft, dirty, saving, busy, runtime, onChan
             id="predictfun-base-url"
             value={draft.base_url}
             onChange={(event) => onChange({ base_url: event.target.value })}
-            placeholder={meta.defaults.baseURL}
+            placeholder={draft.testnet ? '留空使用测试网默认地址' : meta.defaults.baseURL}
             spellCheck={false}
             autoComplete="off"
             className="mt-2 font-mono text-xs"
           />
-          <p className="mt-1.5 text-[11px] leading-4 text-slate-400">当前生效：<code className="break-all rounded bg-slate-100 px-1">{draft.base_url || meta.defaults.baseURL}</code></p>
+          <p className="mt-1.5 text-[11px] leading-4 text-slate-400">当前生效：<code className="break-all rounded bg-slate-100 px-1">{draft.base_url || (draft.testnet ? '测试网默认地址（继承部署环境）' : `主网默认 ${meta.defaults.baseURL}`)}</code></p>
         </div>
         <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 text-xs leading-5 text-slate-500">
           <p className="font-medium text-slate-700">与 Polymarket 的差异</p>
@@ -794,7 +852,7 @@ function PredictFunEndpointSection({ draft, dirty, saving, busy, runtime, onChan
   )
 }
 
-function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, settlementSupported, onChange, onReset, onSave }: {
+function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, settlementSupported, configurationDirty, revisionRef, onChange, onReset, onSave }: {
   draft: PredictFunDraft
   dirty: boolean
   saving: boolean
@@ -802,10 +860,13 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
   runtime: SystemVenueRuntime
   baseURL: string
   settlementSupported: boolean
+  configurationDirty: boolean
+  revisionRef: { current: number }
   onChange: (patch: Partial<PredictFunDraft>) => void
   onReset: () => void
   onSave: () => void
 }) {
+  const probeSeq = useRef(0)
   const { toast } = useToast()
   const meta = venueMeta('predictfun')
   const [testing, setTesting] = useState(false)
@@ -817,7 +878,9 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
 
   // Allowances live on chain, not in the saved settings, so they are read on
   // mount. A venue that is not configured has nothing to report and the card
-  // stays hidden; the read is skipped entirely in that case.
+  // stays hidden; the read is skipped entirely in that case. Re-read whenever
+  // the applied wallet or network changes, otherwise an allowance from the
+  // previous identity would stay on screen.
   useEffect(() => {
     if (!runtime.configured) { setApproval(null); return }
     let alive = true
@@ -825,9 +888,26 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
       .then((result) => { if (alive) setApproval(result.approval) })
       .catch(() => { if (alive) setApproval(null) })
     return () => { alive = false }
-  }, [runtime.configured])
+  }, [runtime.configured, runtime.ready, runtime.signer, runtime.maker, runtime.testnet])
+
+  // Approval acts on the applied runtime, not on the draft. Keep the button
+  // disabled until the current draft is saved and the applied config is ready.
+  const approvalBlockedReason = approving
+    ? '授权提交中'
+    : busy
+      ? '配置保存中'
+      : testing
+        ? '凭据检测中'
+        : configurationDirty
+          ? '先保存配置后再授权'
+          : !runtime.configured
+            ? '尚未配置实盘凭据'
+            : !runtime.ready
+              ? '实盘凭据未就绪'
+              : ''
 
   const grantApprovals = async () => {
+    if (approvalBlockedReason) return
     setApproving(true)
     try {
       const result = await api.approveVenue('predictfun')
@@ -859,6 +939,8 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
     }
     setTesting(true)
     setProbe(null)
+    const revision = revisionRef.current
+    const attempt = ++probeSeq.current
     try {
       // Empty secrets mean "keep the stored value", exactly like the PUT body.
       const live: VenueLiveSettings = {
@@ -868,6 +950,7 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
         ...(draft.testnet === undefined ? {} : { testnet: draft.testnet }),
       }
       const result = await api.testLive(live, baseURL, 'predictfun')
+      if (revisionRef.current !== revision) return
       setProbe(result)
       toast({
         title: result.ok ? 'Predict.fun 凭据可用' : 'Predict.fun 凭据检测失败',
@@ -877,9 +960,10 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
         variant: result.ok ? 'success' : 'error',
       })
     } catch (caught) {
+      if (revisionRef.current !== revision) return
       toast({ title: '检测失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
     } finally {
-      setTesting(false)
+      if (attempt === probeSeq.current) setTesting(false)
     }
   }
 
@@ -1014,9 +1098,14 @@ function PredictFunLiveSection({ draft, dirty, saving, busy, runtime, baseURL, s
 
         <p className="flex-1 text-xs leading-5 text-slate-400">「检测凭据」只做只读验证（读取余额与账户状态），不会保存设置也不会下单；请求会带上 venue=predictfun。</p>
         {approval && !approval.ready && (
-          <Button variant="secondary" onClick={() => void grantApprovals()} loading={approving} disabled={busy}>
-            <ShieldCheck className="h-4 w-4" />链上授权
-          </Button>
+          <>
+            {approvalBlockedReason && (
+              <p className="text-xs leading-5 text-amber-700 sm:text-right" role="status">{approvalBlockedReason}</p>
+            )}
+            <Button variant="secondary" onClick={() => void grantApprovals()} loading={approving} disabled={Boolean(approvalBlockedReason)}>
+              <ShieldCheck className="h-4 w-4" />链上授权
+            </Button>
+          </>
         )}
         <Button variant="secondary" onClick={() => void testCredentials()} loading={testing} disabled={busy}>检测凭据</Button>
         <Button variant="secondary" onClick={onReset} disabled={!dirty || busy}><RotateCcw className="h-4 w-4" />放弃更改</Button>
@@ -1071,13 +1160,9 @@ export function SystemView() {
   const [tab, setTab] = useState<Venue>('polymarket')
   const [system, setSystem] = useState<SystemSettings | null>(null)
   const [proxyDraft, setProxyDraft] = useState<ProxyConfig | null>(null)
-  const [proxyDirty, setProxyDirty] = useState(false)
   const [pmData, setPmData] = useState<DataSourceSettings | null>(null)
   const [pmLive, setPmLive] = useState<LiveSettings | null>(null)
   const [pfDraft, setPfDraft] = useState<PredictFunDraft | null>(null)
-  // Dirty flags are per card so saving one venue never resets the other's draft.
-  const [dataDirty, setDataDirty] = useState<Record<Venue, boolean>>({ polymarket: false, predictfun: false })
-  const [liveDirty, setLiveDirty] = useState<Record<Venue, boolean>>({ polymarket: false, predictfun: false })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [savingSection, setSavingSection] = useState<SaveKey | null>(null)
@@ -1085,22 +1170,43 @@ export function SystemView() {
   const [testResult, setTestResult] = useState<ProxyTestResult | null>(null)
   const { capabilityOf } = useVenues()
 
+  // Monotonic draft revision. Every editable-field change increments it, so an
+  // async response can tell whether the draft it started from still exists.
+  const revisionRef = useRef(0)
+  const bumpRevision = useCallback(() => { revisionRef.current += 1 }, [])
+
+  // Dirty state is derived from the draft and the last applied settings, so a
+  // save can reset the baseline just by replacing `system`. Never compare
+  // secret masks to stored plaintext: the applied draft only has masks/blanks.
+  const proxyDirty = Boolean(system && proxyDraft && proxyDraftDirty(proxyDraft, system.proxy))
+  const pmDataDirty = Boolean(system && pmData && endpointDraftDirty(pmData, system.data_source))
+  const pmLiveDirty = Boolean(system && pmLive && liveDraftDirty(pmLive, system.live, system.runtime.live_environment))
+  const pfApplied = system ? toPredictFunDraft(system) : null
+  const pfDataDirty = Boolean(pfDraft && pfApplied && pfDraft.base_url !== pfApplied.base_url)
+  const pfLiveDirty = Boolean(pfDraft && pfApplied && predictFunLiveDraftDirty(pfDraft, pfApplied))
+
   const load = useCallback(async () => {
+    const revision = revisionRef.current
     setLoading(true)
     try {
       const next = await api.system()
+      // A reload that raced an edit must not replace the newer draft.
+      if (revisionRef.current !== revision) {
+        setError('')
+        return
+      }
       setSystem(next)
       setProxyDraft((current) => (current && proxyDirty ? current : next.proxy))
-      setPmData((current) => (current && dataDirty.polymarket ? current : next.data_source))
-      setPmLive((current) => (current && liveDirty.polymarket ? current : next.live))
-      setPfDraft((current) => (current && (dataDirty.predictfun || liveDirty.predictfun) ? current : toPredictFunDraft(next)))
+      setPmData((current) => (current && pmDataDirty ? current : next.data_source))
+      setPmLive((current) => (current && pmLiveDirty ? current : next.live))
+      setPfDraft((current) => (current && (pfDataDirty || pfLiveDirty) ? current : toPredictFunDraft(next)))
       setError('')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '系统设置加载失败。')
     } finally {
       setLoading(false)
     }
-  }, [proxyDirty, dataDirty, liveDirty])
+  }, [proxyDirty, pmDataDirty, pmLiveDirty, pfDataDirty, pfLiveDirty])
 
   useEffect(() => {
     void load()
@@ -1108,21 +1214,22 @@ export function SystemView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const applySaved = (saved: SystemSettings, key: SaveKey) => {
-    setSystem(saved)
+  // Write only the saved draft; the caller sets `system` (the applied baseline)
+  // even when this save became stale, but stale responses must not touch fields
+  // edited after the request started. Bumping the revision invalidates probes
+  // that were started against the pre-save draft.
+  const applySavedDraft = (saved: SystemSettings, key: SaveKey) => {
+    bumpRevision()
     if (key === 'proxy') {
       setProxyDraft(saved.proxy)
-      setProxyDirty(false)
       return
     }
     if (key === 'data:polymarket') {
       setPmData(saved.data_source)
-      setDataDirty((current) => ({ ...current, polymarket: false }))
       return
     }
     if (key === 'live:polymarket') {
       setPmLive(saved.live)
-      setLiveDirty((current) => ({ ...current, polymarket: false }))
       return
     }
     const savedVenue = saved.venues?.predictfun
@@ -1143,15 +1250,17 @@ export function SystemView() {
         smart_wallet_configured: Boolean(savedVenue?.smart_wallet_configured || savedVenue?.live?.smart_wallet_configured) || current.smart_wallet_configured || Boolean(current.smart_wallet),
       }
     })
-    if (key === 'data:predictfun') setDataDirty((current) => ({ ...current, predictfun: false }))
-    else setLiveDirty((current) => ({ ...current, predictfun: false }))
   }
 
   const saveSection = async (key: SaveKey, body: SystemPatch, successTitle: string, successDescription: string) => {
+    const revision = revisionRef.current
     setSavingSection(key)
     try {
       const saved = await api.updateSystem(body)
-      applySaved(saved, key)
+      // The server applied the save either way; refresh the runtime baseline.
+      setSystem(saved)
+      if (revisionRef.current !== revision) return
+      applySavedDraft(saved, key)
       toast({ title: successTitle, description: successDescription, variant: 'success' })
     } catch (caught) {
       toast({
@@ -1165,8 +1274,8 @@ export function SystemView() {
   }
 
   const updateProxy = (patch: Partial<ProxyConfig>) => {
+    bumpRevision()
     setProxyDraft((current) => (current ? { ...current, ...patch } : current))
-    setProxyDirty(true)
     setTestResult(null)
   }
 
@@ -1177,14 +1286,14 @@ export function SystemView() {
 
   const resetProxy = () => {
     if (!system) return
+    bumpRevision()
     setProxyDraft(system.proxy)
-    setProxyDirty(false)
     setTestResult(null)
   }
 
   const updateData = (patch: Partial<DataSourceSettings>) => {
+    bumpRevision()
     setPmData((current) => (current ? { ...current, ...patch } : current))
-    setDataDirty((current) => ({ ...current, polymarket: true }))
   }
 
   const saveData = () => {
@@ -1207,18 +1316,18 @@ export function SystemView() {
 
   const resetData = () => {
     if (!system) return
+    bumpRevision()
     setPmData(system.data_source)
-    setDataDirty((current) => ({ ...current, polymarket: false }))
   }
 
   const clearData = () => {
+    bumpRevision()
     setPmData({ gamma_base_url: '', clob_base_url: '' })
-    setDataDirty((current) => ({ ...current, polymarket: true }))
   }
 
   const updateLive = (patch: Partial<LiveSettings>) => {
+    bumpRevision()
     setPmLive((current) => (current ? { ...current, ...patch } : current))
-    setLiveDirty((current) => ({ ...current, polymarket: true }))
   }
 
   const saveLive = () => {
@@ -1235,18 +1344,18 @@ export function SystemView() {
 
   const resetLive = () => {
     if (!system) return
+    bumpRevision()
     setPmLive(system.live)
-    setLiveDirty((current) => ({ ...current, polymarket: false }))
   }
 
   const updatePfData = (patch: Partial<PredictFunDraft>) => {
+    bumpRevision()
     setPfDraft((current) => (current ? { ...current, ...patch } : current))
-    setDataDirty((current) => ({ ...current, predictfun: true }))
   }
 
   const updatePfLive = (patch: Partial<PredictFunDraft>) => {
+    bumpRevision()
     setPfDraft((current) => (current ? { ...current, ...patch } : current))
-    setLiveDirty((current) => ({ ...current, predictfun: true }))
   }
 
   const savePfData = () => {
@@ -1261,13 +1370,14 @@ export function SystemView() {
 
   const resetPfData = () => {
     if (!system) return
+    bumpRevision()
     const loaded = toPredictFunDraft(system)
     setPfDraft((current) => (current ? { ...current, base_url: loaded.base_url } : current))
-    setDataDirty((current) => ({ ...current, predictfun: false }))
   }
 
   const resetPfLive = () => {
     if (!system) return
+    bumpRevision()
     const loaded = toPredictFunDraft(system)
     setPfDraft((current) => (current ? {
       ...current,
@@ -1279,7 +1389,6 @@ export function SystemView() {
       private_key_configured: loaded.private_key_configured,
       smart_wallet_configured: loaded.smart_wallet_configured,
     } : current))
-    setLiveDirty((current) => ({ ...current, predictfun: false }))
   }
 
   const savePfLive = () => {
@@ -1315,8 +1424,10 @@ export function SystemView() {
     if (!proxyDraft) return
     setTesting(true)
     setTestResult(null)
+    const revision = revisionRef.current
     try {
       const result = await api.testProxy(proxyDraft)
+      if (revisionRef.current !== revision) return
       setTestResult(result)
       toast({
         title: result.ok ? '代理连接正常' : '代理连接失败',
@@ -1324,6 +1435,7 @@ export function SystemView() {
         variant: result.ok ? 'success' : 'error',
       })
     } catch (caught) {
+      if (revisionRef.current !== revision) return
       toast({ title: '代理测试失败', description: caught instanceof Error ? caught.message : '请稍后重试。', variant: 'error' })
     } finally {
       setTesting(false)
@@ -1370,7 +1482,7 @@ export function SystemView() {
                 <EndpointSection
                   system={system}
                   draft={pmData}
-                  dirty={dataDirty.polymarket}
+                  dirty={pmDataDirty}
                   saving={savingSection === 'data:polymarket'}
                   busy={savingSection !== null}
                   onChange={updateData}
@@ -1383,10 +1495,12 @@ export function SystemView() {
                 <LiveTradingSection
                   system={system}
                   draft={pmLive}
-                  dirty={liveDirty.polymarket}
+                  dirty={pmLiveDirty}
                   saving={savingSection === 'live:polymarket'}
                   busy={savingSection !== null}
                   clobBaseURL={pmData?.clob_base_url ?? ''}
+                  revisionRef={revisionRef}
+                  onDraftEdit={bumpRevision}
                   onChange={updateLive}
                   onReset={resetLive}
                   onSave={saveLive}
@@ -1398,7 +1512,7 @@ export function SystemView() {
               <>
                 <PredictFunEndpointSection
                   draft={pfDraft}
-                  dirty={dataDirty.predictfun}
+                  dirty={pfDataDirty}
                   saving={savingSection === 'data:predictfun'}
                   busy={savingSection !== null}
                   runtime={venueRuntime(system, 'predictfun')}
@@ -1408,12 +1522,14 @@ export function SystemView() {
                 />
                 <PredictFunLiveSection
                   draft={pfDraft}
-                  dirty={liveDirty.predictfun}
+                  dirty={pfLiveDirty}
                   saving={savingSection === 'live:predictfun'}
                   busy={savingSection !== null}
                   runtime={venueRuntime(system, 'predictfun')}
                   baseURL={pfDraft.base_url}
                   settlementSupported={pfCapability?.supports_settlement ?? venueMeta('predictfun').supportsSettlement}
+                  configurationDirty={pfDataDirty || pfLiveDirty}
+                  revisionRef={revisionRef}
                   onChange={updatePfLive}
                   onReset={resetPfLive}
                   onSave={savePfLive}

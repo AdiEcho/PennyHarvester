@@ -49,6 +49,7 @@ type Provider struct {
 	now         func() time.Time
 
 	mu          sync.Mutex
+	generation  uint64
 	endsAt      map[string]endsAtEntry
 	stats       map[string]statsEntry
 	byToken     map[string]marketMeta
@@ -153,6 +154,7 @@ func (p *Provider) Reset() {
 		return
 	}
 	p.mu.Lock()
+	p.generation++
 	p.endsAt = map[string]endsAtEntry{}
 	p.stats = map[string]statsEntry{}
 	p.byToken = map[string]marketMeta{}
@@ -184,6 +186,7 @@ func (p *Provider) ListOpen(ctx context.Context, maxDays int) ([]market.Market, 
 		return nil, fmt.Errorf("Predict.fun 行情未配置")
 	}
 	now := p.now().UTC()
+	generation := p.generationNow()
 	mapped := make([]market.Market, 0, maxPageSize)
 	seen := make(map[string]bool, marketScanCap)
 	failures := make([]string, 0, 5)
@@ -208,7 +211,7 @@ func (p *Provider) ListOpen(ctx context.Context, maxDays int) ([]market.Market, 
 				continue
 			}
 			seen[id] = true
-			item, mapErr := p.mapMarket(ctx, raw, now, maxDays)
+			item, mapErr := p.mapMarket(ctx, raw, now, maxDays, generation)
 			if mapErr != nil {
 				// A deliberate skip (yield-bearing, unknown end date, outside the
 				// scan window) is an expected outcome of a market list that mixes
@@ -228,16 +231,27 @@ func (p *Provider) ListOpen(ctx context.Context, maxDays int) ([]market.Market, 
 		if len(seen) >= marketScanCap {
 			break
 		}
-		cursor = strings.TrimSpace(next)
-		if cursor == "" {
+		next = strings.TrimSpace(next)
+		if next == "" {
 			break
 		}
+		if next == cursor {
+			// A repeated cursor means the server ignored the page parameter or
+			// has a loop. Stop instead of silently re-reading page one until the
+			// scan cap hides the missing markets.
+			failures = appendFailure(failures, "市场分页游标未前进")
+			break
+		}
+		cursor = next
 	}
 
 	if len(mapped) == 0 && len(failures) > 0 {
 		return nil, fmt.Errorf("Predict.fun 没有可用市场: %s", strings.Join(failures, "; "))
 	}
-	p.fillLiquidity(ctx, mapped)
+	p.fillLiquidity(ctx, mapped, generation)
+	if p.generationNow() != generation {
+		return nil, fmt.Errorf("Predict.fun 配置已变更，已丢弃上一配置的行情")
+	}
 	return mapped, nil
 }
 
@@ -251,7 +265,7 @@ func (p *Provider) ListOpen(ctx context.Context, maxDays int) ([]market.Market, 
 // The fetched figure only ever fills a gap: a market whose listing already
 // reported depth keeps that number, because the ask-side figure alone would
 // hide a thin-but-tradable market that has most of its depth on the bid.
-func (p *Provider) fillLiquidity(ctx context.Context, items []market.Market) {
+func (p *Provider) fillLiquidity(ctx context.Context, items []market.Market, generation uint64) {
 	now := p.now()
 	p.mu.Lock()
 	missing := make([]string, 0, len(items))
@@ -282,7 +296,9 @@ func (p *Provider) fillLiquidity(ctx context.Context, items []market.Market) {
 					return
 				}
 				p.mu.Lock()
-				p.stats[id] = statsEntry{liquidity: stats.LiquidityValue(), volume: stats.VolumeValue(), fetchedAt: now}
+				if p.generation == generation {
+					p.stats[id] = statsEntry{liquidity: stats.LiquidityValue(), volume: stats.VolumeValue(), fetchedAt: now}
+				}
 				p.mu.Unlock()
 			}(id)
 		}
@@ -316,20 +332,24 @@ func (p *Provider) Get(ctx context.Context, id string) (market.Market, error) {
 	if p == nil || p.client == nil {
 		return market.Market{}, fmt.Errorf("Predict.fun 行情未配置")
 	}
+	generation := p.generationNow()
 	raw, err := p.client.Market(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return market.Market{}, err
 	}
-	item, err := p.mapMarket(ctx, raw, p.now().UTC(), 0)
+	item, err := p.mapMarket(ctx, raw, p.now().UTC(), 0, generation)
 	if err != nil {
 		return market.Market{}, fmt.Errorf("Predict.fun 市场 %s 不可用: %w", id, err)
+	}
+	if p.generationNow() != generation {
+		return market.Market{}, fmt.Errorf("Predict.fun 配置已变更，已丢弃上一配置的市场")
 	}
 	return item, nil
 }
 
 // mapMarket converts one API market. A non-nil error means the market must not
 // be surfaced; the message explains why.
-func (p *Provider) mapMarket(ctx context.Context, raw Market, now time.Time, maxDays int) (market.Market, error) {
+func (p *Provider) mapMarket(ctx context.Context, raw Market, now time.Time, maxDays int, generation uint64) (market.Market, error) {
 	// Yield-bearing markets settle through a separate contract family this build
 	// cannot sign for. Refusing them here means the executor never sees a token
 	// it would sign against the wrong exchange.
@@ -340,7 +360,7 @@ func (p *Provider) mapMarket(ctx context.Context, raw Market, now time.Time, max
 		return market.Market{}, skipMarket{reason: fmt.Sprintf("市场 %s 不是二元市场", raw.ID)}
 	}
 
-	endsAt, ok, err := p.categoryEndsAt(ctx, raw.CategorySlug)
+	endsAt, ok, err := p.categoryEndsAt(ctx, raw.CategorySlug, generation)
 	if err != nil {
 		return market.Market{}, err
 	}
@@ -440,7 +460,7 @@ func (p *Provider) mapMarket(ctx context.Context, raw Market, now time.Time, max
 		meta.YesTokenID = outcomes[0].TokenID
 		meta.NoTokenID = outcomes[1].TokenID
 	}
-	p.remember(meta)
+	p.remember(meta, generation)
 	return item, nil
 }
 
@@ -508,7 +528,7 @@ func isClosedStatus(status, tradingStatus string) bool {
 // categoryEndsAt resolves a category's endsAt with a per-slug cache. A slug that
 // is missing from the payload is cached as "unknown" for a short TTL so one
 // broken category cannot cause an HTTP request per market per scan.
-func (p *Provider) categoryEndsAt(ctx context.Context, slug string) (time.Time, bool, error) {
+func (p *Provider) categoryEndsAt(ctx context.Context, slug string, generation uint64) (time.Time, bool, error) {
 	slug = strings.TrimSpace(slug)
 	if slug == "" {
 		return time.Time{}, false, nil
@@ -529,37 +549,48 @@ func (p *Provider) categoryEndsAt(ctx context.Context, slug string) (time.Time, 
 
 	category, err := p.client.Category(ctx, slug)
 	if err != nil {
-		p.storeEndsAt(slug, time.Time{}, false, now)
+		p.storeEndsAt(slug, time.Time{}, false, now, generation)
 		return time.Time{}, false, fmt.Errorf("读取 Predict.fun 分类 %s: %w", slug, err)
 	}
 	rawEndsAt := strings.TrimSpace(category.EndsAt)
 	if rawEndsAt == "" {
-		p.storeEndsAt(slug, time.Time{}, false, now)
+		p.storeEndsAt(slug, time.Time{}, false, now, generation)
 		return time.Time{}, false, nil
 	}
 	endsAt, parseErr := time.Parse(time.RFC3339, rawEndsAt)
 	if parseErr != nil || endsAt.IsZero() {
-		p.storeEndsAt(slug, time.Time{}, false, now)
+		p.storeEndsAt(slug, time.Time{}, false, now, generation)
 		return time.Time{}, false, fmt.Errorf("Predict.fun 分类 %s 的 endsAt 不是有效的 RFC3339 时间", slug)
 	}
 	endsAt = endsAt.UTC()
-	p.storeEndsAt(slug, endsAt, true, now)
+	p.storeEndsAt(slug, endsAt, true, now, generation)
 	return endsAt, true, nil
 }
 
-func (p *Provider) storeEndsAt(slug string, endsAt time.Time, ok bool, now time.Time) {
+func (p *Provider) generationNow() uint64 {
 	p.mu.Lock()
-	p.endsAt[slug] = endsAtEntry{endsAt: endsAt, ok: ok, fetchedAt: now}
+	defer p.mu.Unlock()
+	return p.generation
+}
+
+func (p *Provider) storeEndsAt(slug string, endsAt time.Time, ok bool, now time.Time, generation uint64) {
+	p.mu.Lock()
+	if p.generation == generation {
+		p.endsAt[slug] = endsAtEntry{endsAt: endsAt, ok: ok, fetchedAt: now}
+	}
 	p.mu.Unlock()
 }
 
 // remember registers a market's trading metadata for the executor.
-func (p *Provider) remember(meta marketMeta) {
+func (p *Provider) remember(meta marketMeta, generation uint64) {
 	if meta.YesTokenID == "" && meta.NoTokenID == "" {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.generation != generation {
+		return
+	}
 	if meta.YesTokenID != "" {
 		p.byToken[meta.YesTokenID] = meta
 	}
@@ -614,6 +645,29 @@ func (p *Provider) marketMeta(ctx context.Context, tokenID, conditionID string) 
 	return marketMeta{}, fmt.Errorf("未找到 %s 对应的 Predict.fun 市场元数据，请先刷新行情", label)
 }
 
+// marketMetaByID loads one market by its venue id, regardless of status. The
+// open-market scan cannot rebuild a resolved market's token mapping after a
+// restart, so redemption resolves it directly instead of scanning forever.
+func (p *Provider) marketMetaByID(ctx context.Context, marketID string) (marketMeta, error) {
+	marketID = strings.TrimSpace(marketID)
+	if marketID == "" {
+		return marketMeta{}, fmt.Errorf("缺少市场 ID，无法加载赎回元数据")
+	}
+	if p == nil || p.client == nil {
+		return marketMeta{}, fmt.Errorf("Predict.fun 行情未配置，无法确定市场元数据")
+	}
+	raw, err := p.client.Market(ctx, marketID)
+	if err != nil {
+		return marketMeta{}, fmt.Errorf("读取 Predict.fun 市场 %s 元数据: %w", marketID, err)
+	}
+	meta, ok := metaFromMarket(raw)
+	if !ok {
+		return marketMeta{}, fmt.Errorf("Predict.fun 市场 %s 缺少完整的赎回元数据", marketID)
+	}
+	p.remember(meta, p.generationNow())
+	return meta, nil
+}
+
 func (p *Provider) resolveMeta(tokenID, conditionID string) (marketMeta, bool) {
 	var (
 		meta marketMeta
@@ -647,6 +701,7 @@ func (p *Provider) resolveMeta(tokenID, conditionID string) (marketMeta, bool) {
 // scanner maps the market.
 func (p *Provider) indexRemote(ctx context.Context) error {
 	cursor := ""
+	generation := p.generationNow()
 	for page := 0; page < marketScanCap/maxPageSize; page++ {
 		markets, next, err := p.client.Markets(ctx, MarketQuery{
 			First:  maxPageSize,
@@ -662,7 +717,7 @@ func (p *Provider) indexRemote(ctx context.Context) error {
 		for _, raw := range markets {
 			meta, ok := metaFromMarket(raw)
 			if ok {
-				p.remember(meta)
+				p.remember(meta, generation)
 			}
 		}
 		cursor = strings.TrimSpace(next)
@@ -753,35 +808,88 @@ const (
 // market that reports its verdict in only one of the three shapes must still
 // settle.
 func winningOutcome(raw Market) (index int, draw bool, ok bool) {
+	// A lifecycle that has not reached a final state cannot produce a payout,
+	// even if a stale outcome tag already says WON.
+	if !isFinalStatus(raw.Status) || len(raw.Outcomes) != 2 {
+		return 0, false, false
+	}
+	winners := countWinners(raw.Outcomes)
+	if winners > 2 {
+		return 0, false, false
+	}
+	if winners == 2 {
+		// Both sides WON is the verified draw encoding; a resolution object that
+		// names one side does not override the on-chain 1/1 numerators.
+		return 0, true, true
+	}
+
+	resolutionIndex := -1
 	if raw.Resolution != nil {
+		// The resolution object is itself a verdict, but only when it is
+		// complete: an index/token without a WON status is a partial write.
+		if !strings.EqualFold(strings.TrimSpace(raw.Resolution.Status), outcomeWon) {
+			return 0, false, false
+		}
 		if want, err := raw.Resolution.IndexSet.Int64(); err == nil && want > 0 {
 			for i, outcome := range raw.Outcomes {
 				if indexSet, err := outcome.IndexSet.Int64(); err == nil && indexSet == want {
-					return i, countWinners(raw.Outcomes) > 1, true
+					resolutionIndex = i
+					break
 				}
 			}
 		}
-		if winner := strings.TrimSpace(raw.Resolution.OnChainID); winner != "" {
-			for i, outcome := range raw.Outcomes {
-				if strings.TrimSpace(outcome.OnChainID) == winner {
-					return i, countWinners(raw.Outcomes) > 1, true
+		if resolutionIndex < 0 {
+			if winner := strings.TrimSpace(raw.Resolution.OnChainID); winner != "" {
+				for i, outcome := range raw.Outcomes {
+					if strings.TrimSpace(outcome.OnChainID) == winner {
+						resolutionIndex = i
+						break
+					}
 				}
 			}
 		}
-	}
-	winners := countWinners(raw.Outcomes)
-	switch {
-	case winners == 0:
-		return 0, false, false
-	case winners > 1:
-		return 0, true, true
-	}
-	for i, outcome := range raw.Outcomes {
-		if strings.EqualFold(strings.TrimSpace(outcome.Status), outcomeWon) {
-			return i, false, true
+		if resolutionIndex < 0 {
+			return 0, false, false
 		}
+	}
+
+	if winners == 1 {
+		winnerIndex := -1
+		for i, outcome := range raw.Outcomes {
+			if strings.EqualFold(strings.TrimSpace(outcome.Status), outcomeWon) {
+				winnerIndex = i
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(outcome.Status), outcomeLost) {
+				// One WON with a blank or unknown other side is not a complete
+				// result; keep the market pending rather than guess.
+				return 0, false, false
+			}
+		}
+		if resolutionIndex >= 0 && resolutionIndex != winnerIndex {
+			return 0, false, false
+		}
+		return winnerIndex, false, true
+	}
+
+	// No WON tag: only the resolution object can still be a complete verdict.
+	if resolutionIndex >= 0 {
+		if strings.EqualFold(strings.TrimSpace(raw.Outcomes[resolutionIndex].Status), outcomeLost) {
+			return 0, false, false
+		}
+		return resolutionIndex, false, true
 	}
 	return 0, false, false
+}
+
+// isFinalStatus accepts only lifecycles that have finished adjudication.
+// CLOSED and CANCELLED end trading but do not publish a payout.
+func isFinalStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "resolved", "settled", "finalized":
+		return true
+	}
+	return false
 }
 
 // countWinners counts the outcomes tagged WON.

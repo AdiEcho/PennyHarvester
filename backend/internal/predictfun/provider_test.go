@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -254,6 +255,88 @@ func TestGetMapsDrawToFiftyFifty(t *testing.T) {
 	}
 }
 
+func mutateSettled(t *testing.T, body string, mutate func(map[string]any)) string {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode settled fixture: %v", err)
+	}
+	mutate(payload)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode settled fixture: %v", err)
+	}
+	return string(encoded)
+}
+
+func TestGetRefusesFinalStatusWithoutVerdict(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	// RESOLVED but no resolution object and no WON tags: the 0.50/0.50 mids
+	// must not be read as a draw.
+	provider := newSettledProvider(t, clock, buildSettledJSON(t, 50, "RESOLVED", "CLOSED", 0))
+	item, err := provider.Get(context.Background(), "50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ResolutionStatus == "resolved" {
+		t.Fatalf("missing verdict was treated as final: %+v", item)
+	}
+	if _, resolved := item.SettlementPrice("900"); resolved {
+		t.Fatal("missing verdict produced a payout")
+	}
+}
+
+func TestGetRefusesNonFinalLifecycleWithWinnerTags(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	provider := newSettledProvider(t, clock, buildSettledJSON(t, 51, "CLOSED", "CLOSED", 1))
+	item, err := provider.Get(context.Background(), "51")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ResolutionStatus == "resolved" {
+		t.Fatalf("CLOSED lifecycle was treated as final: %+v", item)
+	}
+	if _, resolved := item.SettlementPrice("900"); resolved {
+		t.Fatal("non-final lifecycle produced a payout")
+	}
+}
+
+func TestGetRefusesConflictingResolutionAndOutcomeTags(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	body := mutateSettled(t, buildSettledJSON(t, 52, "RESOLVED", "CLOSED", 1), func(payload map[string]any) {
+		outcomes := payload["outcomes"].([]any)
+		yes := outcomes[0].(map[string]any)
+		yes["status"] = "LOST"
+	})
+	provider := newSettledProvider(t, clock, body)
+	item, err := provider.Get(context.Background(), "52")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ResolutionStatus == "resolved" {
+		t.Fatalf("conflicting verdicts were treated as final: %+v", item)
+	}
+	if _, resolved := item.SettlementPrice("900"); resolved {
+		t.Fatal("conflicting verdicts produced a payout")
+	}
+}
+
+func TestGetRefusesResolutionWithoutWonStatus(t *testing.T) {
+	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
+	body := mutateSettled(t, buildSettledJSON(t, 53, "RESOLVED", "CLOSED", 1), func(payload map[string]any) {
+		resolution := payload["resolution"].(map[string]any)
+		resolution["status"] = "PENDING"
+	})
+	provider := newSettledProvider(t, clock, body)
+	item, err := provider.Get(context.Background(), "53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ResolutionStatus == "resolved" {
+		t.Fatalf("partial resolution was treated as final: %+v", item)
+	}
+}
+
 func TestGetRefusesToSettleClosedMarketWithoutWinner(t *testing.T) {
 	clock := time.Date(2029, 12, 1, 0, 0, 0, 0, time.UTC)
 	provider := newSettledProvider(t, clock, buildSettledJSON(t, 47, "CLOSED", "CLOSED", 0))
@@ -415,5 +498,52 @@ func TestOutcomeMidUsesBothSidesThenFallback(t *testing.T) {
 	}
 	if got := outcomeMid(MarketOutcome{}, 0.01); got != 0 {
 		t.Fatalf("empty price = %v", got)
+	}
+}
+
+func TestMarketMetaByIDLoadsResolvedMarketWithoutOpenScan(t *testing.T) {
+	body := buildSettledJSON(t, 46, "RESOLVED", "CLOSED", 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/markets/46" {
+			t.Errorf("path = %s, want by-id endpoint", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":` + body + `}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{BaseURL: server.URL, Testnet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := NewProvider(client)
+	meta, err := provider.marketMetaByID(context.Background(), "46")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.MarketID != "46" || meta.YesTokenID != "900" || meta.NoTokenID != "901" || meta.ConditionID != "0xsettled" {
+		t.Fatalf("resolved metadata = %+v", meta)
+	}
+}
+
+func TestProviderDropsWritesFromAnOldConfiguration(t *testing.T) {
+	provider := &Provider{
+		generation:  2,
+		endsAt:      map[string]endsAtEntry{},
+		stats:       map[string]statsEntry{},
+		byToken:     map[string]marketMeta{},
+		byCondition: map[string]marketMeta{},
+	}
+	meta := marketMeta{MarketID: "m", ConditionID: "c", YesTokenID: "yes", NoTokenID: "no"}
+	provider.remember(meta, 1)
+	if _, ok := provider.lookupToken("yes"); ok {
+		t.Fatal("a market from the previous generation was indexed")
+	}
+	provider.storeEndsAt("slug", time.Now().Add(time.Hour), true, time.Now(), 1)
+	if _, ok := provider.endsAt["slug"]; ok {
+		t.Fatal("an end date from the previous generation was cached")
+	}
+	provider.remember(meta, 2)
+	if _, ok := provider.lookupToken("yes"); !ok {
+		t.Fatal("the current generation was refused")
 	}
 }

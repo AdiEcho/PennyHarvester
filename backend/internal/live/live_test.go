@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	clobclient "github.com/Cyvadra/polymarket-clob-client"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -216,8 +220,11 @@ func TestQuoteAllowsDollarAmountBelowMinShares(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a $2 marketable buy must quote: %v", err)
 	}
-	if math.Abs(quote.Shares-2.0408) > 1e-9 || quote.LimitPrice != 0.98 {
-		t.Fatalf("shares must be sized from the dollars, not the share floor: %+v", quote)
+	// The signed maker side is floored to cents. At a 0.98 limit that gives
+	// 1.99/2.0408 = 0.9751, below the ask, so the signed limit moves one tick up
+	// and the shares are resized to keep the spend within budget.
+	if math.Abs(quote.Shares-2.0202) > 1e-9 || quote.LimitPrice != 0.99 {
+		t.Fatalf("shares must be sized from the dollars and the signed tick: %+v", quote)
 	}
 	if !quote.FullyFilled || quote.Fee <= 0 {
 		t.Fatalf("unexpected quote: %+v", quote)
@@ -258,6 +265,9 @@ func TestLookupOrderReportsFeeWithoutBookingSide(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/data/order/"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.98"}`))
+		case r.URL.Path == "/data/trades":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"100","status":"CONFIRMED"}],"next_cursor":""}`))
 		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
@@ -313,10 +323,10 @@ func TestLookupOrderUsesRealFillPrices(t *testing.T) {
 				t.Errorf("trades read must be L2 authenticated: %v", r.Header)
 			}
 			_, _ = w.Write([]byte(`{"data":[
-				{"taker_order_id":"order-1","price":"0.98","size":"60","status":"MATCHED"},
-				{"taker_order_id":"order-1","price":"0.985","size":"40","status":"MATCHED"},
-				{"taker_order_id":"other-order","price":"0.5","size":"900","status":"MATCHED"}
-			]}`))
+				{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"60","status":"CONFIRMED"},
+				{"id":"trade-2","taker_order_id":"order-1","price":"0.985","size":"40","status":"CONFIRMED"},
+				{"id":"trade-3","taker_order_id":"other-order","price":"0.5","size":"900","status":"CONFIRMED"}
+			],"next_cursor":""}`))
 		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
 			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
 		default:
@@ -518,7 +528,7 @@ func TestBuySizesBelowMinOrderSizeForMarketableBuy(t *testing.T) {
 		case r.URL.Path == "/order" && r.Method == http.MethodPost:
 			body, _ := io.ReadAll(r.Body)
 			submittedOrder = string(body)
-			_, _ = w.Write([]byte(`{"success":true,"orderID":"order-2","status":"matched","takingAmount":"2.0408","makingAmount":"1.99"}`))
+			_, _ = w.Write([]byte(`{"success":true,"orderID":"order-2","status":"matched","takingAmount":"2.0202","makingAmount":"1.979796"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -537,17 +547,56 @@ func TestBuySizesBelowMinOrderSizeForMarketableBuy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a $2 marketable buy must be submitted: %v", err)
 	}
-	if fill.Shares != 2.0408 || fill.Cost != 1.99 {
+	if fill.Shares != 2.0202 || math.Abs(fill.Cost-1.979796) > 1e-9 {
 		t.Fatalf("unexpected fill: %+v", fill)
 	}
-	// 2.0408 shares at the 0.98 tick-ceiled limit: the signed order must carry
-	// that share count, not a padded five-share one.
-	if !strings.Contains(submittedOrder, `"takerAmount":"2040800"`) {
+	// 2.0202 shares at the one-tick-raised 0.99 limit: the signed order must
+	// carry that share count, not a padded five-share one.
+	if !strings.Contains(submittedOrder, `"takerAmount":"2020200"`) {
 		t.Fatalf("signed order does not carry the dollar-sized shares: %s", submittedOrder)
+	}
+	// The exchange compares the signed integer maker/taker ratio. It must still
+	// cross the original 0.98 ask, not the 0.9751 ratio the old plan signed.
+	var signed struct {
+		Order struct {
+			MakerAmount string `json:"makerAmount"`
+			TakerAmount string `json:"takerAmount"`
+		} `json:"order"`
+	}
+	if err := json.Unmarshal([]byte(submittedOrder), &signed); err != nil {
+		t.Fatalf("decode signed order: %v", err)
+	}
+	maker, err := strconv.ParseFloat(signed.Order.MakerAmount, 64)
+	if err != nil {
+		t.Fatalf("decode maker amount: %v", err)
+	}
+	taker, err := strconv.ParseFloat(signed.Order.TakerAmount, 64)
+	if err != nil {
+		t.Fatalf("decode taker amount: %v", err)
+	}
+	if ratio := maker / taker; ratio < 0.98 {
+		t.Fatalf("signed maker/taker ratio %v does not cross the 0.98 ask", ratio)
 	}
 }
 
-func TestSellPersistsSignedOrderAndSubtractsFee(t *testing.T) {
+func TestCeilTickDoesNotAddAFloatNoiseTick(t *testing.T) {
+	cases := []struct {
+		price, tick, want float64
+	}{
+		{0.07, 0.01, 0.07},
+		{0.14, 0.01, 0.14},
+		{0.28, 0.01, 0.28},
+		{0.071, 0.01, 0.08},
+		{0.9801, 0.001, 0.981},
+	}
+	for _, tc := range cases {
+		if got := ceilTick(tc.price, tc.tick); math.Abs(got-tc.want) > 1e-12 {
+			t.Fatalf("ceilTick(%v,%v)=%v want %v", tc.price, tc.tick, got, tc.want)
+		}
+	}
+}
+
+func TestSellPersistsSignedOrderAndReportsFee(t *testing.T) {
 	var submittedOrder string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -598,11 +647,68 @@ func TestSellPersistsSignedOrderAndSubtractsFee(t *testing.T) {
 		t.Fatalf("unexpected sell fill: %+v", fill)
 	}
 	wantFee := 0.07 * 100 * 0.75 * 0.25
-	if math.Abs(fill.Fee-wantFee) > 1e-9 || math.Abs(fill.Cost-(75-wantFee)) > 1e-9 {
-		t.Fatalf("sell fee must reduce proceeds: %+v wantFee=%f", fill, wantFee)
+	if math.Abs(fill.Fee-wantFee) > 1e-9 || math.Abs(fill.Cost-75) > 1e-9 {
+		t.Fatalf("sell must report gross proceeds and the fee separately: %+v wantFee=%f", fill, wantFee)
+	}
+	// The engine subtracts Fee exactly once. Pre-deducting it here would make the
+	// wallet's proceeds %v instead of %v.
+	if net := fill.Cost - fill.Fee; math.Abs(net-(75-wantFee)) > 1e-9 {
+		t.Fatalf("engine net proceeds = %v, want %v", net, 75-wantFee)
 	}
 	if !strings.Contains(submittedOrder, `"side":"SELL"`) {
 		t.Fatalf("submitted order is not a sell: %s", submittedOrder)
+	}
+}
+
+func TestSellUsesTheFreshTickAfterAMarketTickChange(t *testing.T) {
+	var orders []string
+	var tickFetches int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/book":
+			_, _ = w.Write([]byte(`{"asset_id":"token-1","market":"condition-1","bids":[{"price":"0.745","size":"100"}],"asks":[],"min_order_size":"5","tick_size":"0.001","neg_risk":false}`))
+		case r.URL.Path == "/tick-size":
+			tickFetches++
+			if tickFetches == 1 {
+				_, _ = w.Write([]byte(`{"minimum_tick_size":0.01}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"minimum_tick_size":0.001}`))
+		case r.URL.Path == "/neg-risk":
+			_, _ = w.Write([]byte(`{"neg_risk":false}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		case r.URL.Path == "/order" && r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			orders = append(orders, string(body))
+			_, _ = w.Write([]byte(`{"success":true,"orderID":"sell-1","status":"matched","makingAmount":"100","takingAmount":"74.5"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       server.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := executor.Sell(context.Background(), "token-1", "condition-1", 100, nil); err != nil {
+			t.Fatalf("sell %d: %v", i, err)
+		}
+	}
+	if len(orders) != 2 {
+		t.Fatalf("orders = %d", len(orders))
+	}
+	if !strings.Contains(orders[0], `"takerAmount":"74000000"`) {
+		t.Fatalf("first sell should use the reported 0.01 tick: %s", orders[0])
+	}
+	if !strings.Contains(orders[1], `"takerAmount":"74500000"`) {
+		t.Fatalf("second sell must use the refreshed 0.001 tick: %s", orders[1])
 	}
 }
 
@@ -858,7 +964,8 @@ func TestCollateralUnitsAcceptsNumberAndStringForm(t *testing.T) {
 }
 
 // TestTradesForOrderSkipsUnrelatedAndFailedFills keeps a reconciliation from
-// booking another order's fills or a failed match.
+// booking another order's fills or a failed match, and keeps a confirmed+failed
+// mix from being treated as a complete fill set.
 func TestTradesForOrderSkipsUnrelatedAndFailedFills(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/data/trades" {
@@ -867,26 +974,504 @@ func TestTradesForOrderSkipsUnrelatedAndFailedFills(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
-			{"taker_order_id":"order-1","price":"0.98","size":"10","status":"MATCHED"},
-			{"taker_order_id":"order-1","price":"0.98","size":"10","status":"FAILED"},
-			{"taker_order_id":"order-2","price":"0.98","size":"10","status":"MATCHED"}
-		]}`))
+			{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"10","status":"CONFIRMED"},
+			{"id":"trade-2","taker_order_id":"order-1","price":"0.98","size":"10","status":"FAILED"},
+			{"id":"trade-3","taker_order_id":"order-2","price":"0.98","size":"10","status":"CONFIRMED"}
+		],"next_cursor":""}`))
 	}))
 	defer server.Close()
 
-	executor := New(Config{
+	executor := newLookupTestExecutor(server.URL)
+	result, err := executor.tradesForOrder(context.Background(), "order-1", "condition-1", 10)
+	if err == nil {
+		t.Fatal("a mixed confirmed+failed fill set must not reconcile as complete")
+	}
+	if !strings.Contains(err.Error(), "失败 1 笔") {
+		t.Fatalf("the failed leg must be surfaced: %v", err)
+	}
+	if result.Complete || result.ConfirmedShares != 10 || math.Abs(result.ConfirmedNotional-9.8) > 1e-9 {
+		t.Fatalf("failed and unrelated fills must not contribute: %+v", result)
+	}
+	if result.FailedLegs != 1 || result.PendingLegs != 0 || result.ConfirmedLegs != 1 {
+		t.Fatalf("unexpected leg counts: %+v", result)
+	}
+}
+
+func newLookupTestExecutor(serverURL string) *Executor {
+	return New(Config{
 		PrivateKey:    "0x" + strings.Repeat("1", 64),
 		SignatureType: 0,
-		CLOBURL:       server.URL,
+		CLOBURL:       serverURL,
 		APIKey:        "test-key",
 		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
 		APIPassphrase: "test-passphrase",
 	})
-	shares, notional, found, err := executor.tradesForOrder(context.Background(), "order-1", "condition-1")
-	if err != nil || !found {
-		t.Fatalf("unexpected read: %v found=%v", err, found)
+}
+
+// TestNormalizeTradeStatus pins the finality mapping: only CONFIRMED is a
+// successful terminal fill, every FAILED* spelling is a failed leg, and every
+// other status (including MATCHED/MINED/RETRYING and unknown values) is
+// non-final.
+func TestNormalizeTradeStatus(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want tradeLegStatus
+	}{
+		{"CONFIRMED", tradeLegConfirmed},
+		{"confirmed", tradeLegConfirmed},
+		{" TRADE_STATUS_CONFIRMED ", tradeLegConfirmed},
+		{"MATCHED", tradeLegPending},
+		{"MINED", tradeLegPending},
+		{"RETRYING", tradeLegPending},
+		{"TRADE_STATUS_MATCHED", tradeLegPending},
+		{"TRADE_STATUS_RETRYING", tradeLegPending},
+		{"UNKNOWN", tradeLegPending},
+		{"", tradeLegPending},
+		{"FAILED", tradeLegFailed},
+		{"failed", tradeLegFailed},
+		{"TRADE_STATUS_FAILED", tradeLegFailed},
+		{"TRADE_STATUS_FAILED_INSUFFICIENT_BALANCE", tradeLegFailed},
 	}
-	if math.Abs(shares-10) > 1e-9 || math.Abs(notional-9.8) > 1e-9 {
-		t.Fatalf("shares = %v, notional = %v; failed and unrelated fills must be ignored", shares, notional)
+	for _, tc := range cases {
+		if got := normalizeTradeStatus(tc.raw); got != tc.want {
+			t.Fatalf("normalizeTradeStatus(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// TestLookupOrderRequiresConfirmedTradesForFinality walks one order through the
+// documented lifecycle. MATCHED and RETRYING are non-final; FAILED is a failed
+// leg; only CONFIRMED may be booked, and even then the confirmed shares must
+// equal size_matched.
+func TestLookupOrderRequiresConfirmedTradesForFinality(t *testing.T) {
+	status := "TRADE_STATUS_MATCHED"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.98"}`))
+		case r.URL.Path == "/data/trades":
+			fmt.Fprintf(w, `{"data":[{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"100","status":%q}],"next_cursor":""}`, status)
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	if err := executor.ReadyError(); err != "" {
+		t.Fatal(err)
+	}
+
+	steps := []struct {
+		status  string
+		wantErr string
+	}{
+		{"TRADE_STATUS_MATCHED", "未终态 1 笔"},
+		{"RETRYING", "未终态 1 笔"},
+		{"TRADE_STATUS_FAILED", "失败 1 笔"},
+		{"CONFIRMED", ""},
+	}
+	for _, step := range steps {
+		status = step.status
+		fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+		if !found {
+			t.Fatalf("%s: order must be found", step.status)
+		}
+		if step.wantErr != "" {
+			if err == nil {
+				t.Fatalf("%s: a non-final or failed leg must not be booked: %+v", step.status, fill)
+			}
+			if !strings.Contains(err.Error(), step.wantErr) {
+				t.Fatalf("%s: error must surface the leg state %q: %v", step.status, step.wantErr, err)
+			}
+			if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+				t.Fatalf("%s: incomplete evidence must not carry a fill: %+v", step.status, fill)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: confirmed fill must reconcile: %v", step.status, err)
+		}
+		if fill.Status != "CONFIRMED" || math.Abs(fill.Shares-100) > 1e-9 || math.Abs(fill.Cost-98) > 1e-9 || math.Abs(fill.Price-0.98) > 1e-9 {
+			t.Fatalf("%s: unexpected final fill: %+v", step.status, fill)
+		}
+	}
+}
+
+// TestLookupOrderAllFailedWithSizeMatchedDoesNotFill covers the dangerous
+// fallback: a positive size_matched with an all-FAILED fill set is not a fill,
+// and the limit-price estimate must not be returned as final.
+func TestLookupOrderAllFailedWithSizeMatchedDoesNotFill(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.99"}`))
+		case r.URL.Path == "/data/trades":
+			_, _ = w.Write([]byte(`{"data":[{"id":"trade-1","taker_order_id":"order-1","price":"0.80","size":"100","status":"TRADE_STATUS_FAILED"}],"next_cursor":""}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if !found {
+		t.Fatal("the order exists even though every match failed")
+	}
+	if err == nil || !strings.Contains(err.Error(), "失败 1 笔") {
+		t.Fatalf("all-failed legs must surface as incomplete: %v", err)
+	}
+	if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 || fill.Price != 0 {
+		t.Fatalf("a failed leg and size_matched must not produce a fill: %+v", fill)
+	}
+}
+
+// TestLookupOrderFeesEachConfirmedTrade pins the nonlinear fee contract: two
+// fills at 0.20 and 0.80 pay 1.12, not the 1.75 a VWAP schedule would charge.
+func TestLookupOrderFeesEachConfirmedTrade(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"CONFIRMED","size_matched":"100","price":"0.80"}`))
+		case r.URL.Path == "/data/trades":
+			_, _ = w.Write([]byte(`{"data":[{"id":"trade-1","taker_order_id":"order-1","price":"0.20","size":"50","status":"CONFIRMED"},{"id":"trade-2","taker_order_id":"order-1","price":"0.80","size":"50","status":"CONFIRMED"}],"next_cursor":""}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if err != nil || !found {
+		t.Fatalf("lookup: found=%v err=%v", found, err)
+	}
+	if math.Abs(fill.Fee-1.12) > 1e-9 {
+		t.Fatalf("fee must be summed per trade: got %v want 1.12 (VWAP would be 1.75)", fill.Fee)
+	}
+}
+
+// TestLookupOrderFollowsTradesCursorToExhaustion pins the pagination bug: an
+// order whose 60-share fill is on page 1 and 40-share fill is on page 2 totals
+// 100, not 60, and the second page must be requested.
+func TestLookupOrderFollowsTradesCursorToExhaustion(t *testing.T) {
+	var cursors []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.99"}`))
+		case r.URL.Path == "/data/trades":
+			cursor := r.URL.Query().Get("next_cursor")
+			cursors = append(cursors, cursor)
+			switch cursor {
+			case "":
+				_, _ = w.Write([]byte(`{"data":[{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"60","status":"CONFIRMED"}],"next_cursor":"cursor-2"}`))
+			case "cursor-2":
+				_, _ = w.Write([]byte(`{"data":[{"id":"trade-2","taker_order_id":"order-1","price":"0.985","size":"40","status":"CONFIRMED"}],"next_cursor":"LTE="}`))
+			default:
+				t.Errorf("unexpected trades cursor %q", cursor)
+				http.Error(w, "bad cursor", http.StatusBadRequest)
+			}
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if err != nil || !found {
+		t.Fatalf("lookup failed: %v found=%v", err, found)
+	}
+	if len(cursors) != 2 || cursors[0] != "" || cursors[1] != "cursor-2" {
+		t.Fatalf("both trade pages must be read in order: %v", cursors)
+	}
+	if math.Abs(fill.Shares-100) > 1e-9 || math.Abs(fill.Cost-98.2) > 1e-9 || math.Abs(fill.Price-0.982) > 1e-9 {
+		t.Fatalf("page 2 must contribute to the fill: %+v", fill)
+	}
+}
+
+// TestLookupOrderTradePageCapIsIncomplete makes the hard page cap observable:
+// even after the confirmed quantity happens to equal size_matched, an unread
+// cursor means the fill set is not proven and must not be booked.
+func TestLookupOrderTradePageCapIsIncomplete(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.98"}`))
+		case r.URL.Path == "/data/trades":
+			calls++
+			fmt.Fprintf(w, `{"data":[{"id":"trade-%d","taker_order_id":"order-1","price":"0.98","size":"50","status":"CONFIRMED"}],"next_cursor":"cursor-%d"}`, calls, calls)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if !found {
+		t.Fatal("the order must still be reported as found")
+	}
+	if err == nil || !strings.Contains(err.Error(), "页上限") {
+		t.Fatalf("exceeding the page cap must be incomplete: %v", err)
+	}
+	if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+		t.Fatalf("a capped trade walk must not produce a fill: %+v", fill)
+	}
+	if calls != maxTradePages {
+		t.Fatalf("trades calls = %d, want the hard cap %d", calls, maxTradePages)
+	}
+}
+
+// TestLookupOrderDeduplicatesTradeIDs counts a repeated leg once, so a
+// duplicated page row cannot double the booked shares.
+func TestLookupOrderDeduplicatesTradeIDs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.98"}`))
+		case r.URL.Path == "/data/trades":
+			_, _ = w.Write([]byte(`{"data":[
+				{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"100","status":"CONFIRMED"},
+				{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"100","status":"CONFIRMED"}
+			],"next_cursor":""}`))
+		case strings.HasPrefix(r.URL.Path, "/clob-markets/"):
+			_, _ = w.Write([]byte(`{"fd":{"r":"0.07","e":"1","to":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if err != nil || !found {
+		t.Fatalf("lookup failed: %v found=%v", err, found)
+	}
+	if math.Abs(fill.Shares-100) > 1e-9 || math.Abs(fill.Cost-98) > 1e-9 {
+		t.Fatalf("duplicate trade IDs must be counted once: %+v", fill)
+	}
+}
+
+// TestLookupOrderTrades404DoesNotEstimate makes sure an unavailable trade
+// history never silently falls back to size_matched × limit price.
+func TestLookupOrderTrades404DoesNotEstimate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.99"}`))
+		case r.URL.Path == "/data/trades":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if !found {
+		t.Fatal("the order is known; only its fills are missing")
+	}
+	if err == nil {
+		t.Fatal("a 404 from /data/trades must not become a final fill")
+	}
+	if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+		t.Fatalf("no estimate may be booked without trade evidence: %+v", fill)
+	}
+}
+
+// TestLookupOrderTradesTransportErrorDoesNotEstimate is the timeout/transport
+// variant: the connection is closed before a response, and the order must stay
+// unknown without the limit-price estimate.
+func TestLookupOrderTradesTransportErrorDoesNotEstimate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.99"}`))
+		case r.URL.Path == "/data/trades":
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("test server does not support connection hijacking")
+				http.Error(w, "no hijack", http.StatusInternalServerError)
+				return
+			}
+			conn, _, hijackErr := hijacker.Hijack()
+			if hijackErr != nil {
+				t.Errorf("hijack: %v", hijackErr)
+				return
+			}
+			_ = conn.Close()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if !found {
+		t.Fatal("the order is known; only its fills failed")
+	}
+	if err == nil {
+		t.Fatal("a transport failure must not become a final fill")
+	}
+	if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+		t.Fatalf("no estimate may be booked without trade evidence: %+v", fill)
+	}
+}
+
+// TestLookupOrderConfirmedQuantityMustMatchSizeMatched rejects a complete but
+// short trade history: 60 confirmed shares against size_matched=100 is not a
+// 60-share fill, because 40 shares could still be processing or missing.
+func TestLookupOrderConfirmedQuantityMustMatchSizeMatched(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.98"}`))
+		case r.URL.Path == "/data/trades":
+			_, _ = w.Write([]byte(`{"data":[{"id":"trade-1","taker_order_id":"order-1","price":"0.98","size":"60","status":"CONFIRMED"}],"next_cursor":""}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, found, err := executor.LookupOrder(context.Background(), "order-1", "condition-1")
+	if !found {
+		t.Fatal("the order must be reported as found")
+	}
+	if err == nil || !strings.Contains(err.Error(), "已确认 60/100 份") {
+		t.Fatalf("a short confirmed sum must be incomplete: %v", err)
+	}
+	if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+		t.Fatalf("a mismatched confirmed sum must not be booked: %+v", fill)
+	}
+}
+
+// TestLookupAmbiguousSubmitDoesNotBookMatchedEstimate covers the timeout path
+// in Buy/Sell: a successful order lookup with size_matched but only FAILED
+// trade legs must come back unknown, not as a limit-price estimate.
+func TestLookupAmbiguousSubmitDoesNotBookMatchedEstimate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/data/order/"):
+			_, _ = w.Write([]byte(`{"id":"order-1","status":"MATCHED","size_matched":"100","price":"0.99"}`))
+		case r.URL.Path == "/data/trades":
+			_, _ = w.Write([]byte(`{"data":[{"id":"trade-1","taker_order_id":"order-1","price":"0.80","size":"100","status":"TRADE_STATUS_FAILED"}],"next_cursor":""}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := newLookupTestExecutor(server.URL)
+	fill, err := executor.lookupAmbiguousSubmit(context.Background(), "order-1", "condition-1", errors.New("submit timeout"))
+	if err == nil || !strings.Contains(err.Error(), "submit timeout") {
+		t.Fatalf("an ambiguous submit must stay unresolved with its cause: %v", err)
+	}
+	if fill.Status != "unknown" || fill.Shares != 0 || fill.Cost != 0 {
+		t.Fatalf("the submit path must not book size_matched × limit price: %+v", fill)
+	}
+}
+
+func TestGuardedHTTPClientDoesNotForwardAuthHeaders(t *testing.T) {
+	leaked := ""
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = r.Header.Get("POLY_API_KEY")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	req, err := http.NewRequest(http.MethodGet, source.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("POLY_API_KEY", "secret-key")
+	response, err := guardedHTTPClient(5*time.Second, nil).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusFound {
+		t.Fatalf("redirect must be returned, not followed: status %d", response.StatusCode)
+	}
+	if leaked != "" {
+		t.Fatalf("credential leaked to redirect target: %q", leaked)
+	}
+}
+
+func TestLateCollateralReadFromOldEndpointDoesNotRefillTheCache(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	oldServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/balance-allowance" {
+			http.NotFound(w, r)
+			return
+		}
+		close(started)
+		<-release
+		_, _ = w.Write([]byte(`{"balance":"100000000","allowances":{"0xe111180000d2663c0091e4f400237545b87b996b":"100000000"}}`))
+	}))
+	defer oldServer.Close()
+	newServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/balance-allowance" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"balance":"50000000","allowances":{"0xe111180000d2663c0091e4f400237545b87b996b":"50000000"}}`))
+	}))
+	defer newServer.Close()
+
+	executor := New(Config{
+		PrivateKey:    "0x" + strings.Repeat("1", 64),
+		SignatureType: 0,
+		CLOBURL:       oldServer.URL,
+		APIKey:        "test-key",
+		APISecret:     base64.URLEncoding.EncodeToString([]byte("test-secret")),
+		APIPassphrase: "test-passphrase",
+	})
+	oldRead := make(chan engine.CashSnapshot, 1)
+	go func() {
+		snapshot, _ := executor.Collateral(context.Background())
+		oldRead <- snapshot
+	}()
+	<-started
+	if err := executor.UpdateSettings(engine.LiveSettings{}, newServer.URL); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := executor.Collateral(context.Background())
+	if err != nil || fresh.Amount != 50 {
+		t.Fatalf("fresh collateral = %+v, err=%v", fresh, err)
+	}
+	close(release)
+	<-oldRead
+	cached, err := executor.Collateral(context.Background())
+	if err != nil || cached.Amount != 50 {
+		t.Fatalf("old endpoint refilled the cache: %+v, err=%v", cached, err)
 	}
 }
