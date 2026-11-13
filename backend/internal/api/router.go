@@ -55,6 +55,8 @@ func NewRouter(strategyEngine *engine.Engine, webDir string, authenticator *Auth
 		protected.POST("/scan", h.scan)
 		protected.GET("/positions", h.positions)
 		protected.GET("/orders", h.orders)
+		protected.GET("/chain-operations", h.chainOperations)
+		protected.POST("/chain-operations/:id/resolve", h.resolveChainOperation)
 		protected.GET("/settings", h.settings)
 		protected.PUT("/settings", h.updateSettings)
 		protected.PUT("/settings/scan-interval", h.updateScanInterval)
@@ -619,7 +621,8 @@ func respondError(c *gin.Context, err error) {
 	status := http.StatusInternalServerError
 	switch {
 	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrNotFound),
-		errors.Is(err, engine.ErrInvalidSettings), errors.Is(err, engine.ErrNoApproval):
+		errors.Is(err, engine.ErrInvalidSettings), errors.Is(err, engine.ErrNoApproval),
+		errors.Is(err, engine.ErrChainOperationInvalid):
 		status = http.StatusBadRequest
 	case errors.Is(err, engine.ErrVenueMismatch):
 		status = http.StatusBadRequest

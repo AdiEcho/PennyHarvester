@@ -46,6 +46,9 @@ var (
 	// ErrChainOperationConflict means a chain-operation transition lost a race
 	// with a different terminal state. The stored row is left untouched.
 	ErrChainOperationConflict = errors.New("链上操作状态冲突")
+	// ErrChainOperationInvalid means an operator's resolution request or list
+	// filter is malformed. It is a client error and never changes a row.
+	ErrChainOperationInvalid = errors.New("链上操作参数无效")
 )
 
 // venueError carries a contract-exact message while still matching a sentinel
@@ -1390,6 +1393,16 @@ type Repository interface {
 	ActiveChainOperation(context.Context, int64, market.Venue, string, *int64) (ChainOperation, bool, error)
 	ListUnresolvedChainOperations(context.Context, int) ([]ChainOperation, error)
 	ChainOperationByID(context.Context, int64) (ChainOperation, bool, error)
+	// ListChainOperations returns a filtered, deterministic page. Unresolved
+	// rows are listed by passing Status "unknown".
+	ListChainOperations(context.Context, ChainOperationFilter) (ChainOperationPage, error)
+	// ResolveChainOperation manually closes a row that is still "unknown". It
+	// never broadcasts, signs, or invents a nonce; the operator supplies the
+	// chain evidence after checking the wallet or explorer.
+	ResolveChainOperation(context.Context, int64, string, string, string, string) (ChainOperation, error)
+	// ResolveChainOperationAndOrder closes an unknown redeem row and its linked
+	// order in one transaction. orderID 0 means the operation has no order.
+	ResolveChainOperationAndOrder(context.Context, int64, string, string, string, string, int64, string) (ChainOperation, error)
 	// SellPosition books a fully simulated paper sell and inserts its order.
 	SellPosition(context.Context, Position, Order) error
 	// FinalizeLiveSell marks a pending/unknown real sell as filled and updates

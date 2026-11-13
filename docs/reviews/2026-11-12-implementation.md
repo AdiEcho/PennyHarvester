@@ -124,15 +124,45 @@ cd ../frontend && npx tsc --noEmit && npm run build
 - 前端只有完整证据才允许保存代理实盘账户；不完整时显示“未验证，请核对”并阻止保存。
 - 模拟止损优先使用本轮扫描的市场费率，仓位离开雷达后不再按账户默认费率少计费用。
 - 年化起点只取第一笔 `filled` 自动买入，拒单/未决单不再拉长统计周期。
-- 为未决订单增加 `(account_id, id) WHERE status IN ('pending','unknown')` 部分索引。
+- 为未决订单增加 `(account_id, id) WHERE status IN ('pending','unknown')` 部分索引；2026-11-13 基准又增加
+  `(account_id, id DESC)` 与 `(account_id, status, id DESC)`，消除订单列表的临时排序。
 - 授权/赎回响应的写截止时间单独延长到请求时限之外，避免链上已成功但 60 秒 WriteTimeout 丢掉响应。
 
-## 仍未完成
+## 2026-11-13 收尾
 
-- 跨模块重构（拆分 `engine.go`）与性能基准未展开；当前以正确性和可验证性优先。
-- `unknown` 链上操作没有网页端人工结案入口，需要直接核对链上后处理数据库。
-- 代理实盘保存的最终校验在网页端；绕过网页直接调用 API 仍可写入未验证 Funder，
-  运行时不会自动把它标成已验证。
-- 前端已有行为测试仅覆盖钱包验证与核心竞态，未做完整浏览器端 E2E。
+- `engine.go` 3,679 → 434 行，按职责拆为 `settings.go` / `scan.go` / `orders.go` / `views.go` / `risk.go`；
+  只移动函数体，AST 声明数 119→119，行为等价，全量测试通过。`store/sqlite.go` 1,339 → 494 行（基准修复后 496 行），
+  拆为 accounts/orders/positions/settings/equity，纯移动。
+- `unknown` 链上操作新增网页端核对入口：过滤/分页、审计字段、`unknown` 条件更新、API 400/404/409、
+  桌面表格与移动卡片；确认/回滚不会重发或替换交易，赎回结果同步订单。
+- 代理实盘保存改由服务端重新发现并校验 chain 137、funder、钱包类型与 owner/signer 证据；
+  直接调用 API 无法写入未验证 Funder。发现结果按 signer/funder/type 短时缓存，空私钥不复用缓存。
+- 离线测试隔离：联网 smoke 使用 `//go:build live`，`PREDICTFUN_LIVE` 必须为 `1`；
+  CI 只编译 live 包，`make test-live` 显式联网。
+- 前端接入 vitest + Testing Library + Playwright；覆盖钱包证据、API 合同、链上核对桌面流程与移动卡片，
+  CI 增加浏览器 E2E。`make test` / `make test-e2e` 可复现。
+- 新增只读 `ledger-export`（`mode=ro` + `query_only=1`），导出账户/订单/持仓/链上操作/权益快照，
+  不读设置与凭据表、不调用 venue API、不修改数据库；对账流程见 `docs/ledger-export.md`。
+- 基准报告见 `docs/reviews/2026-11-13-benchmarks.md`；10k 订单典型页 14.07→0.267 ms，深页
+  20.24→0.794 ms，状态过滤 2.79→0.275 ms。
+
+复现命令：
+
+```bash
+cd backend
+env -u PREDICTFUN_LIVE go test -race -count=1 ./...
+go test -tags live -run '^$' ./internal/predictfun
+env -u PREDICTFUN_LIVE go test -run '^$' -bench . -benchmem -count=3 ./internal/engine ./internal/store
+cd ../frontend
+npm run typecheck && npm run test && npm run build && npm run test:e2e
+```
+
+## 仍未完成（外部验证门）
+
+- Protocol V2 实盘提交：域、结构、地址已核实（见 `docs/reviews/2026-11-13-polymarket-v2-evidence.md`），
+  但缺官方 V3 测试向量与 canary CLOB 接受证据，且协议从 2026-11-23 起分阶段激活；
+  当前继续识别展示、实盘明确拒单。完成链上 `domainSeparator()` 复核与一笔 canary 签名往返后再接入。
+- 真实账户对账/最小金额实盘：需要生产只读凭据、venue 流水与操作者确认；本次只提供只读导出，
+  不修改生产库、不伪造对账结果。
 
 生产数据库未修改；所有 schema 变更只通过代码内迁移，旧库在打开时增量升级。

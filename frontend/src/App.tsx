@@ -8,6 +8,7 @@ const DashboardView = lazy(() => import('@/views/dashboard').then((module) => ({
 const OpportunitiesView = lazy(() => import('@/views/opportunities').then((module) => ({ default: module.OpportunitiesView })))
 const PositionsView = lazy(() => import('@/views/positions').then((module) => ({ default: module.PositionsView })))
 const OrdersView = lazy(() => import('@/views/orders').then((module) => ({ default: module.OrdersView })))
+const OperationsView = lazy(() => import('@/views/operations').then((module) => ({ default: module.OperationsView })))
 const SettingsView = lazy(() => import('@/views/settings').then((module) => ({ default: module.SettingsView })))
 const SystemView = lazy(() => import('@/views/system').then((module) => ({ default: module.SystemView })))
 
@@ -28,6 +29,7 @@ export default function App() {
             {view === 'opportunities' && <OpportunitiesView onOrderCreated={() => navigate('positions')} />}
             {view === 'positions' && <PositionsView />}
             {view === 'orders' && <OrdersView />}
+            {view === 'operations' && <OperationsView />}
             {view === 'settings' && <SettingsView />}
             {view === 'system' && <SystemView />}
           </Suspense>

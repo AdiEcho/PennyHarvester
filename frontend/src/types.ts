@@ -272,6 +272,58 @@ export interface OrdersResponse {
   total: number
 }
 
+// A chain operation is the durable journal of an on-chain approve/redeem.
+// Unresolved rows (intent/signed/broadcast/unknown) block a retry, so an
+// operator must record the real chain outcome before the engine continues.
+export type ChainOperationStatus = 'intent' | 'signed' | 'broadcast' | 'unknown' | 'confirmed' | 'reverted'
+export type ChainOperationStatusFilter = ChainOperationStatus | 'all'
+export type ChainOperationKind = 'approve' | 'redeem'
+
+export interface ChainOperation {
+  id: number
+  account_id: number
+  venue: Venue
+  chain_id: number
+  kind: ChainOperationKind
+  position_id?: number | null
+  market_id?: string | null
+  token_id?: string | null
+  from_address: string
+  nonce?: number | null
+  tx_hash?: string | null
+  status: ChainOperationStatus
+  reason?: string | null
+  resolution_note?: string | null
+  resolved_by?: string | null
+  resolved_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ChainOperationsResponse {
+  items: ChainOperation[]
+  total: number
+  limit: number
+  offset: number
+}
+
+// Query keys mirror GET /chain-operations. Empty values are omitted by the
+// client, and `all` is a UI-only filter that never reaches the backend.
+export interface ChainOperationsParams {
+  account_id?: number
+  venue?: Venue | null
+  status?: ChainOperationStatusFilter
+  limit?: number
+  offset?: number
+}
+
+export interface ResolveChainOperationBody {
+  status: 'confirmed' | 'reverted'
+  reason: string
+  actor: string
+  tx_hash?: string
+}
+
 // VenueSettings overrides the global Settings for one venue. Zero/absent
 // numeric values inherit the global value; disabled venues are neither scanned
 // nor traded.

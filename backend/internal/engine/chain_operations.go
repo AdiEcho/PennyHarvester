@@ -16,21 +16,44 @@ import (
 // deliberately separate because an approval has no order, and a redemption can
 // need recovery long after its order has been rendered.
 type ChainOperation struct {
-	ID          int64        `json:"id"`
-	AccountID   int64        `json:"account_id"`
-	Venue       market.Venue `json:"venue"`
-	ChainID     int64        `json:"chain_id"`
-	Kind        string       `json:"kind"`
-	PositionID  *int64       `json:"position_id,omitempty"`
-	MarketID    string       `json:"market_id,omitempty"`
-	TokenID     string       `json:"token_id,omitempty"`
-	FromAddress string       `json:"from_address"`
-	Nonce       *uint64      `json:"nonce,omitempty"`
-	TxHash      string       `json:"tx_hash,omitempty"`
-	Status      string       `json:"status"`
-	Reason      string       `json:"reason,omitempty"`
-	CreatedAt   time.Time    `json:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at"`
+	ID             int64        `json:"id"`
+	AccountID      int64        `json:"account_id"`
+	Venue          market.Venue `json:"venue"`
+	ChainID        int64        `json:"chain_id"`
+	Kind           string       `json:"kind"`
+	PositionID     *int64       `json:"position_id,omitempty"`
+	MarketID       string       `json:"market_id,omitempty"`
+	TokenID        string       `json:"token_id,omitempty"`
+	FromAddress    string       `json:"from_address"`
+	Nonce          *uint64      `json:"nonce,omitempty"`
+	TxHash         string       `json:"tx_hash,omitempty"`
+	Status         string       `json:"status"`
+	Reason         string       `json:"reason,omitempty"`
+	ResolvedBy     string       `json:"resolved_by,omitempty"`
+	ResolutionNote string       `json:"resolution_note,omitempty"`
+	ResolvedAt     *time.Time   `json:"resolved_at,omitempty"`
+	CreatedAt      time.Time    `json:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at"`
+}
+
+// ChainOperationFilter selects a deterministic page of the chain journal. Zero
+// values mean "all": account 0 spans every account, an empty venue spans every
+// venue, and an empty status spans every state.
+type ChainOperationFilter struct {
+	AccountID int64
+	Venue     market.Venue
+	Status    string
+	Limit     int
+	Offset    int
+}
+
+// ChainOperationPage is a full result page. Total counts every matching row, not
+// just the returned slice, so the UI can paginate an unresolved backlog.
+type ChainOperationPage struct {
+	Items  []ChainOperation `json:"items"`
+	Total  int64            `json:"total"`
+	Limit  int              `json:"limit"`
+	Offset int              `json:"offset"`
 }
 
 const (
@@ -45,6 +68,12 @@ const (
 	chainOperationRecoveryLimit  = 50
 	chainOperationRecoveryBudget = 12 * time.Second
 	chainOperationRecoveryPerOp  = 5 * time.Second
+
+	// Manual resolution is an operator action, so every field that proves who
+	// closed an unknown row is bounded before it becomes an audit record.
+	chainOperationActorMax  = 120
+	chainOperationReasonMax = 500
+	chainOperationTxHashLen = 66 // 0x + 64 hex characters
 )
 
 const chainOperationStaleReason = "进程中断，交易可能未广播，请核对钱包 nonce 与链上记录"
@@ -94,6 +123,129 @@ func (e *Engine) finishChainOperation(ctx context.Context, id int64, status, rea
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chainOperationWriteTimeout)
 	defer cancel()
 	return e.repo.FinishChainOperation(writeCtx, id, status, clampReason(reason))
+}
+
+// ListChainOperations is the operator's read path over the chain journal. It
+// validates the filter here as well as in the store so a caller cannot ask for
+// a venue or state the schema does not contain. Limit 0 means the default and a
+// larger value is capped rather than rejected: a list endpoint must stay
+// bounded even when a caller asks for everything.
+func (e *Engine) ListChainOperations(ctx context.Context, filter ChainOperationFilter) (ChainOperationPage, error) {
+	filter.Status = normalizeChainOperationStatus(filter.Status)
+	if filter.AccountID < 0 {
+		return ChainOperationPage{}, fmt.Errorf("%w: account_id 不能为负数", ErrChainOperationInvalid)
+	}
+	if filter.Venue != "" && !filter.Venue.Valid() {
+		return ChainOperationPage{}, fmt.Errorf("%w: 未知场所 %q", ErrChainOperationInvalid, filter.Venue)
+	}
+	if filter.Status != "" && !validChainOperationStatus(filter.Status) {
+		return ChainOperationPage{}, fmt.Errorf("%w: 无效的链上操作状态 %q", ErrChainOperationInvalid, filter.Status)
+	}
+	if filter.Limit < 0 {
+		return ChainOperationPage{}, fmt.Errorf("%w: limit 不能为负数", ErrChainOperationInvalid)
+	}
+	if filter.Offset < 0 {
+		return ChainOperationPage{}, fmt.Errorf("%w: offset 不能为负数", ErrChainOperationInvalid)
+	}
+	return e.repo.ListChainOperations(ctx, filter)
+}
+
+// ResolveChainOperation closes an unknown row with an operator's verified
+// outcome. It takes tradeMu so a manual resolution cannot interleave with a
+// live redemption or the recovery pass updating the same linked order. It never
+// touches the chain: no RPC, no signature, no new nonce.
+func (e *Engine) ResolveChainOperation(ctx context.Context, id int64, status, reason, actor, txHash string) (ChainOperation, error) {
+	status = strings.TrimSpace(status)
+	actor = strings.TrimSpace(actor)
+	reason = strings.TrimSpace(reason)
+	if id <= 0 {
+		return ChainOperation{}, fmt.Errorf("%w: 链上操作 ID 无效", ErrChainOperationInvalid)
+	}
+	if status != "confirmed" && status != "reverted" {
+		return ChainOperation{}, fmt.Errorf("%w: 状态仅支持 confirmed 或 reverted", ErrChainOperationInvalid)
+	}
+	if actor == "" || len([]rune(actor)) > chainOperationActorMax {
+		return ChainOperation{}, fmt.Errorf("%w: 操作人必填且不超过 %d 个字符", ErrChainOperationInvalid, chainOperationActorMax)
+	}
+	if reason == "" || len([]rune(reason)) > chainOperationReasonMax {
+		return ChainOperation{}, fmt.Errorf("%w: 核对说明必填且不超过 %d 个字符", ErrChainOperationInvalid, chainOperationReasonMax)
+	}
+	hash, err := normalizeChainOperationTxHash(txHash)
+	if err != nil {
+		return ChainOperation{}, err
+	}
+
+	e.tradeMu.Lock()
+	defer e.tradeMu.Unlock()
+	current, ok, err := e.repo.ChainOperationByID(ctx, id)
+	if err != nil {
+		return ChainOperation{}, err
+	}
+	if !ok {
+		return ChainOperation{}, engineNotFound("链上操作")
+	}
+	// Resolve the journal row and its linked redemption order atomically. The
+	// order lookup happens here because only the engine knows the redeem-intent
+	// rule; the store applies both writes in one transaction.
+	var orderID int64
+	var orderStatus string
+	if current.Kind == "redeem" && current.PositionID != nil {
+		if intent, found, err := e.repo.RedeemIntent(ctx, current.AccountID, *current.PositionID); err != nil {
+			return ChainOperation{}, err
+		} else if found {
+			orderID = intent.ID
+			switch status {
+			case "confirmed":
+				orderStatus = "filled"
+			case "reverted":
+				orderStatus = "rejected"
+			}
+		}
+	}
+	resolved, err := e.repo.ResolveChainOperationAndOrder(ctx, id, status, reason, actor, hash, orderID, orderStatus)
+	if err != nil {
+		return ChainOperation{}, err
+	}
+	return resolved, nil
+}
+
+// engineNotFound keeps the store's ErrNotFound sentinel while naming the
+// resource in the message.
+func engineNotFound(resource string) error {
+	return fmt.Errorf("%w: %s不存在", ErrNotFound, resource)
+}
+
+func normalizeChainOperationStatus(raw string) string {
+	status := strings.TrimSpace(raw)
+	if strings.EqualFold(status, "all") {
+		return ""
+	}
+	return status
+}
+
+func validChainOperationStatus(status string) bool {
+	switch status {
+	case "intent", "signed", "broadcast", "confirmed", "reverted", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeChainOperationTxHash(raw string) (string, error) {
+	hash := strings.TrimSpace(raw)
+	if hash == "" {
+		return "", nil
+	}
+	if len(hash) != chainOperationTxHashLen || hash[0] != '0' || (hash[1] != 'x' && hash[1] != 'X') {
+		return "", fmt.Errorf("%w: 交易哈希须为 0x 加 64 位十六进制", ErrChainOperationInvalid)
+	}
+	for _, digit := range hash[2:] {
+		if !(digit >= '0' && digit <= '9') && !(digit >= 'a' && digit <= 'f') && !(digit >= 'A' && digit <= 'F') {
+			return "", fmt.Errorf("%w: 交易哈希须为 0x 加 64 位十六进制", ErrChainOperationInvalid)
+		}
+	}
+	return strings.ToLower(hash), nil
 }
 
 // transactionHashError attaches the signed hash to an error from a layer that

@@ -1,3 +1,5 @@
+//go:build live
+
 package predictfun
 
 import (
@@ -7,15 +9,17 @@ import (
 	"time"
 )
 
-// TestLiveProviderSmoke exercises the real Predict.fun REST API. It is opt-in
-// because it needs the network and depends on the venue's live data:
+// TestLiveProviderSmoke exercises the real Predict.fun REST API. It requires
+// both the live build tag and an explicit opt-in because it needs the network
+// and depends on the venue's live data:
 //
-//	PREDICTFUN_LIVE=1 go test ./internal/predictfun/ -run TestLiveProviderSmoke -v
+//	PREDICTFUN_LIVE=1 go test -tags live ./internal/predictfun/ -run TestLiveProviderSmoke -v
 //
 // It needs no credentials: the market-data endpoints are public, so this proves
-// the read path without touching the operator's key.
+// the read path without touching the operator's key. Offline builds (no tag)
+// never compile or run this file, regardless of environment variables.
 func TestLiveProviderSmoke(t *testing.T) {
-	if os.Getenv("PREDICTFUN_LIVE") == "" {
+	if os.Getenv("PREDICTFUN_LIVE") != "1" {
 		t.Skip("set PREDICTFUN_LIVE=1 to hit the real Predict.fun API")
 	}
 	testnet := os.Getenv("PREDICTFUN_TESTNET") != ""
@@ -60,9 +64,9 @@ func TestLiveProviderSmoke(t *testing.T) {
 // TestLiveProviderSettlementSmoke proves the settlement mapping against settled
 // markets the venue actually published, not against a fixture:
 //
-//	PREDICTFUN_LIVE=1 PREDICTFUN_TESTNET=1 go test ./internal/predictfun/ -run TestLiveProviderSettlementSmoke -v
+//	PREDICTFUN_LIVE=1 PREDICTFUN_TESTNET=1 go test -tags live ./internal/predictfun/ -run TestLiveProviderSettlementSmoke -v
 func TestLiveProviderSettlementSmoke(t *testing.T) {
-	if os.Getenv("PREDICTFUN_LIVE") == "" {
+	if os.Getenv("PREDICTFUN_LIVE") != "1" {
 		t.Skip("set PREDICTFUN_LIVE=1 to hit the real Predict.fun API")
 	}
 	testnet := os.Getenv("PREDICTFUN_TESTNET") != ""

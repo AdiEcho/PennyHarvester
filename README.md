@@ -37,7 +37,7 @@
 - **策略参数按账户独立，再按场所细分**。每个账户保存自己的一份参数（`account_settings` 表）：价格区间、流动性、分类与体育策略、尾盘窗口、止损、单笔金额与敞口都只作用于该账户，切换账户不会串用配置。每个场所还可单独覆写开关、单笔金额、单账户最大持仓、场所总敞口与费率；单事件敞口上限（`max_event_exposure`）只按账户设置，用于约束同一场选举或同一场比赛下所有盘口的合计投入；留空即继承该账户「策略」页的值。尚未保存过参数的账户实时继承全局默认模板（`settings` 表），新建账户也以该模板为起点。
 - **Predict.fun 当前支持**：只读行情与报价（无需任何凭据）、限价/市价买入、市价止损卖出、持仓与余额查询、按币种计价的手续费与收益测算、**自动结算**（Predict.fun 公布获胜结果后，引擎把胜方记 1.00、负方记 0.00、平局记 0.50 并关账）、**链上赎回**（对已结算仓位提交 `redeemPositions` 交易取回 USDT，见下文）、测试网（`PREDICTFUN_TESTNET=1`）。卖单同样受最小名义额、份额精度与止损份额门槛约束。
 - **Predict.fun 暂不支持**：代理钱包签名（当前要求 EOA 私钥与 maker 一致；Kernel 域包装的签名格式已有调研记录但未实现）、链上合并/转换（`merge`/`convert`）、WebSocket 盘口订阅（走轮询）。赎回由本系统**代发交易**，签名地址必须有 BNB 支付 gas；neg-risk 市场的赎回还需要先在「系统设置 → Predict.fun」执行一次链上授权（授权 NegRiskAdapter 划转结果份额）。
-- **链上操作身份**：授权与赎回在签名后、广播前写入 `chain_operations`（from、nonce、tx hash、状态）；广播/回执未知保持 `unknown` 并阻塞重试，系统不会用新 nonce 自动重发。需要人工按交易哈希核对链上结果。
+- **链上操作身份**：授权与赎回在签名后、广播前写入 `chain_operations`（from、nonce、tx hash、状态）；广播/回执未知保持 `unknown` 并阻塞重试，系统不会用新 nonce 自动重发。需要人工按交易哈希核对链上结果，可在网页「链上操作」查看待核对记录并填写核对人、说明与哈希；确认上链必须提供交易哈希，核对不会重发交易。
 - **合约与签名**：Predict.fun 订单使用 EIP-712（域名为 `predict.fun CTF Exchange`，链 ID 56 / 测试网 97），合约地址由官方 SDK 的 `Constants.ts` 生成到 `backend/internal/predictfun/addresses.go`（**生成文件，请勿手改**）。首次实盘前需要为交易所合约授权 USDT 与 ERC1155（`EnsureApprovals`，当前通过代码/接口触发，不静默自动授权）。
 
 ---
@@ -75,7 +75,7 @@
 - **预估年化收益率**：以「自动下单开始时间」到当前为窗口，把累计收益率按复利折算成一年：`年化 = (1 + 累计收益率)^(365 / 天数) - 1`。累计收益率取自当前账户的 `total_return`（已实现 + 浮动盈亏 / 初始本金或实盘基准），因此持仓未平仓时是浮动口径。不足 1 天不折算，直接显示「—」，避免几小时样本放大成三位数；本金亏尽时年化为 `-100%`。这是按当前速度线性外推的估算，不是对未来的预测。
 
 ### 4. 可视化工作台与工程底座
-- **六大核心视图**：账户总览、机会雷达、我的持仓、订单记录、参数设置、系统设置，支持深浅色主题切换与响应式布局。
+- **七大核心视图**：账户总览、机会雷达、我的持仓、订单记录、链上操作、参数设置、系统设置，支持深浅色主题切换与响应式布局。
 - **扫描与下单解耦（手动可选自动下单）**：手动点击「立即扫描」会先询问「仅扫描行情 / 扫描并自动下单」。仅扫描只更新行情、持仓盯市与净值快照；选择自动下单时，系统对**当前账户**执行一次自动买入，仅处理尚无持仓记录的盘口（已持仓、已结算或已止损卖出的盘口会跳过），并仍受单笔金额、单市场/总敞口/单事件敞口、尾盘窗口与未决订单熔断限制。该显式选择会覆盖当前账户的后台自动交易开关与引擎暂停状态一次；后台扫描引擎仍按各账户独立的自动交易开关执行策略。
 - **开箱即用与安全默认**：内置 SQLite 事务级自动迁移、优雅停机、请求体大小限制、安全响应头，默认仅监听本地回环地址（`127.0.0.1`），并通过 Go 竞态检测（`-race`）与前后端构建测试。
 
@@ -323,7 +323,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 - **网页凭据的存储方式**：私钥、L2 Secret 与 Passphrase 以 AES-256-GCM 加密写入 SQLite；密钥文件默认位于数据库旁（`<DATABASE_PATH>.key`，权限 `0600`）。请将数据库与密钥文件一同备份；丢失密钥将无法解密已保存的凭据。网页与 API 永远不会返回明文私钥。
 - 若未手动提供 L2 API 凭据，系统会在首次执行实盘操作时自动通过私钥派生。
-- **保存前先验证**：网页「系统设置 → 实盘交易凭据」提供「检测凭据」按钮（`POST /system/live/test`），它会用当前表单（未保存也可）派生 L2 凭据并读取抵押余额与授权额度，返回 Signer / Maker / 掩码后的 API Key。该检测只读、不落库、不下单，可用于确认私钥与 Funder、签名类型是否匹配。
+- **保存前先验证**：网页「系统设置 → 实盘交易凭据」提供「检测凭据」按钮（`POST /system/live/test`），它会用当前表单（未保存也可）派生 L2 凭据并读取抵押余额与授权额度，返回 Signer / Maker / 掩码后的 API Key。该检测只读、不落库、不下单，可用于确认私钥与 Funder、签名类型是否匹配。代理钱包模式下保存设置时，服务端还会重新发现并核对 Funder 的 Polygon 链、部署类型与 owner/signer 证据；未验证的 Funder 即使绕过网页直接调 API 也会被拒绝。
 - **开发者码（Builder Code）已内置**：`backend/internal/config/config.go` 中硬编码了 `BuilderCode`（及仅供识别的 `BuilderAddress`），实盘订单在签名前会写入该 `builder` 字段，用于把成交归因到对应 builder 档案并参与分佣。该值为公开标识，不是密钥，也不需要环境变量配置。
 - 请使用专用的小额热钱包，**切勿将私钥提交至 Git 仓库**；网页保存的私钥也应按同等敏感级别保护数据库与密钥文件。
 - **实盘资金口径说明**：实盘账户的「策略可用资金」计算公式为 `首次同步的钱包 pUSD 基准 + 已实现盈亏 − 当前未平仓成本`，同时界面会并列展示 CLOB 报告的「钱包 pUSD 余额」。该核算方式假设该钱包专用于本策略；若同一钱包内还有你在 Polymarket 手动交易的其他仓位，策略账面可用资金会与钱包真实余额产生偏差。
@@ -390,6 +390,8 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POST` | `/system/live/test` | 用请求体中的实盘凭据（`live` 与 `clob_base_url`，掩码值自动还原）做只读验证：派生 L2 凭据并读取余额/授权，返回 Signer、Maker、掩码 API Key 与耗时；不保存设置、不下单 |
 | `POST` | `/system/relayer/test` | 验证 Relayer API Key：`relayer_api_key` + `relayer_address`（需与私钥地址一致），调用 `GET /relayer/api/keys` 确认密钥有效；不保存、不提交交易 |
 | `POST` | `/system/live/funder` | 用私钥做 L1 鉴权，向 CLOB 查询该签名地址关联的 Proxy / Deposit 钱包，返回 `wallets`；不保存设置 |
+| `GET` | `/chain-operations` | 查询链上操作审计记录，支持 `account_id`、`venue`、`status`、`limit`、`offset`；默认按更新时间倒序 |
+| `POST` | `/chain-operations/:id/resolve` | 人工核对结果未知的链上操作。请求体：`{"status":"confirmed|reverted","reason":"核对说明","actor":"核对人","tx_hash":"0x..."}`；确认上链必须提供交易哈希，不会重启或重发交易 |
 | `GET` | `/auth/status` | 查询是否需要登录与当前会话是否有效（无需登录即可访问） |
 | `POST` | `/auth/login` | 使用访问密码登录，成功后在 `ph_session` Cookie 中下发会话 |
 | `POST` | `/auth/logout` | 退出登录并吊销当前会话 |
@@ -423,11 +425,12 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 在仓库根目录可直接运行：
 
 ```bash
-make test
+make test        # 后端竞态/vet/live 编译 + 前端类型检查/行为测试/构建
+make test-e2e    # Playwright 浏览器流程（内置 mock API，不连生产）
 make build
 ```
 
-或分步执行后端竞态测试、静态检查与前端生产构建：
+或分步执行后端竞态测试、静态检查与前端类型检查、行为测试、生产构建：
 
 ```bash
 cd backend
@@ -435,8 +438,37 @@ go test -race ./...
 go vet ./...
 
 cd ../frontend
+npm run typecheck
+npm run test
 npm run build
 ```
+
+离线扫描与查询基线见 `docs/reviews/2026-11-13-benchmarks.md`，复现：
+
+```bash
+cd backend
+env -u PREDICTFUN_LIVE go test -run '^$' -bench . -benchmem -count=3 ./internal/engine ./internal/store
+```
+
+离线测试不会编译或运行联网 smoke（`backend/internal/predictfun/live_smoke_test.go` 使用 `//go:build live`，环境变量不再影响普通 `go test`）。需要显式验证真实 Predict.fun 公开接口时：
+
+```bash
+make test-live
+# 等价于：cd backend && PREDICTFUN_LIVE=1 go test -tags live ./internal/predictfun -run 'TestLiveProvider' -v
+```
+
+该命令会访问外网，不属于 CI 离线流程；测试网结算映射再加 `PREDICTFUN_TESTNET=1`。
+
+### 只读账本导出（对账）
+
+`backend/cmd/ledger-export` 以 `mode=ro` + `PRAGMA query_only=1` 打开本地 SQLite，把账户、订单、持仓、链上操作与权益快照导出为版本化 JSON，供与 venue 流水人工核对；不读取设置/凭据表、不调用 venue API、不修改数据库：
+
+```bash
+cd backend
+go run ./cmd/ledger-export -db data/pennyharvester.db -account 1 -out ledger.json -pretty
+```
+
+输出字段、匹配规则与差异处理流程见 [docs/ledger-export.md](docs/ledger-export.md)。
 
 ---
 

@@ -20,13 +20,18 @@ import (
 
 func newSystemRouter(t *testing.T) (http.Handler, *store.SQLite) {
 	t.Helper()
+	return newSystemRouterWithExecutor(t, nil)
+}
+
+func newSystemRouterWithExecutor(t *testing.T, live engine.LiveExecutor) (http.Handler, *store.SQLite) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	repository, err := store.Open(context.Background(), ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { repository.Close() })
-	registry := apiTestRegistry(t, testProvider(), nil)
+	registry := apiTestRegistry(t, testProvider(), live)
 	instance, err := engine.New(context.Background(), repository, registry, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -243,10 +248,17 @@ func TestSystemSettingsProxyPersistence(t *testing.T) {
 }
 
 func TestSystemSettingsLiveCredentialsAreRedactedAndPreserved(t *testing.T) {
-	handler, repository := newSystemRouter(t)
-	ctx := context.Background()
 	key := "0x" + strings.Repeat("1", 64)
 	funder := "0x0000000000000000000000000000000000000002"
+	handler, repository := newSystemRouterWithExecutor(t, &apiWalletLive{
+		discovery: engine.WalletDiscovery{
+			Signer: "0x0000000000000000000000000000000000000001", Funder: funder,
+			WalletType: 1, Deployed: true, Verified: true, ChainID: 137,
+			Owner: "0x0000000000000000000000000000000000000001", Evidence: "polygon:137:owner",
+		},
+		environment: engine.LiveEnvironment{PrivateKeySet: true, SignatureType: 1},
+	})
+	ctx := context.Background()
 
 	update := request(t, handler, http.MethodPut, "/api/v1/system", map[string]any{
 		"data_source": map[string]any{

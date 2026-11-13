@@ -1,5 +1,4 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
+import { expect, it } from 'vitest'
 import type { FunderDiscoveryResult } from '@/types'
 import { assessDetectedWallet } from './wallet-verification.ts'
 
@@ -22,13 +21,20 @@ const evidence: FunderDiscoveryResult = {
   evidence: 'create2-derivation',
 }
 
-test('EOA mode does not require proxy wallet verification', () => {
+it('EOA mode does not require proxy wallet verification', () => {
   const result = assessDetectedWallet(null, 'eoa', '', 0)
-  assert.equal(result.status, 'not_required')
-  assert.equal(result.canSubmit, true)
+  expect(result.status).toBe('not_required')
+  expect(result.canSubmit).toBe(true)
 })
 
-test('bytecode-derived wallet type without evidence is only a candidate', () => {
+it('EOA mode rejects a funder because funds would not be on the signer', () => {
+  const result = assessDetectedWallet(null, 'eoa', funder, 0)
+  expect(result.status).toBe('unverified')
+  expect(result.canSubmit).toBe(false)
+  expect(result.reason).toContain('不应填写 Funder')
+})
+
+it('bytecode-derived wallet type without evidence is only a candidate', () => {
   const result = assessDetectedWallet(
     {
       ok: true,
@@ -43,16 +49,16 @@ test('bytecode-derived wallet type without evidence is only a candidate', () => 
     funder,
     3,
   )
-  assert.equal(result.status, 'candidate')
-  assert.equal(result.label, '未验证，请核对')
-  assert.equal(result.canSubmit, false)
-  assert.match(result.reason, /字节码形态本身不能证明/)
+  expect(result.status).toBe('candidate')
+  expect(result.label).toBe('未验证，请核对')
+  expect(result.canSubmit).toBe(false)
+  expect(result.reason).toMatch(/字节码形态本身不能证明/)
 })
 
-test('wrong chain or owner mismatch stays unverified', () => {
+it('wrong chain or owner mismatch stays unverified', () => {
   const wrongChain = assessDetectedWallet({ ...evidence, chain_id: 1 }, 'proxy', funder, 3)
-  assert.equal(wrongChain.status, 'candidate')
-  assert.equal(wrongChain.canSubmit, false)
+  expect(wrongChain.status).toBe('candidate')
+  expect(wrongChain.canSubmit).toBe(false)
 
   const wrongOwner = assessDetectedWallet(
     { ...evidence, owner: '0x4444444444444444444444444444444444444444' },
@@ -60,12 +66,34 @@ test('wrong chain or owner mismatch stays unverified', () => {
     funder,
     3,
   )
-  assert.equal(wrongOwner.status, 'candidate')
-  assert.match(wrongOwner.reason, /owner 与 signer 不一致/)
+  expect(wrongOwner.status).toBe('candidate')
+  expect(wrongOwner.reason).toMatch(/owner 与 signer 不一致/)
 })
 
-test('only explicit complete evidence verifies a proxy wallet', () => {
+it('funder and signature type must match the form being saved', () => {
+  const otherFunder = assessDetectedWallet(
+    { ...evidence, funder: '0x5555555555555555555555555555555555555555' },
+    'proxy',
+    funder,
+    3,
+  )
+  expect(otherFunder.status).toBe('candidate')
+  expect(otherFunder.reason).toMatch(/候选地址与当前 Funder 不一致/)
+
+  const otherType = assessDetectedWallet(evidence, 'proxy', funder, 1)
+  expect(otherType.status).toBe('candidate')
+  expect(otherType.reason).toMatch(/钱包类型与当前签名类型不一致/)
+})
+
+it('an undeployed wallet is never accepted', () => {
+  const result = assessDetectedWallet({ ...evidence, deployed: false }, 'proxy', funder, 3)
+  expect(result.status).toBe('candidate')
+  expect(result.canSubmit).toBe(false)
+  expect(result.reason).toMatch(/尚未在链上部署/)
+})
+
+it('only explicit complete evidence verifies a proxy wallet', () => {
   const result = assessDetectedWallet(evidence, 'proxy', funder, 3)
-  assert.equal(result.status, 'verified')
-  assert.equal(result.canSubmit, true)
+  expect(result.status).toBe('verified')
+  expect(result.canSubmit).toBe(true)
 })

@@ -7,6 +7,7 @@ import {
   Cog,
   FlaskConical,
   LayoutDashboard,
+  Link2,
   Menu,
   Radio,
   Settings2,
@@ -27,14 +28,15 @@ import { RiskNotice } from '@/components/risk-notice'
 import { ModeBadge } from '@/components/status-badges'
 import { ThemeToggle } from '@/components/theme-toggle'
 
-export type View = 'dashboard' | 'opportunities' | 'positions' | 'orders' | 'settings' | 'system'
+export type View = 'dashboard' | 'opportunities' | 'positions' | 'orders' | 'operations' | 'settings' | 'system'
 
 const navigation: { id: View; label: string; icon: LucideIcon; section?: string }[] = [
   { id: 'dashboard', label: '账户总览', icon: LayoutDashboard, section: '工作台' },
   { id: 'opportunities', label: '机会雷达', icon: Binoculars },
   { id: 'positions', label: '我的持仓', icon: WalletCards },
   { id: 'orders', label: '订单记录', icon: BookOpenCheck },
-  { id: 'settings', label: '参数设置', icon: Settings2, section: '系统' },
+  { id: 'operations', label: '链上操作', icon: Link2, section: '系统' },
+  { id: 'settings', label: '参数设置', icon: Settings2 },
   { id: 'system', label: '系统设置', icon: Cog },
 ]
 
@@ -43,6 +45,7 @@ const viewNames: Record<View, string> = {
   opportunities: '机会雷达',
   positions: '我的持仓',
   orders: '订单记录',
+  operations: '链上操作',
   settings: '参数设置',
   system: '系统设置',
 }

@@ -3,6 +3,9 @@ import type {
   AccountMode,
   AccountsResponse,
   AuthStatus,
+  ChainOperation,
+  ChainOperationsParams,
+  ChainOperationsResponse,
   Dashboard,
   DataSourceSettings,
   Engine,
@@ -20,6 +23,7 @@ import type {
   ProxyConfig,
   ProxyTestResult,
   RelayerProbeResult,
+  ResolveChainOperationBody,
   Settings,
   SystemSettings,
   Venue,
@@ -159,6 +163,26 @@ export const api = {
     venue?: Venue | null,
     signal?: AbortSignal,
   ) => request<OrdersResponse>(withVenue(withAccount(`/orders?status=${status}&limit=${limit}&offset=${offset}`, accountId), venue), { signal }),
+  /**
+   * List the durable chain-operation journal. Filters are optional and empty
+   * values are omitted; the UI's "all" status means "send no status".
+   */
+  chainOperations: (params: ChainOperationsParams = {}, signal?: AbortSignal) => {
+    const query = new URLSearchParams()
+    if (params.account_id) query.set('account_id', String(params.account_id))
+    if (params.venue) query.set('venue', params.venue)
+    if (params.status && params.status !== 'all') query.set('status', params.status)
+    if (params.limit !== undefined) query.set('limit', String(params.limit))
+    if (params.offset !== undefined) query.set('offset', String(params.offset))
+    const search = query.toString()
+    return request<ChainOperationsResponse>(`/chain-operations${search ? `?${search}` : ''}`, { signal })
+  },
+  /**
+   * Record an operator's manual chain check. This endpoint never signs or
+   * broadcasts a transaction; it only moves an unresolved row to a final state.
+   */
+  resolveChainOperation: (id: number, body: ResolveChainOperationBody, signal?: AbortSignal) =>
+    request<ChainOperation>(`/chain-operations/${id}/resolve`, { method: 'POST', body, signal }),
   settings: (signal?: AbortSignal, accountId?: number) =>
     request<Settings>(withAccount('/settings', accountId), { signal }),
   updateSettings: (settings: Settings, signal?: AbortSignal, accountId?: number) =>
