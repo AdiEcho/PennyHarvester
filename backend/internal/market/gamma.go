@@ -690,15 +690,56 @@ func (g *GammaClient) Get(ctx context.Context, id string) (Market, error) {
 // book is marked from a scan view that only carries markets ending in the
 // future, so every position in a market that already ended needs its own read.
 // Batching turns that from one GET per position (which blew the scan deadline
-// on a 10s cadence) into one request per chunk. A failed chunk keeps the rows
-// already parsed and reports the error once.
+// on a 10s cadence) into one request per chunk.
+//
+// The list route hides closed markets unless the caller asks for them, and a
+// settled market is exactly what the position book needs to see. Asking once
+// without the filter and once with closed=true keeps a book of expired
+// positions at two requests per chunk; only ids the list route still does not
+// return fall back to the single-market route, which has no such filter. A
+// missing row used to stay unmarked forever, which blocked that account's
+// stop-loss and entries on every scan. A failed read keeps the rows already
+// parsed and reports the error once.
 func (g *GammaClient) GetMany(ctx context.Context, ids []string) (map[string]Market, error) {
 	result := make(map[string]Market, len(ids))
-	if len(ids) == 0 {
+	requested := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		requested = append(requested, id)
+	}
+	if len(requested) == 0 {
 		return result, nil
 	}
-	const batchSize = 50
 	var failures []string
+	g.getManyChunks(ctx, requested, nil, result, &failures)
+	if missing := missingMarketIDs(requested, result); len(missing) > 0 {
+		g.getManyChunks(ctx, missing, url.Values{"closed": {"true"}}, result, &failures)
+	}
+	for _, id := range missingMarketIDs(requested, result) {
+		item, err := g.Get(ctx, id)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("市场 %s: %v", id, err))
+			continue
+		}
+		result[item.ID] = item
+	}
+	if len(failures) > 0 {
+		// A failing upstream reports the same reason once per pass, so repeated
+		// lines are dropped before they reach the scan error.
+		return result, fmt.Errorf("%s", strings.Join(uniqueMessages(failures), "; "))
+	}
+	return result, nil
+}
+
+// getManyChunks reads ids through the list route in chunks, merging every
+// parsed row into result. extra carries the filters a retry pass needs.
+func (g *GammaClient) getManyChunks(ctx context.Context, ids []string, extra url.Values, result map[string]Market, failures *[]string) {
+	const batchSize = 50
 	for start := 0; start < len(ids); start += batchSize {
 		end := start + batchSize
 		if end > len(ids) {
@@ -706,29 +747,51 @@ func (g *GammaClient) GetMany(ctx context.Context, ids []string) (map[string]Mar
 		}
 		query := url.Values{"include_tag": {"true"}, "limit": {strconv.Itoa(end - start)}}
 		for _, id := range ids[start:end] {
-			id = strings.TrimSpace(id)
-			if id != "" {
-				query.Add("id", id)
+			query.Add("id", id)
+		}
+		for key, values := range extra {
+			for _, value := range values {
+				query.Set(key, value)
 			}
 		}
 		var raw []gammaMarket
 		if err := g.getJSON(ctx, "/markets?"+query.Encode(), &raw); err != nil {
-			failures = append(failures, err.Error())
+			*failures = append(*failures, err.Error())
 			continue
 		}
 		for _, item := range raw {
 			parsed, err := parseGammaMarket(item)
 			if err != nil {
-				failures = append(failures, err.Error())
+				*failures = append(*failures, err.Error())
 				continue
 			}
 			result[parsed.ID] = parsed
 		}
 	}
-	if len(failures) > 0 {
-		return result, fmt.Errorf("%s", strings.Join(failures, "; "))
+}
+
+func missingMarketIDs(ids []string, result map[string]Market) []string {
+	missing := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := result[id]; !ok {
+			missing = append(missing, id)
+		}
 	}
-	return result, nil
+	return missing
+}
+
+// uniqueMessages keeps the first occurrence of each failure line.
+func uniqueMessages(messages []string) []string {
+	unique := make([]string, 0, len(messages))
+	seen := make(map[string]bool, len(messages))
+	for _, message := range messages {
+		if seen[message] {
+			continue
+		}
+		seen[message] = true
+		unique = append(unique, message)
+	}
+	return unique
 }
 
 // EventTags resolves Polymarket event tags in batches. The engine uses tags to

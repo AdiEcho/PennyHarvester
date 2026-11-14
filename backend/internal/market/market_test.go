@@ -543,6 +543,83 @@ func TestGammaClientGetManyBatchesIDs(t *testing.T) {
 	}
 }
 
+func TestGammaClientGetManyResolvesClosedMarkets(t *testing.T) {
+	var listCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/markets" {
+			t.Errorf("closed ids must stay on the batch route, got %s", r.URL.Path)
+			return
+		}
+		listCalls.Add(1)
+		// Gamma's list route omits closed markets unless closed=true is set.
+		if r.URL.Query().Get("closed") != "true" {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{
+			"id":"6978726","conditionId":"c-ended","question":"XRP Up or Down?","slug":"xrp-up-down",
+			"outcomes":["Up","Down"],"outcomePrices":["0","1"],
+			"clobTokenIds":["ended-up","ended-down"],"endDate":"2026-11-13T02:10:00Z",
+			"liquidity":"2500","volume":"90000","active":true,"closed":true,
+			"umaResolutionStatus":"resolved","acceptingOrders":false
+		}]`))
+	}))
+	defer server.Close()
+
+	client := NewGammaClient(server.URL, nil)
+	items, err := client.GetMany(context.Background(), []string{"6978726"})
+	if err != nil {
+		t.Fatalf("a closed market must resolve from the batch route: %v", err)
+	}
+	if listCalls.Load() != 2 {
+		t.Fatalf("expected one open pass and one closed retry, got %d calls", listCalls.Load())
+	}
+	item, ok := items["6978726"]
+	if !ok {
+		t.Fatalf("closed market missing from batch result: %+v", items)
+	}
+	if price, resolved := item.SettlementPrice("ended-down"); !resolved || price != 1 {
+		t.Fatalf("settlement not readable from the batch row: price=%v resolved=%v item=%+v", price, resolved, item)
+	}
+}
+
+func TestGammaClientGetManyFallsBackToSingleRead(t *testing.T) {
+	var listCalls, getCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/markets":
+			listCalls.Add(1)
+			_, _ = w.Write([]byte(`[]`))
+		case "/markets/archived-row":
+			getCalls.Add(1)
+			_, _ = w.Write([]byte(`{
+				"id":"archived-row","conditionId":"c-archived","question":"Archived market?","slug":"archived-market",
+				"outcomes":["Yes","No"],"outcomePrices":["1","0"],
+				"clobTokenIds":["archived-yes","archived-no"],"endDate":"2026-11-13T02:10:00Z",
+				"liquidity":"2500","volume":"90000","active":false,"closed":true,
+				"umaResolutionStatus":"resolved","acceptingOrders":false
+			}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewGammaClient(server.URL, nil)
+	items, err := client.GetMany(context.Background(), []string{"archived-row"})
+	if err != nil {
+		t.Fatalf("single-market fallback failed: %v", err)
+	}
+	if listCalls.Load() != 2 || getCalls.Load() != 1 {
+		t.Fatalf("expected two list passes then one single read, lists=%d gets=%d", listCalls.Load(), getCalls.Load())
+	}
+	if items["archived-row"].ID != "archived-row" {
+		t.Fatalf("fallback row not parsed: %+v", items)
+	}
+}
+
 func TestMarketRejectsInvalidEndDate(t *testing.T) {
 	raw := gammaMarket{ID: "1", Version: "v1", Outcomes: json.RawMessage(`["Yes","No"]`), OutcomePrices: json.RawMessage(`[0.9,0.1]`), ClobTokenIDs: json.RawMessage(`["a","b"]`), EndDate: time.Time{}.Format(time.RFC3339)}
 	// Zero time is valid RFC3339, so this verifies parsing rather than silently
