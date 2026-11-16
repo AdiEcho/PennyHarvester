@@ -1231,9 +1231,10 @@ type Metrics struct {
 	// strategy actually started trading. Nil until an auto entry exists, so a
 	// manually traded account never claims a strategy window it did not run.
 	AutoTradeStartedAt *time.Time `json:"auto_trade_started_at"`
-	// AnnualizedReturn compounds TotalReturn over AnnualizedDays since
-	// AutoTradeStartedAt. It stays 0 below one day: an annualized figure built
-	// on hours of samples is noise, not an estimate.
+	// AnnualizedReturn scales TotalReturn over AnnualizedDays since
+	// AutoTradeStartedAt. It stays 0 below thirty days: compounding a few days
+	// of fills produces a fantasy figure, not an estimate. Windows under a year
+	// scale linearly, longer ones compound.
 	AnnualizedReturn float64 `json:"annualized_return"`
 	// AnnualizedDays is the elapsed window in days, reported whenever an auto
 	// entry exists so the UI can show how long the estimate covers.

@@ -606,18 +606,32 @@ func sanitizeEquityPoint(p EquityPoint) EquityPoint {
 	return p
 }
 
-// annualizedReturn compounds a period return over the elapsed days. Below one
-// day it returns 0 instead of amplifying hours of noise into a three-digit
-// number, and a wiped-out book reports -100% rather than a NaN root.
+// minAnnualizedDays is the shortest strategy window allowed to carry a yearly
+// figure. A few days of fills is not a sample: the return over three days says
+// nothing about a year, and extrapolating it manufactures fantasy numbers.
+const minAnnualizedDays = 30
+
+// annualizedReturn scales a period return to a year. Below minAnnualizedDays it
+// returns 0, because compounding a handful of days turns an ordinary return into
+// an astronomical one (39% over 3.4 days compounds to 10^17 percent). Windows
+// shorter than a year scale linearly, the way a fund annualizes a partial
+// period, so the rate is reported without pretending the book compounds 100+
+// times; at exactly a year the two methods agree, so the switch has no jump.
+// A wiped-out book reports -100% rather than a NaN root or a sub -100% number.
 func annualizedReturn(totalReturn, days float64) float64 {
-	if days < 1 {
+	if days < minAnnualizedDays {
 		return 0
 	}
-	growth := 1 + totalReturn
-	if growth <= 0 {
+	if totalReturn <= -1 {
 		return -1
 	}
-	return math.Pow(growth, 365/days) - 1
+	if days < 365 {
+		if scaled := totalReturn * 365 / days; scaled > -1 {
+			return scaled
+		}
+		return -1
+	}
+	return math.Pow(1+totalReturn, 365/days) - 1
 }
 
 func sanitizeMetrics(m Metrics) Metrics {

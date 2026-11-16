@@ -836,7 +836,7 @@ func TestWinRateCountsStopLossAsLoss(t *testing.T) {
 
 // TestDashboardReportsAutoTradeStartAndAnnualizedReturn pins the two performance
 // read-outs: the account's first automatic buy marks the start of the strategy
-// window, and the annualized estimate compounds the booked return over it.
+// window, and the annualized estimate scales the booked return over it.
 func TestDashboardReportsAutoTradeStartAndAnnualizedReturn(t *testing.T) {
 	ctx := context.Background()
 	provider := &fakeProvider{markets: map[string]market.Market{
@@ -911,10 +911,86 @@ func TestDashboardReportsAutoTradeStartAndAnnualizedReturn(t *testing.T) {
 	if metrics.TotalReturn <= 0 {
 		t.Fatalf("the settled win must produce a positive return: %+v", metrics)
 	}
-	want := math.Pow(1+metrics.TotalReturn, 365/metrics.AnnualizedDays) - 1
+	// Thirty days is a partial period, so it is annualized linearly; compounding
+	// here would turn a modest return into an unusable number.
+	want := metrics.TotalReturn * 365 / metrics.AnnualizedDays
 	if math.Abs(metrics.AnnualizedReturn-want) > 1e-9 {
 		t.Fatalf("annualized return = %v, want %v (total return %v over %v days)",
 			metrics.AnnualizedReturn, want, metrics.TotalReturn, metrics.AnnualizedDays)
+	}
+}
+
+// annualizedWindow opens a strategy window of the given length over a book in
+// profit: the first automatic buy settles as a win, then an older automatic buy
+// is backdated to move the window start.
+func annualizedWindow(t *testing.T, window time.Duration) engine.Metrics {
+	t.Helper()
+	ctx := context.Background()
+	provider := &fakeProvider{markets: map[string]market.Market{
+		"auto": nearClose(binary("auto", 0.98, 20000, 2), 10*time.Minute),
+	}}
+	instance, repository := newTestEngine(t, provider, nil)
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if _, err := instance.UpdateAccount(ctx, paper.ID, nil, boolPointer(true), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolved := provider.markets["auto"]
+	resolved.Closed = true
+	resolved.Active = false
+	resolved.ResolutionStatus = "resolved"
+	resolved.Outcomes[0].Price = 1
+	resolved.Outcomes[1].Price = 0
+	provider.markets["auto"] = resolved
+	if err := instance.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateOrder(ctx, engine.Order{
+		AccountID: paper.ID, MarketID: "backdated", Question: "backdated", Outcome: "Yes",
+		TokenID: "backdated-yes", Kind: "auto", Type: "buy", Amount: 100, Price: 0.98,
+		Shares: 102, Status: "filled", Reason: "auto",
+		CreatedAt: time.Now().UTC().Add(-window),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err := instance.Dashboard(ctx, paper.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.Metrics.TotalReturn <= 0 {
+		t.Fatalf("window %v: the settled win must produce a positive return: %+v", window, dashboard.Metrics)
+	}
+	return dashboard.Metrics
+}
+
+// TestAnnualizedReturnOnlyScalesWindowsThatHaveEarnedIt pins the guard rails: a
+// window under a month publishes no yearly figure at all, a partial period
+// scales linearly, and only a window of a year or more compounds.
+func TestAnnualizedReturnOnlyScalesWindowsThatHaveEarnedIt(t *testing.T) {
+	// A few days of fills compound to 10^17 percent. Nothing about that is an
+	// estimate, so the dashboard withholds the number instead of printing it.
+	short := annualizedWindow(t, 5*24*time.Hour)
+	if math.Abs(short.AnnualizedDays-5) > 0.02 {
+		t.Fatalf("window should be about five days: %+v", short)
+	}
+	if short.AnnualizedReturn != 0 {
+		t.Fatalf("a five-day window must not be annualized: %+v", short)
+	}
+
+	month := annualizedWindow(t, 30*24*time.Hour)
+	if want := month.TotalReturn * 365 / month.AnnualizedDays; math.Abs(month.AnnualizedReturn-want) > 1e-9 {
+		t.Fatalf("a thirty-day window must scale linearly: annualized return = %v, want %v (%v over %v days)",
+			month.AnnualizedReturn, want, month.TotalReturn, month.AnnualizedDays)
+	}
+
+	// A window of a year or more compounds, because by then the return really is
+	// the product of twelve months of trading.
+	year := annualizedWindow(t, 400*24*time.Hour)
+	if want := math.Pow(1+year.TotalReturn, 365/year.AnnualizedDays) - 1; math.Abs(year.AnnualizedReturn-want) > 1e-9 {
+		t.Fatalf("a 400-day window must compound: annualized return = %v, want %v (%v over %v days)",
+			year.AnnualizedReturn, want, year.TotalReturn, year.AnnualizedDays)
 	}
 }
 

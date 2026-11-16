@@ -147,6 +147,19 @@ function EquityChart({ data, refreshing, mode, venue }: { data: EquityPoint[]; r
   )
 }
 
+// Mirrors minAnnualizedDays in backend/internal/engine/views.go. A window this
+// short has not traded through a market cycle yet, so scaling it up to a year
+// produces a fantasy figure (39% over 3.4 days compounds to 10^17 percent)
+// rather than an estimate. The backend withholds the number until the window
+// clears the threshold; the UI shows why instead of an em dash.
+const MIN_ANNUALIZED_DAYS = 30
+
+// formatWindow prints a strategy window in the unit that reads best: days once
+// it has run a full day, hours before that.
+function formatWindow(days: number) {
+  return days >= 1 ? `${formatNumber(days, 1)} 天` : `${formatNumber(days * 24, 1)} 小时`
+}
+
 function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: boolean }) {
   const isLive = metrics?.mode === 'live'
   // An account belongs to exactly one venue, so these numbers are never a
@@ -192,13 +205,15 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
       />
       <StatCard
         label="预估年化收益率"
-        value={metrics ? (metrics.annualized_days >= 1 ? formatPercent(metrics.annualized_return, 1, true) : '—') : '—'}
+        value={metrics ? (metrics.annualized_days >= MIN_ANNUALIZED_DAYS ? formatPercent(metrics.annualized_return, 1, true) : '—') : '—'}
         icon={TrendingUp}
         venue={venue}
         loading={loading}
-        detail={metrics ? (metrics.annualized_days >= 1
-          ? <span>按 {formatNumber(metrics.annualized_days, 1)} 天折算 · 累计 <span className={pnlClass(metrics.total_return)}>{formatPercent(metrics.total_return, 2, true)}</span></span>
-          : metrics.auto_trade_started_at ? '自动下单不足 1 天，暂不折算' : '尚未产生自动买入') : '正在加载账户数据'}
+        detail={metrics ? (metrics.annualized_days >= MIN_ANNUALIZED_DAYS
+          ? <span>按 {formatNumber(metrics.annualized_days, 1)} 天{metrics.annualized_days < 365 ? '线性' : '复利'}折算 · 累计 <span className={pnlClass(metrics.total_return)}>{formatPercent(metrics.total_return, 2, true)}</span></span>
+          : metrics.auto_trade_started_at
+            ? `已运行 ${formatWindow(metrics.annualized_days)}，满 ${MIN_ANNUALIZED_DAYS} 天才折算`
+            : '尚未产生自动买入') : '正在加载账户数据'}
       />
       <StatCard
         label="自动下单开始时间"
@@ -207,9 +222,7 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
         venue={venue}
         loading={loading}
         detail={metrics ? (metrics.auto_trade_started_at
-          ? (metrics.annualized_days >= 1
-            ? `首笔自动买入 · 距今 ${formatNumber(metrics.annualized_days, 1)} 天`
-            : `首笔自动买入 · 距今 ${formatNumber(metrics.annualized_days * 24, 1)} 小时`)
+          ? `首笔自动买入 · 距今 ${formatWindow(metrics.annualized_days)}`
           : '开启自动交易并成交后开始计时') : '正在加载账户数据'}
       />
     </div>
