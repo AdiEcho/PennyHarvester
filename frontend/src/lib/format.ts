@@ -1,3 +1,8 @@
+// Every instant the API returns is UTC. The UI prints it in Beijing time so an
+// operator reading the book and the exchange pages sees one clock regardless of
+// the browser's own timezone.
+export const DISPLAY_TIME_ZONE = 'Asia/Shanghai'
+
 // Money is formatted by fmtMoney() in lib/venue.ts so the venue currency is
 // always part of the string. There is deliberately no bare USD formatter here:
 // a USDT amount must never be rendered with a dollar sign.
@@ -39,6 +44,7 @@ export function formatDate(value: string | null, includeTime = true) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '时间未知'
   return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: DISPLAY_TIME_ZONE,
     month: '2-digit',
     day: '2-digit',
     ...(includeTime ? { hour: '2-digit', minute: '2-digit', hour12: false } : {}),
@@ -50,6 +56,7 @@ export function formatFullDate(value: string | null) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '时间未知'
   return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: DISPLAY_TIME_ZONE,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -64,6 +71,7 @@ export function formatAxisDate(value: string) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ''
   return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: DISPLAY_TIME_ZONE,
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',

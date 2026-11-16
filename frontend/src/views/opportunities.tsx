@@ -506,7 +506,7 @@ export function OpportunitiesView({ onOrderCreated }: { onOrderCreated: () => vo
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-slate-100 pt-3 text-[11px] text-slate-400">
           <span>毛收益 = (1 − 价格) / 价格（未计手续费）</span>
           <span>盘口估算净收益 = 实时盘口成交价 + 真实手续费，按「参数设置 → 场所单笔金额」{scopedOrderSize > 0 ? `（${fmtMoney(scopedOrderSize, scope === 'all' ? accountVenue : scope)}）` : '（逐场所）'}估算，非最终结算收益</span>
-          <span>到期时间按本地时区显示</span>
+          <span>到期时间按北京时间（UTC+8）显示</span>
           <span>立即扫描会先询问是否执行自动交易（含止损卖出）；自动买入只处理当前账户尚无持仓记录的盘口</span>
           <span>默认分类来自「参数设置」；体育赛事盘口默认按加时/波动风险过滤</span>
           <span>{marketLanguage === 'zh' ? '市场问题与方向优先使用中文文案' : '市场问题与方向显示英文原文'}</span>

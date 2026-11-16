@@ -217,7 +217,7 @@ export function AppShell({ view, onNavigate, children }: { view: View; onNavigat
             <RiskNotice />
             <div className="mt-4 flex flex-col gap-1 text-[11px] text-slate-400 sm:flex-row sm:items-center sm:justify-between">
               <span>{isLive ? `PennyHarvester · ${venueLabel(venueOf(account))} 实盘交易模式` : `PennyHarvester · ${venueLabel(venueOf(account))} 模拟演练模式`}</span>
-              <span className="flex items-center gap-1.5"><Activity className="h-3 w-3" /> 页面开启时每 20 秒自动同步最新数据</span>
+              <span className="flex items-center gap-1.5"><Activity className="h-3 w-3" /> 页面开启时每 20 秒自动同步最新数据 · 时间均为北京时间（UTC+8）</span>
             </div>
           </footer>
         </main>
