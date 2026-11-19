@@ -7,6 +7,7 @@ import type {
   ChainOperationsParams,
   ChainOperationsResponse,
   Dashboard,
+  EquityRange,
   DataSourceSettings,
   Engine,
   FunderDiscoveryResult,
@@ -123,6 +124,13 @@ function withVenue(path: string, venue?: Venue | null): string {
   return `${path}${path.includes('?') ? '&' : '?'}venue=${encodeURIComponent(venue)}`
 }
 
+// The equity window is resolved server-side, so the UI only sends the key it
+// shows and never has to translate days into timestamps.
+function withRange(path: string, range?: EquityRange): string {
+  if (!range) return path
+  return `${path}${path.includes('?') ? '&' : '?'}range=${encodeURIComponent(range)}`
+}
+
 export const api = {
   health: (signal?: AbortSignal) => request<Health>('/health', { signal }),
   accounts: (signal?: AbortSignal) => request<AccountsResponse>('/accounts', { signal }),
@@ -132,8 +140,8 @@ export const api = {
     request<Account>(`/accounts/${id}`, { method: 'PATCH', body, signal }),
   deleteAccount: (id: number, signal?: AbortSignal) =>
     request<void>(`/accounts/${id}`, { method: 'DELETE', signal }),
-  dashboard: (accountId: number | undefined, signal?: AbortSignal) =>
-    request<Dashboard>(withAccount('/dashboard', accountId), { signal }),
+  dashboard: (accountId: number | undefined, signal?: AbortSignal, range?: EquityRange) =>
+    request<Dashboard>(withRange(withAccount('/dashboard', accountId), range), { signal }),
   getVenues: (signal?: AbortSignal) =>
     request<VenuesResponse>('/venues', { signal }).then((response) => response?.venues ?? []),
   opportunities: (venue?: Venue | null, signal?: AbortSignal, accountId?: number) =>

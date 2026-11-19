@@ -186,6 +186,21 @@ func TestHealthAndPaperOrderAPI(t *testing.T) {
 	}
 }
 
+func TestDashboardEquityRangeAPI(t *testing.T) {
+	handler, _ := setupRouter(t)
+	paperID := accountID(t, handler, engine.AccountModePaper)
+	for _, window := range []string{"1d", "3d", "7d", "15d", "1m"} {
+		response := request(t, handler, http.MethodGet, "/api/v1/dashboard?account_id="+itoa(paperID)+"&range="+window, nil)
+		if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"equity"`)) {
+			t.Fatalf("range %s failed: %d %s", window, response.Code, response.Body.String())
+		}
+	}
+	invalid := request(t, handler, http.MethodGet, "/api/v1/dashboard?account_id="+itoa(paperID)+"&range=2w", nil)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported range = %d %s, want 400", invalid.Code, invalid.Body.String())
+	}
+}
+
 func TestOpportunityQuoteAPI(t *testing.T) {
 	handler, _ := setupRouterWithLive(t, quoteLive{})
 	scan := request(t, handler, http.MethodPost, "/api/v1/scan", nil)

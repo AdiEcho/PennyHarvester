@@ -271,12 +271,34 @@ func (h *Handler) deleteAccount(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// equityRanges is the dashboard's supported trailing windows. The keys are the
+// API's range values, so the UI sends exactly the label it shows and the server
+// owns the duration.
+var equityRanges = map[string]time.Duration{
+	"1d":  24 * time.Hour,
+	"3d":  3 * 24 * time.Hour,
+	"7d":  7 * 24 * time.Hour,
+	"15d": 15 * 24 * time.Hour,
+	"1m":  30 * 24 * time.Hour,
+}
+
 func (h *Handler) dashboard(c *gin.Context) {
 	accountID, ok := accountIDFromQuery(c)
 	if !ok {
 		return
 	}
-	dashboard, err := h.engine.Dashboard(c.Request.Context(), accountID)
+	var dashboard engine.Dashboard
+	var err error
+	if rawRange := c.Query("range"); rawRange != "" {
+		window, supported := equityRanges[rawRange]
+		if !supported {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "range 仅支持 1d、3d、7d、15d、1m"})
+			return
+		}
+		dashboard, err = h.engine.DashboardRange(c.Request.Context(), accountID, window)
+	} else {
+		dashboard, err = h.engine.Dashboard(c.Request.Context(), accountID)
+	}
 	if err != nil {
 		respondError(c, err)
 		return

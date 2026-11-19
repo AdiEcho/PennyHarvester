@@ -116,6 +116,8 @@ export interface Source {
   last_sync_at: string | null
 }
 
+export type EquityRange = '1d' | '3d' | '7d' | '15d' | '1m'
+
 export interface EquityPoint {
   time: string
   value: number

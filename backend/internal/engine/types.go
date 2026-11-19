@@ -1412,6 +1412,9 @@ type Repository interface {
 	SettlePosition(context.Context, Position, Order) error
 	AddSnapshot(context.Context, int64, EquityPoint) error
 	ListSnapshots(context.Context, int64, int) ([]EquityPoint, error)
+	// ListSnapshotWindow returns the last snapshot at or before since as the
+	// window anchor, followed by every snapshot after since in write order.
+	ListSnapshotWindow(context.Context, int64, time.Time) (*EquityPoint, []EquityPoint, error)
 }
 
 func opportunityFor(m market.Market, outcome market.Outcome, now time.Time) Opportunity {

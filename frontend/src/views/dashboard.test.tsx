@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
@@ -128,5 +128,20 @@ describe('estimated annualized return', () => {
     expect(card.getByText('—', { exact: true })).toBeVisible()
     expect(card.getByText('等待运行时长累积')).toBeVisible()
     expect(card.queryByText(/满 30 天才折算/)).not.toBeInTheDocument()
+  })
+})
+
+describe('equity range selector', () => {
+  it('requests the chosen window while keeping the rest of the dashboard mounted', async () => {
+    vi.mocked(api.dashboard).mockResolvedValue(dashboard)
+    render(<DashboardView onOpenOrders={vi.fn()} />)
+    await screen.findByText('暂无资金曲线')
+    expect(api.dashboard).toHaveBeenLastCalledWith(1, expect.any(AbortSignal), '1d')
+
+    fireEvent.click(screen.getByRole('button', { name: '7天' }))
+
+    await waitFor(() => expect(api.dashboard).toHaveBeenLastCalledWith(1, expect.any(AbortSignal), '7d'))
+    expect(screen.getByText('预估年化收益率')).toBeVisible()
+    expect(screen.getByRole('button', { name: '7天' })).toHaveAttribute('aria-pressed', 'true')
   })
 })

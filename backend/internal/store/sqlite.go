@@ -268,6 +268,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_orders_account_status_id ON orders(account_id, status, id DESC);
 	CREATE INDEX IF NOT EXISTS idx_orders_unresolved_account ON orders(account_id, id) WHERE status IN ('pending', 'unknown');
 	CREATE INDEX IF NOT EXISTS idx_snapshots_account_id ON equity_snapshots(account_id, id DESC);
+	CREATE INDEX IF NOT EXISTS idx_snapshots_account_time ON equity_snapshots(account_id, time);
 	CREATE INDEX IF NOT EXISTS idx_chain_operations_status_id ON chain_operations(status, id);
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_operations_active_redeem ON chain_operations(account_id, position_id) WHERE kind = 'redeem' AND status IN ('intent', 'signed', 'broadcast', 'unknown');
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_operations_active_approve ON chain_operations(account_id, venue) WHERE kind = 'approve' AND status IN ('intent', 'signed', 'broadcast', 'unknown');`

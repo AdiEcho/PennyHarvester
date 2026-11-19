@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   ArrowDownRight,
@@ -22,6 +22,7 @@ import {
   Area,
   CartesianGrid,
   Line,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -31,8 +32,8 @@ import {
 import { api } from '@/lib/api'
 import { useAccount } from '@/lib/account-context'
 import { usePolling } from '@/hooks/usePolling'
-import type { AccountMode, EquityPoint, Metrics } from '@/types'
-import { formatAxisDate, formatDate, formatFullDate, formatNumber, formatPercent, pnlClass } from '@/lib/format'
+import type { AccountMode, EquityPoint, EquityRange, Metrics } from '@/types'
+import { formatDate, formatFullDate, formatNumber, formatPercent, formatWindowAxis, pnlClass } from '@/lib/format'
 import { fmtMoney, fmtMoneyAxis, venueMeta, venueOf, type Venue } from '@/lib/venue'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
@@ -42,6 +43,17 @@ import { EmptyState, ErrorState, Skeleton } from '@/components/ui/feedback'
 import { InlineError, PageHeader } from '@/components/page-header'
 import { OrderModeBadge, OrderStatusBadge, VenueChip } from '@/components/status-badges'
 import { orderTypeLabel } from '@/views/orders'
+
+// The dashboard resolves the equity window on the server, so these keys are
+// exactly the range values the API accepts.
+const EQUITY_RANGES: Array<{ key: EquityRange; label: string }> = [
+  { key: '1d', label: '1天' },
+  { key: '3d', label: '3天' },
+  { key: '7d', label: '7天' },
+  { key: '15d', label: '15天' },
+  { key: '1m', label: '1月' },
+]
+const DEFAULT_EQUITY_RANGE: EquityRange = '1d'
 
 function StatCard({ label, value, detail, icon: Icon, venue, accent, loading }: {
   label: string
@@ -70,31 +82,61 @@ function StatCard({ label, value, detail, icon: Icon, venue, accent, loading }: 
   )
 }
 
-function EquityTooltip({ active, payload, mode, venue }: { active?: boolean; payload?: Array<{ payload: EquityPoint }>; mode: AccountMode; venue: Venue }) {
+function EquityTooltip({ active, payload, mode, venue, baseline }: { active?: boolean; payload?: Array<{ payload: EquityPoint }>; mode: AccountMode; venue: Venue; baseline: number }) {
   if (!active || !payload?.length) return null
   const point = payload[0].payload
+  const change = point.value - baseline
   return (
-    <div className="min-w-[170px] rounded-xl border border-slate-200 bg-surface/95 p-3.5 shadow-float backdrop-blur">
+    <div className="min-w-[190px] rounded-xl border border-slate-200 bg-surface/95 p-3.5 shadow-float backdrop-blur">
       <p className="text-xs text-slate-500">{formatFullDate(point.time)}</p>
       <div className="mt-2 flex items-center justify-between gap-5">
         <span className="flex items-center gap-2 text-xs text-slate-500"><span className="h-0.5 w-4 rounded bg-[var(--series-equity)]" />{mode === 'live' ? '实盘权益' : '模拟权益'}</span>
         <span className="text-sm font-semibold text-slate-900">{fmtMoney(point.value, point.venue ?? venue)}</span>
       </div>
+      {Number.isFinite(baseline) && (
+        <div className="mt-1.5 flex items-center justify-between gap-5 border-t border-slate-100 pt-1.5">
+          <span className="text-xs text-slate-500">区间变化</span>
+          <span className={cn('text-xs font-medium tabular-nums', pnlClass(change))}>{fmtMoney(change, point.venue ?? venue, { signed: true })}{baseline > 0 ? ` · ${formatPercent(change / baseline, 2, true)}` : ''}</span>
+        </div>
+      )}
     </div>
   )
 }
 
-function EquityChart({ data, refreshing, mode, venue }: { data: EquityPoint[]; refreshing: boolean; mode: AccountMode; venue: Venue }) {
+function EquityChart({ data, refreshing, mode, venue, range, onRangeChange }: {
+  data: EquityPoint[]
+  refreshing: boolean
+  mode: AccountMode
+  venue: Venue
+  range: EquityRange
+  onRangeChange: (range: EquityRange) => void
+}) {
   const [view, setView] = useState<'chart' | 'table'>('chart')
   const label = mode === 'live' ? '实盘权益' : '模拟权益'
   const meta = venueMeta(venue)
+  // Recharts needs a numeric axis to scale hours and days evenly; a category
+  // axis spaces points by index and would distort an interval with gaps.
+  const chartData = useMemo(() => data.map((point) => ({ ...point, ts: Date.parse(point.time) })), [data])
+  const first = chartData[0]
+  const last = chartData[chartData.length - 1]
+  const hasWindow = chartData.length > 1
+  const change = hasWindow ? last.value - first.value : 0
+  const changeRatio = hasWindow && first.value > 0 ? change / first.value : 0
+  const high = hasWindow ? Math.max(...chartData.map((point) => point.value)) : 0
+  const low = hasWindow ? Math.min(...chartData.map((point) => point.value)) : 0
+  const windowLabel = EQUITY_RANGES.find((option) => option.key === range)?.label ?? range
+  // A single snapshot has no span, so a dataMin/dataMax domain would collapse
+  // to zero width; pad half an hour around it so the point still renders.
+  const xDomain = chartData.length === 1
+    ? [first.ts - 30 * 60 * 1000, first.ts + 30 * 60 * 1000]
+    : ['dataMin', 'dataMax']
 
   return (
     <Card className="min-w-0 xl:col-span-2">
       <CardHeader className="flex-col gap-4 space-y-0 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-2"><CardTitle>权益曲线</CardTitle><VenueChip venue={venue} /></div>
-          <CardDescription className="mt-1">{meta.label} · {label} · {meta.currency} · {data.length} 个记录点</CardDescription>
+          <CardDescription className="mt-1">{meta.label} · {label} · {meta.currency} · 近{windowLabel} · {data.length} 个采样点</CardDescription>
         </div>
         <div className="flex shrink-0 self-start rounded-lg border border-slate-200 bg-slate-50 p-1" aria-label="权益数据展示方式">
           <button className={cn('flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-xs transition', view === 'chart' ? 'bg-surface font-medium text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800')} onClick={() => setView('chart')} aria-pressed={view === 'chart'}>
@@ -106,12 +148,28 @@ function EquityChart({ data, refreshing, mode, venue }: { data: EquityPoint[]; r
         </div>
       </CardHeader>
       <CardContent>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1" role="group" aria-label="权益曲线时间范围">
+            {EQUITY_RANGES.map((option) => (
+              <button key={option.key} type="button" className={cn('h-7 whitespace-nowrap rounded-md px-2.5 text-xs transition', range === option.key ? 'bg-surface font-medium text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800')} onClick={() => onRangeChange(option.key)} aria-pressed={range === option.key}>
+                {option.label}
+              </button>
+            ))}
+          </div>
+          {hasWindow && (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+              <span>区间变化 <span className={cn('font-medium tabular-nums', pnlClass(change))}>{fmtMoney(change, venue, { signed: true })} · {formatPercent(changeRatio, 2, true)}</span></span>
+              <span className="hidden sm:inline">最高 <span className="font-medium tabular-nums text-slate-700">{fmtMoney(high, venue)}</span></span>
+              <span className="hidden sm:inline">最低 <span className="font-medium tabular-nums text-slate-700">{fmtMoney(low, venue)}</span></span>
+            </div>
+          )}
+        </div>
         {data.length === 0 ? (
           <EmptyState compact icon={TrendingUp} title="暂无资金曲线" description="完成首次市场扫描或产生交易后，这里会自动绘出你的账户净值变化趋势。" />
         ) : view === 'table' ? (
           <div className="scrollbar-thin max-h-[310px] overflow-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-sm">
-              <caption className="sr-only">{label}历史数据（{meta.currency}）</caption>
+              <caption className="sr-only">{label}近{windowLabel}历史数据（{meta.currency}）</caption>
               <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                 <tr><th className="px-4 py-3 font-medium">记录时间</th><th className="px-4 py-3 text-right font-medium">{label}（{meta.currency}）</th></tr>
               </thead>
@@ -123,9 +181,9 @@ function EquityChart({ data, refreshing, mode, venue }: { data: EquityPoint[]; r
             </table>
           </div>
         ) : (
-          <div className={cn('h-[310px] w-full transition-opacity', refreshing && 'opacity-60')} role="img" aria-label={`${meta.label}${label}（${meta.currency}）随时间变化的折线图；也可切换为数据表查看`}>
+          <div className={cn('h-[310px] w-full transition-opacity', refreshing && 'opacity-60')} role="img" aria-label={`${meta.label}${label}近${windowLabel}（${meta.currency}）随时间变化的折线图；也可切换为数据表查看`}>
             <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={data} margin={{ top: 12, right: 8, left: 0, bottom: 0 }}>
+              <ComposedChart data={chartData} margin={{ top: 12, right: 8, left: 0, bottom: 0 }}>
                 <defs>
                   <linearGradient id="equityArea" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="var(--series-equity)" stopOpacity={0.12} />
@@ -133,11 +191,12 @@ function EquityChart({ data, refreshing, mode, venue }: { data: EquityPoint[]; r
                   </linearGradient>
                 </defs>
                 <CartesianGrid vertical={false} stroke="var(--chart-grid)" strokeWidth={1} />
-                <XAxis dataKey="time" tickFormatter={formatAxisDate} tickLine={false} axisLine={false} minTickGap={42} tickMargin={12} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
+                <XAxis dataKey="ts" type="number" scale="time" domain={xDomain} tickFormatter={(value: number) => formatWindowAxis(value, range)} tickLine={false} axisLine={false} minTickGap={42} tickMargin={12} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
                 <YAxis tickFormatter={fmtMoneyAxis} tickLine={false} axisLine={false} width={82} tickCount={5} domain={['auto', 'auto']} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
-                <Tooltip content={<EquityTooltip mode={mode} venue={venue} />} cursor={{ stroke: 'var(--chart-muted)', strokeWidth: 1 }} isAnimationActive={false} />
+                <Tooltip content={<EquityTooltip mode={mode} venue={venue} baseline={first?.value ?? 0} />} cursor={{ stroke: 'var(--chart-muted)', strokeWidth: 1 }} isAnimationActive={false} />
+                {hasWindow && <ReferenceLine y={first.value} stroke="var(--chart-muted)" strokeDasharray="4 4" strokeOpacity={0.55} />}
                 <Area type="monotone" dataKey="value" stroke="none" fill="url(#equityArea)" isAnimationActive={false} />
-                <Line type="monotone" dataKey="value" name={label} stroke="var(--series-equity)" strokeWidth={2} dot={data.length === 1 ? { r: 4, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 } : false} activeDot={{ r: 5, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 }} isAnimationActive={false} />
+                <Line type="monotone" dataKey="value" name={label} stroke="var(--series-equity)" strokeWidth={2} dot={chartData.length === 1 ? { r: 4, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 } : false} activeDot={{ r: 5, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 }} isAnimationActive={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </div>
@@ -229,10 +288,22 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
 
 export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
   const { account, accountId, isLoading: accountLoading } = useAccount()
-  const fetchDashboard = useCallback((signal: AbortSignal) => api.dashboard(accountId, signal), [accountId])
+  const [range, setRange] = useState<EquityRange>(DEFAULT_EQUITY_RANGE)
+  // usePolling clears its data whenever the fetcher identity changes. Keeping
+  // the window in a ref lets the fetcher stay stable while a range switch
+  // refreshes in place, so the rest of the dashboard never flashes.
+  const rangeRef = useRef<EquityRange>(DEFAULT_EQUITY_RANGE)
+  const fetchDashboard = useCallback((signal: AbortSignal) => api.dashboard(accountId, signal, rangeRef.current), [accountId])
   const fetchOrders = useCallback((signal: AbortSignal) => api.orders(accountId, 'all', 6, 0, null, signal), [accountId])
   const dashboard = usePolling(fetchDashboard, { enabled: Boolean(accountId) })
   const orders = usePolling(fetchOrders, { enabled: Boolean(accountId) })
+  const { refresh: refreshDashboard } = dashboard
+  const changeRange = useCallback((next: EquityRange) => {
+    if (next === rangeRef.current) return
+    rangeRef.current = next
+    setRange(next)
+    refreshDashboard()
+  }, [refreshDashboard])
   const data = dashboard.data
   const mode: AccountMode = account?.mode || 'paper'
   const isLive = mode === 'live'
@@ -256,7 +327,7 @@ export function DashboardView({ onOpenOrders }: { onOpenOrders: () => void }) {
       <MetricsCards metrics={data?.metrics || null} loading={loading} />
 
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
-        {loading ? <Card className="xl:col-span-2"><div className="p-6"><Skeleton className="h-5 w-32" /><Skeleton className="mt-8 h-[260px] w-full" /></div></Card> : data ? <EquityChart data={data.equity} refreshing={dashboard.isRefreshing} mode={mode} venue={venue} /> : <Card className="xl:col-span-2"><ErrorState message={dashboard.error || '暂无总览数据。'} onRetry={dashboard.refresh} /></Card>}
+        {loading ? <Card className="xl:col-span-2"><div className="p-6"><Skeleton className="h-5 w-32" /><Skeleton className="mt-8 h-[260px] w-full" /></div></Card> : data ? <EquityChart data={data.equity} refreshing={dashboard.isRefreshing} mode={mode} venue={venue} range={range} onRangeChange={changeRange} /> : <Card className="xl:col-span-2"><ErrorState message={dashboard.error || '暂无总览数据。'} onRetry={dashboard.refresh} /></Card>}
 
         <Card>
           <CardHeader className="flex-row items-start justify-between space-y-0">

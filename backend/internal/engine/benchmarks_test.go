@@ -75,6 +75,10 @@ func (r *benchRepository) ListSnapshots(context.Context, int64, int) ([]EquityPo
 	return nil, nil
 }
 
+func (r *benchRepository) ListSnapshotWindow(context.Context, int64, time.Time) (*EquityPoint, []EquityPoint, error) {
+	return nil, nil, nil
+}
+
 func (r *benchRepository) AddSnapshot(_ context.Context, accountID int64, point EquityPoint) error {
 	// A scan appends one snapshot per account per iteration. Keeping only the
 	// newest point keeps the fake repository bounded; SQLite persistence is

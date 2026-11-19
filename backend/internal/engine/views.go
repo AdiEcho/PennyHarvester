@@ -370,6 +370,20 @@ func (e *Engine) Orders(ctx context.Context, accountID int64, status string, lim
 }
 
 func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, error) {
+	return e.dashboard(ctx, accountID, 0)
+}
+
+// DashboardRange returns the same dashboard with the equity series clipped to
+// the trailing window. A non-positive window keeps the legacy, fixed-length
+// series so existing callers stay unchanged.
+func (e *Engine) DashboardRange(ctx context.Context, accountID int64, window time.Duration) (Dashboard, error) {
+	if window <= 0 {
+		return e.Dashboard(ctx, accountID)
+	}
+	return e.dashboard(ctx, accountID, window)
+}
+
+func (e *Engine) dashboard(ctx context.Context, accountID int64, window time.Duration) (Dashboard, error) {
 	account, err := e.ResolveAccount(ctx, accountID)
 	if err != nil {
 		return Dashboard{}, err
@@ -474,15 +488,9 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	if err != nil {
 		return Dashboard{}, err
 	}
-	points, err := e.repo.ListSnapshots(ctx, account.ID, 500)
+	points, err := e.equityHistory(ctx, account, window, metrics.Equity)
 	if err != nil {
 		return Dashboard{}, err
-	}
-	if len(points) == 0 {
-		points = []EquityPoint{{
-			Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
-			Time: time.Now().UTC(), Value: metrics.Equity,
-		}}
 	}
 	for i := range points {
 		points[i] = sanitizeEquityPoint(points[i])
@@ -499,6 +507,98 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 		Source:  source,
 		Equity:  points,
 	}, nil
+}
+
+const (
+	// maxEquityPoints keeps the chart payload small enough to switch ranges
+	// without a visible hitch while still preserving the last value in each
+	// bucket; 300 points covers the whole chart width at any sensible size.
+	maxEquityPoints = 300
+	// legacyEquityPoints is the fixed series callers without a window keep
+	// receiving, so their responses and tests stay byte-identical.
+	legacyEquityPoints = 500
+)
+
+// equityHistory builds the series the dashboard plots. Without a window it
+// keeps the legacy newest-N behaviour; with one it anchors the series at the
+// last value from before the window, so the chart starts at the equity that
+// window actually began with.
+func (e *Engine) equityHistory(ctx context.Context, account Account, window time.Duration, current float64) ([]EquityPoint, error) {
+	now := time.Now().UTC()
+	fallback := EquityPoint{
+		Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
+		Time: now, Value: current,
+	}
+	if window <= 0 {
+		points, err := e.repo.ListSnapshots(ctx, account.ID, legacyEquityPoints)
+		if err != nil {
+			return nil, err
+		}
+		if len(points) == 0 {
+			return []EquityPoint{fallback}, nil
+		}
+		return points, nil
+	}
+	since := now.Add(-window)
+	boundary, points, err := e.repo.ListSnapshotWindow(ctx, account.ID, since)
+	if err != nil {
+		return nil, err
+	}
+	if len(points) == 0 {
+		points = []EquityPoint{fallback}
+	}
+	return equityWindowSeries(boundary, points, since, now, maxEquityPoints), nil
+}
+
+// equityWindowSeries prepends the window's opening anchor and downsamples the
+// in-window points to at most maxPoints buckets by keeping the last point in
+// each bucket. Keeping the last point preserves the current value at the right
+// edge of the chart; averaging would smooth away spikes the operator needs to
+// see. Both time bounds are clamped to the window so a series can never claim
+// to start outside it.
+func equityWindowSeries(boundary *EquityPoint, points []EquityPoint, since, now time.Time, maxPoints int) []EquityPoint {
+	if maxPoints < 1 {
+		maxPoints = 1
+	}
+	series := make([]EquityPoint, 0, maxPoints+1)
+	if boundary != nil {
+		start := *boundary
+		start.Time = since
+		series = append(series, start)
+	}
+	if len(points) <= maxPoints {
+		for _, point := range points {
+			point.Time = clampToWindow(point.Time, since, now)
+			series = append(series, point)
+		}
+		return series
+	}
+	width := now.Sub(since) / time.Duration(maxPoints)
+	if width < time.Second {
+		width = time.Second
+	}
+	bucket := time.Time{}
+	for i, point := range points {
+		point.Time = clampToWindow(point.Time, since, now)
+		current := point.Time.Truncate(width)
+		if i == 0 || current.After(bucket) {
+			series = append(series, point)
+			bucket = current
+			continue
+		}
+		series[len(series)-1] = point
+	}
+	return series
+}
+
+func clampToWindow(value, since, now time.Time) time.Time {
+	if value.Before(since) {
+		return since
+	}
+	if value.After(now) {
+		return now
+	}
+	return value
 }
 
 func (e *Engine) ensureLiveBaseline(ctx context.Context, account Account, openExposure, realized float64) Account {

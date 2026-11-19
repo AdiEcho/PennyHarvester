@@ -36,6 +36,14 @@ describe('api request contract', () => {
     )
   })
 
+  it('appends the equity range as the last dashboard parameter', async () => {
+    fetchMock.mockResolvedValueOnce(json({ equity: [] }))
+
+    await api.dashboard(7, undefined, '15d')
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/dashboard?account_id=7&range=15d')
+  })
+
   it('omits the UI-only all status and empty chain-operation filters', async () => {
     fetchMock.mockResolvedValueOnce(json({ items: [], total: 0, limit: 50, offset: 0 }))
 

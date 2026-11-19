@@ -1,3 +1,5 @@
+import type { EquityRange } from '@/types'
+
 // Every instant the API returns is UTC. The UI prints it in Beijing time so an
 // operator reading the book and the exchange pages sees one clock regardless of
 // the browser's own timezone.
@@ -67,15 +69,20 @@ export function formatFullDate(value: string | null) {
   }).format(date)
 }
 
-export function formatAxisDate(value: string) {
+// Equity axes need different labels per window: a 1d chart is read by clock
+// time, 3d needs the date to tell days apart, and longer windows only need the
+// date. The chart passes the already-parsed timestamp so ticks stay numeric.
+export function formatWindowAxis(value: number, range: EquityRange) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ''
+  const options: Intl.DateTimeFormatOptions = range === '1d'
+    ? { hour: '2-digit', minute: '2-digit' }
+    : range === '3d'
+      ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+      : { month: '2-digit', day: '2-digit' }
   return new Intl.DateTimeFormat('zh-CN', {
     timeZone: DISPLAY_TIME_ZONE,
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
+    ...options,
     hour12: false,
   }).format(date)
 }

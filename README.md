@@ -378,7 +378,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper","venue":"predictfun","initial_bankroll":25000}`（`venue` 省略时默认为 `polymarket`，创建后不可更改；`initial_bankroll` 仅对模拟账户生效，省略或为 `0` 时使用当前账户策略里的默认资金，负数返回 400） |
 | `PATCH` | `/accounts/:id` | 修改账户名称、自动交易开关或设为默认账户 |
 | `DELETE` | `/accounts/:id` | 删除指定模拟账户（级联清除其持仓、订单与净值记录） |
-| `GET` | `/dashboard?account_id=1` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照 |
+| `GET` | `/dashboard?account_id=1&range=7d` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照。`range` 支持 `1d / 3d / 7d / 15d / 1m`，曲线锚定窗口起点前的最后一个快照并降采样到 300 点；省略 `range` 时保持最近 500 个快照 |
 | `GET` | `/opportunities?account_id=1` | 获取当前账户最近一次成功扫描筛选出的市场机会列表；每项同时返回原始 `question` / `outcome`、Polymarket 中文翻译 `question_zh` / `outcome_zh`，以及中文赛事标题 `event_title_zh` 和盘口短标题 `group_item_title`，用于体育盘口的中文兜底展示。分类与风险字段包括 `category`（`sports / politics / crypto / finance / tech / culture / other`）、`sports_game`、`overtime_risk` 与 `price_change_24h`。列表按该账户的价格、流动性、到期与体育策略过滤；省略 `account_id` 时返回所有账户候选的并集 |
 | `POST` | `/scan` | 手动触发扫描：默认仅刷新行情、持仓盯市与净值，不自动下单；附加 `?execute=true` 时同步执行自动交易。建议同时传 `?account_id=`：自动下单与止损只作用于该账户，且该显式请求会覆盖账户的后台自动交易开关；响应中的 `auto_trade` 返回本次下单数、跳过的已持仓盘口数与本账户错误 |
 | `GET` | `/positions?account_id=1&status=open` | 查询持仓列表，`status` 支持 `all / open / won / lost / split / sold`（`sold` 是止损筛选别名，底层为 `status=lost` + `exit_kind=stop`） |
