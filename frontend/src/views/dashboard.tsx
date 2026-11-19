@@ -147,21 +147,19 @@ function EquityChart({ data, refreshing, mode, venue }: { data: EquityPoint[]; r
   )
 }
 
-// Mirrors minAnnualizedDays in backend/internal/engine/views.go. A window this
-// short has not traded through a market cycle yet, so scaling it up to a year
-// produces a fantasy figure (39% over 3.4 days compounds to 10^17 percent)
-// rather than an estimate. The backend withholds the number until the window
-// clears the threshold; the UI shows why instead of an em dash.
-const MIN_ANNUALIZED_DAYS = 30
-
-// formatWindow prints a strategy window in the unit that reads best: days once
-// it has run a full day, hours before that.
+// Use smaller units for short strategy windows so a valid estimate does not
+// claim to cover zero days or hours.
 function formatWindow(days: number) {
-  return days >= 1 ? `${formatNumber(days, 1)} 天` : `${formatNumber(days * 24, 1)} 小时`
+  if (days >= 1) return `${formatNumber(days, 1)} 天`
+  if (days >= 1 / 24) return `${formatNumber(days * 24, 1)} 小时`
+  if (days >= 1 / 1440) return `${formatNumber(days * 1440, 1)} 分钟`
+  const seconds = Math.max(0, days * 86400)
+  return seconds > 0 && seconds < 1 ? '不足 1 秒' : `${formatNumber(seconds, 1)} 秒`
 }
 
 function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: boolean }) {
   const isLive = metrics?.mode === 'live'
+  const hasAnnualizedReturn = Boolean(metrics?.auto_trade_started_at && metrics.annualized_days > 0)
   // An account belongs to exactly one venue, so these numbers are never a
   // cross-venue sum; the venue chip keeps the currency unambiguous.
   const venue = venueOf(metrics)
@@ -205,14 +203,14 @@ function MetricsCards({ metrics, loading }: { metrics: Metrics | null; loading: 
       />
       <StatCard
         label="预估年化收益率"
-        value={metrics ? (metrics.annualized_days >= MIN_ANNUALIZED_DAYS ? formatPercent(metrics.annualized_return, 1, true) : '—') : '—'}
+        value={metrics && hasAnnualizedReturn ? formatPercent(metrics.annualized_return, 1, true) : '—'}
         icon={TrendingUp}
         venue={venue}
         loading={loading}
-        detail={metrics ? (metrics.annualized_days >= MIN_ANNUALIZED_DAYS
-          ? <span>按 {formatNumber(metrics.annualized_days, 1)} 天{metrics.annualized_days < 365 ? '线性' : '复利'}折算 · 累计 <span className={pnlClass(metrics.total_return)}>{formatPercent(metrics.total_return, 2, true)}</span></span>
+        detail={metrics ? (hasAnnualizedReturn
+          ? <span>按 {formatWindow(metrics.annualized_days)}{metrics.annualized_days < 365 ? '线性' : '复利'}折算 · 累计 <span className={pnlClass(metrics.total_return)}>{formatPercent(metrics.total_return, 2, true)}</span></span>
           : metrics.auto_trade_started_at
-            ? `已运行 ${formatWindow(metrics.annualized_days)}，满 ${MIN_ANNUALIZED_DAYS} 天才折算`
+            ? '等待运行时长累积'
             : '尚未产生自动买入') : '正在加载账户数据'}
       />
       <StatCard

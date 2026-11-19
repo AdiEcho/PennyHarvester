@@ -467,7 +467,7 @@ func (e *Engine) Dashboard(ctx context.Context, accountID int64) (Dashboard, err
 	}
 	if startedAt != nil {
 		metrics.AutoTradeStartedAt = startedAt
-		metrics.AnnualizedDays = math.Round(time.Since(*startedAt).Hours()/24*100) / 100
+		metrics.AnnualizedDays = math.Max(0, time.Since(*startedAt).Hours()/24)
 		metrics.AnnualizedReturn = annualizedReturn(metrics.TotalReturn, metrics.AnnualizedDays)
 	}
 	metrics.TotalOrders, err = e.repo.CountOrders(ctx, account.ID, "all", "")
@@ -606,20 +606,13 @@ func sanitizeEquityPoint(p EquityPoint) EquityPoint {
 	return p
 }
 
-// minAnnualizedDays is the shortest strategy window allowed to carry a yearly
-// figure. A few days of fills is not a sample: the return over three days says
-// nothing about a year, and extrapolating it manufactures fantasy numbers.
-const minAnnualizedDays = 30
-
-// annualizedReturn scales a period return to a year. Below minAnnualizedDays it
-// returns 0, because compounding a handful of days turns an ordinary return into
-// an astronomical one (39% over 3.4 days compounds to 10^17 percent). Windows
-// shorter than a year scale linearly, the way a fund annualizes a partial
-// period, so the rate is reported without pretending the book compounds 100+
-// times; at exactly a year the two methods agree, so the switch has no jump.
+// annualizedReturn scales a period return to a year over any positive window,
+// returning 0 for non-positive elapsed days. Windows shorter than a year scale
+// linearly rather than compounding a short history many times; at exactly a
+// year the two methods agree, so the switch to compounding has no jump.
 // A wiped-out book reports -100% rather than a NaN root or a sub -100% number.
 func annualizedReturn(totalReturn, days float64) float64 {
-	if days < minAnnualizedDays {
+	if days <= 0 {
 		return 0
 	}
 	if totalReturn <= -1 {

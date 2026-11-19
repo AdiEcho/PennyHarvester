@@ -1227,17 +1227,16 @@ type Metrics struct {
 	StoppedPositions int `json:"stopped_positions"`
 	// WinRate is wins / (settled - splits); split refunds stay out of both sides.
 	WinRate float64 `json:"win_rate"`
-	// AutoTradeStartedAt is the account's first automatic buy, i.e. when the
-	// strategy actually started trading. Nil until an auto entry exists, so a
-	// manually traded account never claims a strategy window it did not run.
+	// AutoTradeStartedAt is the account's first filled automatic buy, i.e. when
+	// the strategy actually started trading. Nil until a filled auto entry
+	// exists, so manual orders never start a strategy window.
 	AutoTradeStartedAt *time.Time `json:"auto_trade_started_at"`
-	// AnnualizedReturn scales TotalReturn over AnnualizedDays since
-	// AutoTradeStartedAt. It stays 0 below thirty days: compounding a few days
-	// of fills produces a fantasy figure, not an estimate. Windows under a year
-	// scale linearly, longer ones compound.
+	// AnnualizedReturn scales TotalReturn over any positive AnnualizedDays
+	// since AutoTradeStartedAt. Windows under a year scale linearly; windows of
+	// a year or more compound. Non-positive windows return 0; losses stop at -100%.
 	AnnualizedReturn float64 `json:"annualized_return"`
-	// AnnualizedDays is the elapsed window in days, reported whenever an auto
-	// entry exists so the UI can show how long the estimate covers.
+	// AnnualizedDays is the unrounded elapsed window in days since the first
+	// filled automatic buy, clamped to 0 for a future start time.
 	AnnualizedDays float64 `json:"annualized_days"`
 	TotalOrders    int64   `json:"total_orders"`
 }
@@ -1377,9 +1376,9 @@ type Repository interface {
 	// account's recent orders where an old intent can fall off the page.
 	RedeemIntent(context.Context, int64, int64) (Order, bool, error)
 	CountOrders(context.Context, int64, string, market.Venue) (int64, error)
-	// EarliestAutoBuyAt returns the creation time of the account's first
-	// automatic buy, which is the start of the strategy's live performance
-	// window. Nil means the account has never auto-entered.
+	// EarliestAutoBuyAt returns the creation time of the account's first filled
+	// automatic buy, which starts the strategy's performance window. Nil means
+	// the account has no filled automatic buys.
 	EarliestAutoBuyAt(context.Context, int64) (*time.Time, error)
 	ListUnresolvedOrders(context.Context, int64) ([]Order, error)
 	MarkOrderStatus(context.Context, int64, string, string) error

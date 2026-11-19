@@ -871,10 +871,18 @@ func TestDashboardReportsAutoTradeStartAndAnnualizedReturn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The first auto buy just happened, so the window is minutes old: the start
-	// time is published and the annualized estimate stays parked at 0.
-	if dashboard.Metrics.AutoTradeStartedAt == nil || dashboard.Metrics.AnnualizedDays >= 1 || dashboard.Metrics.AnnualizedReturn != 0 {
-		t.Fatalf("a fresh auto entry must not be annualized: %+v", dashboard.Metrics)
+	// Even a fresh auto entry is annualized over its positive elapsed window.
+	// Fees and slippage make this book a loss, bounded at -100% when scaled.
+	if dashboard.Metrics.AutoTradeStartedAt == nil || dashboard.Metrics.AnnualizedDays <= 0 || dashboard.Metrics.AnnualizedDays >= 1 {
+		t.Fatalf("a fresh auto entry must publish its elapsed window: %+v", dashboard.Metrics)
+	}
+	if dashboard.Metrics.TotalReturn >= 0 {
+		t.Fatalf("fees and slippage must produce a loss on entry: %+v", dashboard.Metrics)
+	}
+	wantFresh := math.Max(-1, dashboard.Metrics.TotalReturn*365/dashboard.Metrics.AnnualizedDays)
+	if math.IsNaN(dashboard.Metrics.AnnualizedReturn) || math.Abs(dashboard.Metrics.AnnualizedReturn-wantFresh) > 1e-9 {
+		t.Fatalf("a fresh auto entry must be annualized with a -100%% loss floor: got %v, want %v (%+v)",
+			dashboard.Metrics.AnnualizedReturn, wantFresh, dashboard.Metrics)
 	}
 
 	// Settle that entry as a win so the booked return is non-zero, then plant an
@@ -920,9 +928,9 @@ func TestDashboardReportsAutoTradeStartAndAnnualizedReturn(t *testing.T) {
 	}
 }
 
-// annualizedWindow opens a strategy window of the given length over a book in
-// profit: the first automatic buy settles as a win, then an older automatic buy
-// is backdated to move the window start.
+// annualizedWindow reports a profitable book over the given strategy window.
+// A settled manual buy supplies the return without starting the strategy clock;
+// a filled automatic buy supplies the only strategy start time.
 func annualizedWindow(t *testing.T, window time.Duration) engine.Metrics {
 	t.Helper()
 	ctx := context.Background()
@@ -931,10 +939,9 @@ func annualizedWindow(t *testing.T, window time.Duration) engine.Metrics {
 	}}
 	instance, repository := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
-	if _, err := instance.UpdateAccount(ctx, paper.ID, nil, boolPointer(true), nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := instance.Scan(ctx); err != nil {
+	if _, err := instance.PlaceOrder(ctx, paper.ID, engine.OrderRequest{
+		MarketID: "auto", Outcome: "Yes", TokenID: "auto-yes", Amount: 100,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	resolved := provider.markets["auto"]
@@ -947,50 +954,68 @@ func annualizedWindow(t *testing.T, window time.Duration) engine.Metrics {
 	if err := instance.Scan(ctx); err != nil {
 		t.Fatal(err)
 	}
+	startedAt := time.Now().UTC().Add(-window)
 	if _, err := repository.CreateOrder(ctx, engine.Order{
 		AccountID: paper.ID, MarketID: "backdated", Question: "backdated", Outcome: "Yes",
 		TokenID: "backdated-yes", Kind: "auto", Type: "buy", Amount: 100, Price: 0.98,
-		Shares: 102, Status: "filled", Reason: "auto",
-		CreatedAt: time.Now().UTC().Add(-window),
+		Shares: 102, Status: "filled", Reason: "auto", CreatedAt: startedAt,
 	}); err != nil {
 		t.Fatal(err)
 	}
+	minDays := math.Max(0, time.Since(startedAt).Hours()/24)
 	dashboard, err := instance.Dashboard(ctx, paper.ID)
+	maxDays := math.Max(0, time.Since(startedAt).Hours()/24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dashboard.Metrics.TotalReturn <= 0 {
-		t.Fatalf("window %v: the settled win must produce a positive return: %+v", window, dashboard.Metrics)
+	metrics := dashboard.Metrics
+	if metrics.AutoTradeStartedAt == nil || !metrics.AutoTradeStartedAt.Equal(startedAt) {
+		t.Fatalf("window %v: strategy must start at the filled automatic buy: %+v", window, metrics)
 	}
-	return dashboard.Metrics
+	if metrics.AnnualizedDays < minDays || metrics.AnnualizedDays > maxDays {
+		t.Fatalf("window %v: elapsed days = %v, want unrounded duration in [%v, %v]", window, metrics.AnnualizedDays, minDays, maxDays)
+	}
+	if metrics.TotalReturn <= 0 {
+		t.Fatalf("window %v: the settled win must produce a positive return: %+v", window, metrics)
+	}
+	return metrics
 }
 
-// TestAnnualizedReturnOnlyScalesWindowsThatHaveEarnedIt pins the guard rails: a
-// window under a month publishes no yearly figure at all, a partial period
-// scales linearly, and only a window of a year or more compounds.
-func TestAnnualizedReturnOnlyScalesWindowsThatHaveEarnedIt(t *testing.T) {
-	// A few days of fills compound to 10^17 percent. Nothing about that is an
-	// estimate, so the dashboard withholds the number instead of printing it.
-	short := annualizedWindow(t, 5*24*time.Hour)
-	if math.Abs(short.AnnualizedDays-5) > 0.02 {
-		t.Fatalf("window should be about five days: %+v", short)
+// TestAnnualizedReturnScalesEveryPositiveWindow pins the formulas across short
+// histories and the yearly boundary without rounding elapsed days.
+func TestAnnualizedReturnScalesEveryPositiveWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		window time.Duration
+	}{
+		{name: "five_days", window: 5 * 24 * time.Hour},
+		{name: "five_minutes", window: 5 * time.Minute},
+		{name: "thirty_seconds", window: 30 * time.Second},
+		{name: "thirty_days", window: 30 * 24 * time.Hour},
+		{name: "one_year", window: 365 * 24 * time.Hour},
+		{name: "four_hundred_days", window: 400 * 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics := annualizedWindow(t, tc.window)
+			if metrics.AnnualizedDays <= 0 || metrics.AnnualizedReturn <= 0 {
+				t.Fatalf("a positive strategy window and return must be annualized: %+v", metrics)
+			}
+			want := metrics.TotalReturn * 365 / metrics.AnnualizedDays
+			if tc.window >= 365*24*time.Hour {
+				want = math.Pow(1+metrics.TotalReturn, 365/metrics.AnnualizedDays) - 1
+			}
+			if math.IsNaN(metrics.AnnualizedReturn) || math.IsInf(metrics.AnnualizedReturn, 0) || math.Abs(metrics.AnnualizedReturn-want) > 1e-9 {
+				t.Fatalf("annualized return = %v, want %v (%v over %v days)",
+					metrics.AnnualizedReturn, want, metrics.TotalReturn, metrics.AnnualizedDays)
+			}
+		})
 	}
-	if short.AnnualizedReturn != 0 {
-		t.Fatalf("a five-day window must not be annualized: %+v", short)
-	}
+}
 
-	month := annualizedWindow(t, 30*24*time.Hour)
-	if want := month.TotalReturn * 365 / month.AnnualizedDays; math.Abs(month.AnnualizedReturn-want) > 1e-9 {
-		t.Fatalf("a thirty-day window must scale linearly: annualized return = %v, want %v (%v over %v days)",
-			month.AnnualizedReturn, want, month.TotalReturn, month.AnnualizedDays)
-	}
-
-	// A window of a year or more compounds, because by then the return really is
-	// the product of twelve months of trading.
-	year := annualizedWindow(t, 400*24*time.Hour)
-	if want := math.Pow(1+year.TotalReturn, 365/year.AnnualizedDays) - 1; math.Abs(year.AnnualizedReturn-want) > 1e-9 {
-		t.Fatalf("a 400-day window must compound: annualized return = %v, want %v (%v over %v days)",
-			year.AnnualizedReturn, want, year.TotalReturn, year.AnnualizedDays)
+func TestDashboardClampsFutureAnnualizedWindow(t *testing.T) {
+	metrics := annualizedWindow(t, -time.Hour)
+	if metrics.AnnualizedDays != 0 || metrics.AnnualizedReturn != 0 {
+		t.Fatalf("a future automatic buy must report zero elapsed days and annualized return: %+v", metrics)
 	}
 }
 
