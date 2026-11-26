@@ -3,6 +3,8 @@ package engine
 import (
 	"testing"
 	"time"
+
+	"pennyharvester/backend/internal/market"
 )
 
 func TestEquityWindowSeriesAnchorsAndDownsamples(t *testing.T) {
@@ -49,5 +51,47 @@ func TestEquityWindowSeriesKeepsShortSeriesAndClampsBounds(t *testing.T) {
 	}
 	if !series[0].Time.Equal(since) || !series[2].Time.Equal(now) {
 		t.Fatalf("bounds were not clamped: %+v", series)
+	}
+}
+
+func TestRealizedEquitySeriesUsesClosedPositions(t *testing.T) {
+	start := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(value time.Time) *time.Time { return &value }
+	positions := []Position{
+		// Closed before the window: its PnL is already part of the opening equity.
+		{RealizedPNL: 5, ClosedAt: at(start.Add(-time.Hour))},
+		{RealizedPNL: 2, ClosedAt: at(start.Add(time.Hour))},
+		{RealizedPNL: -3, ClosedAt: at(start.Add(2 * time.Hour))},
+		{Status: "open"},
+	}
+
+	series := realizedEquitySeries(positions, 100, start, start.Add(3*time.Hour), time.Hour, market.VenuePolymarket, market.CurrencyUSDC)
+	want := []float64{105, 107, 104, 104}
+	if len(series) != len(want) {
+		t.Fatalf("series length = %d, want %d: %+v", len(series), len(want), series)
+	}
+	for i, value := range want {
+		if series[i].Value != value {
+			t.Fatalf("point %d value = %v, want %v", i, series[i].Value, value)
+		}
+		if !series[i].Estimated {
+			t.Fatalf("point %d is not marked estimated", i)
+		}
+	}
+}
+
+func TestSnapshotDueThrottlesToInterval(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	if !snapshotDue(nil, now) {
+		t.Fatal("an account without snapshots should record immediately")
+	}
+	if snapshotDue([]EquityPoint{{Time: now.Add(-30 * time.Second)}}, now) {
+		t.Fatal("a snapshot inside the interval should be skipped")
+	}
+	if !snapshotDue([]EquityPoint{{Time: now.Add(-snapshotInterval)}}, now) {
+		t.Fatal("a snapshot at the interval boundary should be recorded")
+	}
+	if !snapshotDue([]EquityPoint{{Time: now.Add(time.Minute)}}, now) {
+		t.Fatal("a backwards clock must not block recording until it catches up")
 	}
 }

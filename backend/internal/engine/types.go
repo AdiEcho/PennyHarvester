@@ -1200,6 +1200,10 @@ type EquityPoint struct {
 	Currency market.Currency `json:"currency"`
 	Time     time.Time       `json:"time"`
 	Value    float64         `json:"value"`
+	// Estimated marks a point reconstructed from closed positions rather than
+	// read from a stored snapshot. The dashboard draws these as a dashed line
+	// and never persists them, so a later real snapshot always wins.
+	Estimated bool `json:"estimated,omitempty"`
 }
 
 type Metrics struct {

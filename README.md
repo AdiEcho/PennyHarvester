@@ -378,7 +378,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper","venue":"predictfun","initial_bankroll":25000}`（`venue` 省略时默认为 `polymarket`，创建后不可更改；`initial_bankroll` 仅对模拟账户生效，省略或为 `0` 时使用当前账户策略里的默认资金，负数返回 400） |
 | `PATCH` | `/accounts/:id` | 修改账户名称、自动交易开关或设为默认账户 |
 | `DELETE` | `/accounts/:id` | 删除指定模拟账户（级联清除其持仓、订单与净值记录） |
-| `GET` | `/dashboard?account_id=1&range=7d` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照。`range` 支持 `1d / 3d / 7d / 15d / 1m`，曲线锚定窗口起点前的最后一个快照并降采样到 300 点；省略 `range` 时保持最近 500 个快照 |
+| `GET` | `/dashboard?account_id=1&range=7d` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照。`range` 支持 `1d / 3d / 7d / 15d / 1m`；曲线锚定窗口起点前的最后一个快照并降采样，首条真实快照之前的模拟历史按已平仓盈亏重建，重建点带 `estimated: true` 且不写回数据库；省略 `range` 时保持最近 500 个快照 |
 | `GET` | `/opportunities?account_id=1` | 获取当前账户最近一次成功扫描筛选出的市场机会列表；每项同时返回原始 `question` / `outcome`、Polymarket 中文翻译 `question_zh` / `outcome_zh`，以及中文赛事标题 `event_title_zh` 和盘口短标题 `group_item_title`，用于体育盘口的中文兜底展示。分类与风险字段包括 `category`（`sports / politics / crypto / finance / tech / culture / other`）、`sports_game`、`overtime_risk` 与 `price_change_24h`。列表按该账户的价格、流动性、到期与体育策略过滤；省略 `account_id` 时返回所有账户候选的并集 |
 | `POST` | `/scan` | 手动触发扫描：默认仅刷新行情、持仓盯市与净值，不自动下单；附加 `?execute=true` 时同步执行自动交易。建议同时传 `?account_id=`：自动下单与止损只作用于该账户，且该显式请求会覆盖账户的后台自动交易开关；响应中的 `auto_trade` 返回本次下单数、跳过的已持仓盘口数与本账户错误 |
 | `GET` | `/positions?account_id=1&status=open` | 查询持仓列表，`status` 支持 `all / open / won / lost / split / sold`（`sold` 是止损筛选别名，底层为 `status=lost` + `exit_kind=stop`） |
@@ -419,6 +419,11 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 ### 自动数据库迁移
 服务启动时会自动检测并升级旧版 SQLite 数据库结构：包括为 `positions` 表补充 `kind / exit_kind` 字段与 `split` 状态、为 `orders` 表补充 `pending / unknown` 状态与 `fee / action` 字段、为存量模拟账户补写基准权益，以及创建 `system_settings`（网络代理配置）、`access_password`（访问密码哈希）与 `account_settings`（每账户独立策略参数）等新表。新增字段使用 `ALTER TABLE ADD COLUMN`，不会重建带有额外列、索引或触发器的数据库；只有在缺少 `split` 或 `pending/unknown` 约束的旧库上才会重建对应表。已有安装升级后，全局 `settings` 行保留为默认模板，账户在首次保存前继续实时继承它，因此升级不会改变任何账户的当前行为。所有迁移均在数据库事务内执行，若失败会自动回滚；建议在版本升级前先备份 `pennyharvester.db`。
+
+### 净值快照存储
+权益曲线不是逐次扫描全部落盘：每个账户最多每分钟写入一条快照，即使扫描间隔更短也只按分钟采样。每账户保留最近 100000 条，按每分钟一条计算约覆盖 69 天，满足页面的 `1m` 窗口。旧版本曾按每次扫描写入并只保留 5000 条，升级后无法恢复已经被清理的历史，只能从现在重新累积。
+
+模拟账户在所选窗口内、首条真实快照之前没有落盘数据时，服务端会用已平仓仓位的已实现盈亏按成本价重建一段权益：买入不改变权益，平仓时赢家按 1、输家按 0、止损按成交价结算，开仓期间按成本计，因此不预测中间价格。重建点带 `estimated: true`，页面用虚线标出并注明“按成本价估算”，且不会写回快照表；实盘账户不重建。
 
 ### 运行测试与构建检查
 

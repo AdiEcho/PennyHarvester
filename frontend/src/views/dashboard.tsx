@@ -54,6 +54,21 @@ const EQUITY_RANGES: Array<{ key: EquityRange; label: string }> = [
   { key: '1m', label: '1月' },
 ]
 const DEFAULT_EQUITY_RANGE: EquityRange = '1d'
+const EQUITY_RANGE_MS: Record<EquityRange, number> = {
+  '1d': 24 * 60 * 60 * 1000,
+  '3d': 3 * 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  '15d': 15 * 24 * 60 * 60 * 1000,
+  '1m': 30 * 24 * 60 * 60 * 1000,
+}
+
+function formatCoverage(ms: number) {
+  const minutes = Math.round(ms / 60000)
+  if (minutes < 60) return `${Math.max(minutes, 1)} 分钟`
+  const hours = ms / 3600000
+  if (hours < 48) return `${formatNumber(hours, 1)} 小时`
+  return `${formatNumber(hours / 24, 1)} 天`
+}
 
 function StatCard({ label, value, detail, icon: Icon, venue, accent, loading }: {
   label: string
@@ -82,16 +97,18 @@ function StatCard({ label, value, detail, icon: Icon, venue, accent, loading }: 
   )
 }
 
-function EquityTooltip({ active, payload, mode, venue, baseline }: { active?: boolean; payload?: Array<{ payload: EquityPoint }>; mode: AccountMode; venue: Venue; baseline: number }) {
+function EquityTooltip({ active, payload, mode, venue, baseline }: { active?: boolean; payload?: Array<{ payload: ChartEquityPoint }>; mode: AccountMode; venue: Venue; baseline: number }) {
   if (!active || !payload?.length) return null
   const point = payload[0].payload
-  const change = point.value - baseline
+  const value = point.value ?? point.estimatedValue ?? 0
+  const estimateOnly = point.value === undefined && point.estimatedValue !== undefined
+  const change = value - baseline
   return (
     <div className="min-w-[190px] rounded-xl border border-slate-200 bg-surface/95 p-3.5 shadow-float backdrop-blur">
       <p className="text-xs text-slate-500">{formatFullDate(point.time)}</p>
       <div className="mt-2 flex items-center justify-between gap-5">
-        <span className="flex items-center gap-2 text-xs text-slate-500"><span className="h-0.5 w-4 rounded bg-[var(--series-equity)]" />{mode === 'live' ? '实盘权益' : '模拟权益'}</span>
-        <span className="text-sm font-semibold text-slate-900">{fmtMoney(point.value, point.venue ?? venue)}</span>
+        <span className="flex items-center gap-2 text-xs text-slate-500"><span className={cn('h-0.5 w-4 rounded bg-[var(--series-equity)]', estimateOnly && 'opacity-60')} />{mode === 'live' ? '实盘权益' : '模拟权益'}{estimateOnly ? '（估算）' : ''}</span>
+        <span className="text-sm font-semibold text-slate-900">{fmtMoney(value, point.venue ?? venue)}</span>
       </div>
       {Number.isFinite(baseline) && (
         <div className="mt-1.5 flex items-center justify-between gap-5 border-t border-slate-100 pt-1.5">
@@ -102,6 +119,8 @@ function EquityTooltip({ active, payload, mode, venue, baseline }: { active?: bo
     </div>
   )
 }
+
+type ChartEquityPoint = Omit<EquityPoint, 'value'> & { ts: number; value?: number; estimatedValue?: number }
 
 function EquityChart({ data, refreshing, mode, venue, range, onRangeChange }: {
   data: EquityPoint[]
@@ -116,27 +135,51 @@ function EquityChart({ data, refreshing, mode, venue, range, onRangeChange }: {
   const meta = venueMeta(venue)
   // Recharts needs a numeric axis to scale hours and days evenly; a category
   // axis spaces points by index and would distort an interval with gaps.
-  const chartData = useMemo(() => data.map((point) => ({ ...point, ts: Date.parse(point.time) })), [data])
+  // Estimated points carry `estimatedValue` and real points carry `value`, so
+  // the dashed and solid lines can share one timeline without the estimate
+  // being mistaken for a stored snapshot.
+  const chartData = useMemo(() => {
+    const rows = new Map<string, ChartEquityPoint>()
+    for (const point of data) {
+      const row = rows.get(point.time) ?? { ...point, ts: Date.parse(point.time), value: undefined }
+      if (point.estimated) row.estimatedValue = point.value
+      else row.value = point.value
+      rows.set(point.time, row)
+    }
+    return [...rows.values()].sort((a, b) => a.ts - b.ts)
+  }, [data])
   const first = chartData[0]
   const last = chartData[chartData.length - 1]
+  const firstValue = first?.value ?? first?.estimatedValue ?? 0
+  const lastValue = last?.value ?? last?.estimatedValue ?? 0
   const hasWindow = chartData.length > 1
-  const change = hasWindow ? last.value - first.value : 0
-  const changeRatio = hasWindow && first.value > 0 ? change / first.value : 0
-  const high = hasWindow ? Math.max(...chartData.map((point) => point.value)) : 0
-  const low = hasWindow ? Math.min(...chartData.map((point) => point.value)) : 0
+  const hasEstimate = data.some((point) => point.estimated)
+  const coverage = hasWindow && Number.isFinite(first.ts) && Number.isFinite(last.ts)
+    ? Math.max(0, last.ts - first.ts)
+    : 0
+  const partialWindow = coverage > 0 && coverage < EQUITY_RANGE_MS[range] * 0.9
+  const change = hasWindow ? lastValue - firstValue : 0
+  const changeRatio = hasWindow && firstValue > 0 ? change / firstValue : 0
+  const values = chartData.map((point) => point.value ?? point.estimatedValue).filter((value): value is number => Number.isFinite(value))
+  const high = values.length ? Math.max(...values) : 0
+  const low = values.length ? Math.min(...values) : 0
   const windowLabel = EQUITY_RANGES.find((option) => option.key === range)?.label ?? range
   // A single snapshot has no span, so a dataMin/dataMax domain would collapse
   // to zero width; pad half an hour around it so the point still renders.
+  // Otherwise show the whole requested window, even when stored history is
+  // shorter: a 7d chart that silently zooms into 14 hours makes every range
+  // look identical and hides missing data at the left edge.
+  const windowEnd = hasWindow ? Math.max(Date.now(), last.ts) : 0
   const xDomain = chartData.length === 1
     ? [first.ts - 30 * 60 * 1000, first.ts + 30 * 60 * 1000]
-    : ['dataMin', 'dataMax']
+    : [windowEnd - EQUITY_RANGE_MS[range], windowEnd]
 
   return (
     <Card className="min-w-0 xl:col-span-2">
       <CardHeader className="flex-col gap-4 space-y-0 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-2"><CardTitle>权益曲线</CardTitle><VenueChip venue={venue} /></div>
-          <CardDescription className="mt-1">{meta.label} · {label} · {meta.currency} · 近{windowLabel} · {data.length} 个采样点</CardDescription>
+          <CardDescription className="mt-1">{meta.label} · {label} · {meta.currency} · 近{windowLabel} · {data.length} 个采样点{hasEstimate ? '（含估算）' : ''}{partialWindow && <span className="font-medium text-amber-600"> · 数据仅覆盖 {formatCoverage(coverage)}</span>}</CardDescription>
         </div>
         <div className="flex shrink-0 self-start rounded-lg border border-slate-200 bg-slate-50 p-1" aria-label="权益数据展示方式">
           <button className={cn('flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 text-xs transition', view === 'chart' ? 'bg-surface font-medium text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-800')} onClick={() => setView('chart')} aria-pressed={view === 'chart'}>
@@ -161,6 +204,7 @@ function EquityChart({ data, refreshing, mode, venue, range, onRangeChange }: {
               <span>区间变化 <span className={cn('font-medium tabular-nums', pnlClass(change))}>{fmtMoney(change, venue, { signed: true })} · {formatPercent(changeRatio, 2, true)}</span></span>
               <span className="hidden sm:inline">最高 <span className="font-medium tabular-nums text-slate-700">{fmtMoney(high, venue)}</span></span>
               <span className="hidden sm:inline">最低 <span className="font-medium tabular-nums text-slate-700">{fmtMoney(low, venue)}</span></span>
+              {hasEstimate && <span className="inline-flex items-center gap-1.5"><span className="w-4 border-t border-dashed border-[var(--series-equity)]" />按成本价估算</span>}
             </div>
           )}
         </div>
@@ -169,13 +213,13 @@ function EquityChart({ data, refreshing, mode, venue, range, onRangeChange }: {
         ) : view === 'table' ? (
           <div className="scrollbar-thin max-h-[310px] overflow-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-sm">
-              <caption className="sr-only">{label}近{windowLabel}历史数据（{meta.currency}）</caption>
+              <caption className="sr-only">{label}近{windowLabel}历史数据（{meta.currency}{hasEstimate ? '，含估算' : ''}）</caption>
               <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                 <tr><th className="px-4 py-3 font-medium">记录时间</th><th className="px-4 py-3 text-right font-medium">{label}（{meta.currency}）</th></tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {[...data].reverse().map((point, index) => (
-                  <tr key={`${point.time}-${index}`}><td className="px-4 py-3 text-slate-600">{formatFullDate(point.time)}</td><td className="px-4 py-3 text-right font-medium tabular-nums text-slate-900">{fmtMoney(point.value, point.venue ?? venue)}</td></tr>
+                  <tr key={`${point.time}-${index}`}><td className="px-4 py-3 text-slate-600">{formatFullDate(point.time)}{point.estimated && <span className="ml-1.5 rounded bg-slate-100 px-1 py-0.5 text-[10px] text-slate-500">估算</span>}</td><td className="px-4 py-3 text-right font-medium tabular-nums text-slate-900">{fmtMoney(point.value, point.venue ?? venue)}</td></tr>
                 ))}
               </tbody>
             </table>
@@ -193,9 +237,10 @@ function EquityChart({ data, refreshing, mode, venue, range, onRangeChange }: {
                 <CartesianGrid vertical={false} stroke="var(--chart-grid)" strokeWidth={1} />
                 <XAxis dataKey="ts" type="number" scale="time" domain={xDomain} tickFormatter={(value: number) => formatWindowAxis(value, range)} tickLine={false} axisLine={false} minTickGap={42} tickMargin={12} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
                 <YAxis tickFormatter={fmtMoneyAxis} tickLine={false} axisLine={false} width={82} tickCount={5} domain={['auto', 'auto']} tick={{ fill: 'var(--chart-muted)', fontSize: 11 }} />
-                <Tooltip content={<EquityTooltip mode={mode} venue={venue} baseline={first?.value ?? 0} />} cursor={{ stroke: 'var(--chart-muted)', strokeWidth: 1 }} isAnimationActive={false} />
-                {hasWindow && <ReferenceLine y={first.value} stroke="var(--chart-muted)" strokeDasharray="4 4" strokeOpacity={0.55} />}
+                <Tooltip content={<EquityTooltip mode={mode} venue={venue} baseline={firstValue} />} cursor={{ stroke: 'var(--chart-muted)', strokeWidth: 1 }} isAnimationActive={false} />
+                {hasWindow && <ReferenceLine y={firstValue} stroke="var(--chart-muted)" strokeDasharray="4 4" strokeOpacity={0.55} />}
                 <Area type="monotone" dataKey="value" stroke="none" fill="url(#equityArea)" isAnimationActive={false} />
+                {hasEstimate && <Line type="monotone" dataKey="estimatedValue" name="估算权益" stroke="var(--series-equity)" strokeWidth={2} strokeDasharray="6 4" strokeOpacity={0.7} dot={false} activeDot={{ r: 5, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 }} isAnimationActive={false} />}
                 <Line type="monotone" dataKey="value" name={label} stroke="var(--series-equity)" strokeWidth={2} dot={chartData.length === 1 ? { r: 4, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 } : false} activeDot={{ r: 5, fill: 'var(--series-equity)', stroke: 'var(--chart-surface)', strokeWidth: 2 }} isAnimationActive={false} />
               </ComposedChart>
             </ResponsiveContainer>

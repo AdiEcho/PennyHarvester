@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -488,7 +489,7 @@ func (e *Engine) dashboard(ctx context.Context, accountID int64, window time.Dur
 	if err != nil {
 		return Dashboard{}, err
 	}
-	points, err := e.equityHistory(ctx, account, window, metrics.Equity)
+	points, err := e.equityHistory(ctx, account, positions, window, metrics.Equity, metrics.InitialBankroll)
 	if err != nil {
 		return Dashboard{}, err
 	}
@@ -523,7 +524,7 @@ const (
 // keeps the legacy newest-N behaviour; with one it anchors the series at the
 // last value from before the window, so the chart starts at the equity that
 // window actually began with.
-func (e *Engine) equityHistory(ctx context.Context, account Account, window time.Duration, current float64) ([]EquityPoint, error) {
+func (e *Engine) equityHistory(ctx context.Context, account Account, positions []Position, window time.Duration, current, baseline float64) ([]EquityPoint, error) {
 	now := time.Now().UTC()
 	fallback := EquityPoint{
 		Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
@@ -547,7 +548,83 @@ func (e *Engine) equityHistory(ctx context.Context, account Account, window time
 	if len(points) == 0 {
 		points = []EquityPoint{fallback}
 	}
-	return equityWindowSeries(boundary, points, since, now, maxEquityPoints), nil
+	series := equityWindowSeries(boundary, points, since, now, maxEquityPoints)
+	// A boundary snapshot proves the value at the window's left edge, so the
+	// stored series already covers the whole window. Without one, everything
+	// before the first stored point is reconstructed from realised trades.
+	if boundary != nil || account.Mode != AccountModePaper || baseline <= 0 || len(series) == 0 {
+		return series, nil
+	}
+	cutoff := series[0].Time
+	start := since
+	if created := account.CreatedAt.UTC(); created.After(start) {
+		start = created
+	}
+	if !cutoff.After(start) {
+		return series, nil
+	}
+	estimated := realizedEquitySeries(positions, baseline, start, cutoff, equityBucketWidth(window), account.EffectiveVenue(), account.EffectiveCurrency())
+	if len(estimated) == 0 {
+		return series, nil
+	}
+	merged := make([]EquityPoint, 0, len(estimated)+len(series))
+	merged = append(merged, estimated...)
+	merged = append(merged, series...)
+	return merged, nil
+}
+
+// realizedEquitySeries reconstructs the realised-only equity curve from closed
+// positions. Buying an outcome does not change equity: cash falls by the cost
+// and the holding is worth the same cost. Settling does: a win pays out, a loss
+// pays zero, and a stop-loss sells at its recorded price, so each close moves
+// equity by exactly its realised PnL. Open positions therefore contribute
+// nothing until they close, which is the cost-basis estimate the dashboard
+// labels as such. Prices at intermediate times are not stored anywhere, so
+// this is the strongest reconstruction the trade ledger supports.
+func realizedEquitySeries(positions []Position, baseline float64, start, end time.Time, width time.Duration, venue market.Venue, currency market.Currency) []EquityPoint {
+	if !end.After(start) || width <= 0 {
+		return nil
+	}
+	if width < time.Minute {
+		width = time.Minute
+	}
+	closed := make([]Position, 0, len(positions))
+	for _, position := range positions {
+		if position.ClosedAt != nil && !position.ClosedAt.After(end) {
+			closed = append(closed, position)
+		}
+	}
+	sort.Slice(closed, func(i, j int) bool {
+		return closed[i].ClosedAt.Before(*closed[j].ClosedAt)
+	})
+	points := make([]EquityPoint, 0, int(end.Sub(start)/width)+1)
+	realized, next := 0.0, 0
+	add := func(at time.Time) {
+		for next < len(closed) && !closed[next].ClosedAt.After(at) {
+			realized += closed[next].RealizedPNL
+			next++
+		}
+		points = append(points, EquityPoint{
+			Venue: venue, Currency: currency, Time: at,
+			Value: baseline + realized, Estimated: true,
+		})
+	}
+	for at := start; at.Before(end); at = at.Add(width) {
+		add(at)
+	}
+	add(end)
+	return points
+}
+
+// equityBucketWidth keeps the estimate on the same sampling grid as the stored
+// series. Without it a short gap would get one point per minute while the real
+// series covers the same span with a handful of points.
+func equityBucketWidth(window time.Duration) time.Duration {
+	width := window / time.Duration(maxEquityPoints)
+	if width < time.Minute {
+		return time.Minute
+	}
+	return width
 }
 
 // equityWindowSeries prepends the window's opening anchor and downsamples the
@@ -632,8 +709,22 @@ func (e *Engine) ensureLiveBaseline(ctx context.Context, account Account, openEx
 	return account
 }
 
+// snapshotInterval is how often the equity curve records a point. Scans can run
+// every ten seconds, but the chart only draws a few hundred points, so storing
+// every scan would spend the retention budget on detail no screen can show.
+// One minute keeps a full 30-day window inside snapshotRetention.
+const snapshotInterval = time.Minute
+
 func (e *Engine) snapshot(ctx context.Context, account Account) error {
 	if account.Mode == AccountModeLive && account.BaselineEquity <= 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	latest, err := e.repo.ListSnapshots(ctx, account.ID, 1)
+	if err != nil {
+		return err
+	}
+	if !snapshotDue(latest, now) {
 		return nil
 	}
 	dashboard, err := e.Dashboard(ctx, account.ID)
@@ -645,8 +736,19 @@ func (e *Engine) snapshot(ctx context.Context, account Account) error {
 	}
 	return e.repo.AddSnapshot(ctx, account.ID, EquityPoint{
 		Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
-		Time: time.Now().UTC(), Value: dashboard.Metrics.Equity,
+		Time: now, Value: dashboard.Metrics.Equity,
 	})
+}
+
+// snapshotDue reports whether the curve should record another point. A new
+// account has no snapshot yet, and a clock that moved backwards must not block
+// recording until it catches up with the stored time.
+func snapshotDue(latest []EquityPoint, now time.Time) bool {
+	if len(latest) == 0 {
+		return true
+	}
+	last := latest[len(latest)-1].Time
+	return now.Before(last) || now.Sub(last) >= snapshotInterval
 }
 
 // moneyPrecision is the number of decimals the API exposes for a venue's

@@ -121,6 +121,8 @@ export type EquityRange = '1d' | '3d' | '7d' | '15d' | '1m'
 export interface EquityPoint {
   time: string
   value: number
+  /** True for a point reconstructed from closed trades, not a stored snapshot. */
+  estimated?: boolean
   /** 旧快照可能没有场所；渲染时用账户的场所兜底。 */
   venue?: Venue
   currency?: Currency

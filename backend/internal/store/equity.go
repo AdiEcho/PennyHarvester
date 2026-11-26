@@ -8,9 +8,9 @@ import (
 	"pennyharvester/backend/internal/market"
 )
 
-// snapshotRetention bounds the rows kept per account. At the default one-minute
-// scan this covers well over a month of history, which is what the dashboard's
-// 1m range needs; the cap keeps an aggressive scan interval from growing the
+// snapshotRetention bounds the rows kept per account. At the one-minute
+// snapshot cadence this covers about 69 days, well beyond the dashboard's
+// 1m range, while keeping an aggressive scan interval from growing the
 // database and the ledger export without bound.
 const snapshotRetention = 100000
 

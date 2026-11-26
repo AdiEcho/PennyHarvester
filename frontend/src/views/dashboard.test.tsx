@@ -132,6 +132,34 @@ describe('estimated annualized return', () => {
 })
 
 describe('equity range selector', () => {
+  it('warns when the stored history is shorter than the selected window', async () => {
+    vi.mocked(api.dashboard).mockResolvedValue({
+      ...dashboard,
+      equity: [
+        { time: '2026-11-19T00:00:00Z', value: 1000 },
+        { time: '2026-11-19T02:00:00Z', value: 1001 },
+      ],
+    })
+    render(<DashboardView onOpenOrders={vi.fn()} />)
+    await screen.findByText('权益曲线')
+    expect(await screen.findByText((_, node) => node?.tagName === 'P' && node.textContent?.includes('数据仅覆盖 2 小时') === true)).toBeVisible()
+  })
+
+  it('marks reconstructed points as estimated instead of hiding the gap', async () => {
+    vi.mocked(api.dashboard).mockResolvedValue({
+      ...dashboard,
+      equity: [
+        { time: '2026-11-13T02:00:00Z', value: 1000, estimated: true },
+        { time: '2026-11-19T00:00:00Z', value: 1001 },
+      ],
+    })
+    render(<DashboardView onOpenOrders={vi.fn()} />)
+    await screen.findByText('权益曲线')
+    expect(await screen.findByText('按成本价估算')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: '数据' }))
+    expect(await screen.findByText('估算')).toBeVisible()
+  })
+
   it('requests the chosen window while keeping the rest of the dashboard mounted', async () => {
     vi.mocked(api.dashboard).mockResolvedValue(dashboard)
     render(<DashboardView onOpenOrders={vi.fn()} />)
