@@ -363,6 +363,10 @@ export interface Settings {
   crypto_entry_window_seconds: number
   stop_loss_enabled: boolean
   stop_loss_ratio: number
+  /** 下单前读取实时盘口；限价较参考价偏高超过此值则拒绝。0 = 不限漂移（仍检查绝对最高价）。 */
+  max_price_drift_bps: number
+  /** 加密分类市场允许自动入场的最低参考价，独立于 min_price。0 = 不限。 */
+  crypto_min_confidence: number
   /** 服务端管理，前端只读并原样回传。 */
   fee_model_version?: number
   /** 逐场所覆写；缺省字段继承上面的全局值。 */

@@ -38,7 +38,7 @@ import { TabBar, type TabItem } from '@/components/ui/tab-bar'
 import { PageHeader } from '@/components/page-header'
 import { ModeBadge, VenueChip } from '@/components/status-badges'
 
-const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'max_event_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes', 'crypto_entry_window_seconds', 'stop_loss_ratio'] as const
+const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'max_event_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes', 'crypto_entry_window_seconds', 'stop_loss_ratio', 'max_price_drift_bps', 'crypto_min_confidence'] as const
 const selectKeys = ['default_category', 'sports_policy'] as const
 type NumericKey = typeof numericKeys[number]
 type SelectKey = typeof selectKeys[number]
@@ -112,6 +112,8 @@ function toDraft(settings: Settings): Draft {
       crypto_entry_window_seconds: String(settings.crypto_entry_window_seconds),
       stop_loss_ratio: String(settings.stop_loss_ratio),
       stop_loss_enabled: settings.stop_loss_enabled,
+      max_price_drift_bps: String(settings.max_price_drift_bps ?? 50),
+      crypto_min_confidence: String(settings.crypto_min_confidence ?? 0.5),
     },
     venues: {
       polymarket: toVenueDraft('polymarket', settings.venues?.polymarket),
@@ -141,6 +143,8 @@ function toShared(draft: SharedDraft) {
     crypto_entry_window_seconds: Number(draft.crypto_entry_window_seconds),
     stop_loss_ratio: Number(draft.stop_loss_ratio),
     stop_loss_enabled: draft.stop_loss_enabled,
+    max_price_drift_bps: Number(draft.max_price_drift_bps),
+    crypto_min_confidence: Number(draft.crypto_min_confidence),
   }
 }
 
@@ -202,6 +206,8 @@ function validateShared(shared: SharedDraft): FieldErrors {
   if (!Number.isInteger(settings.sports_entry_window_minutes) || settings.sports_entry_window_minutes < 0 || settings.sports_entry_window_minutes > 1440) errors.sports_entry_window_minutes = '请输入 0–1440 之间的整数分钟数。'
   if (!Number.isInteger(settings.crypto_entry_window_seconds) || settings.crypto_entry_window_seconds < 0 || settings.crypto_entry_window_seconds > 86400) errors.crypto_entry_window_seconds = '请输入 0–86400 之间的整数秒数。'
   if (settings.stop_loss_ratio <= 0 || settings.stop_loss_ratio >= 1) errors.stop_loss_ratio = '请输入 0–1 之间的小数，例如 0.70。'
+  if (settings.max_price_drift_bps < 0 || settings.max_price_drift_bps > 1000) errors.max_price_drift_bps = '请输入 0–1000 之间的数值。'
+  if (settings.crypto_min_confidence < 0 || settings.crypto_min_confidence > 1) errors.crypto_min_confidence = '请输入 0–1 之间的数值（0 表示不限制）。'
   return errors
 }
 
@@ -891,6 +897,13 @@ export function SettingsView() {
                 <div className="mt-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
                   <div className="rounded-xl bg-surface p-2.5 text-amber-600"><Info className="h-5 w-5" /></div>
                   <div className="flex-1"><p className="text-sm font-semibold text-amber-900">止损不是保证成交价</p><p className="mt-1 text-xs leading-5 text-amber-800">止损触发依赖扫描间隔（暂停扫描引擎时不会检查），行情跳空或盘口深度不足时可能卖不出去，或成交价明显低于止损线。Polymarket 的止损卖单使用 FOK 立即成交或全部取消；Predict.fun 使用 MARKET 单并受滑点上限约束。未成交时会在下一次扫描重试。请先用模拟账户验证。</p></div>
+                </div>
+              </SettingsSection>
+
+              <SettingsSection icon={Activity} title="实盘入场保护" description="在实盘订单签名前增加两道额外检查：一是实时读取盘口限价，拒绝价格漂移过大的订单；二是对加密分类市场设置最低置信度，防止在胜率不足的方向性盘口自动入场。模拟账户不受影响。">
+                <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2">
+                  <NumberField id="max_price_drift_bps" label="实时限价漂移上限" description="下单前读取真实盘口限价；若限价较上次扫描参考价偏高超过此值则拒绝下单。0 表示不限制漂移（仍检查绝对最高价）。默认 50 bps。" value={draft.shared.max_price_drift_bps} unit="bps" min={0} max={1000} step="1" error={errors.max_price_drift_bps} onChange={(value) => update('max_price_drift_bps', value)} />
+                  <NumberField id="crypto_min_confidence" label="加密市场最低置信度" description="加密分类市场的参考价必须高于此值才允许自动入场，独立于全局最低价。默认 0.50；防止在胜率低于 50% 的方向性盘口（如 5 分钟 Up/Down）自动买入。0 表示不限制。" value={draft.shared.crypto_min_confidence} unit="" min={0} max={1} step="0.01" error={errors.crypto_min_confidence} onChange={(value) => update('crypto_min_confidence', value)} />
                 </div>
               </SettingsSection>
 
