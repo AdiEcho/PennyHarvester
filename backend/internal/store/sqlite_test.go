@@ -363,9 +363,6 @@ func TestLegacySettingsPayloadUsesDefaultsForMissingFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.InitialBankroll != engine.DefaultSettings().InitialBankroll {
-		t.Fatalf("missing initial_bankroll should use the default, got %v", settings.InitialBankroll)
-	}
 	if settings.MinPrice != 0.96 {
 		t.Fatalf("existing values must be preserved, got %v", settings.MinPrice)
 	}

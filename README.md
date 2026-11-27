@@ -121,7 +121,7 @@
 
 - 默认 `fee_bps = 15`，对应 `p≈0.97`、类别费率 `0.05`，在本策略的 0.95–0.99 区间内整体偏保守。旧版本写入的默认 `0` 会在首次加载时一次性升级为 15；升级后如需 0 费（例如只做地缘政治这类免手续费市场）可以再手动改回。
 - 模拟账户仍采用固定 `fee_bps` 近似，不复刻 CLOB 的非线性费率曲线；要更贴近某个具体价位，按上表换算后填入即可。
-- `initial_bankroll`（模拟初始本金）在「账户管理 → 新建账户」弹窗里填写，直接写入该新账户的基准权益；省略时回落到策略页的「新建模拟账户默认资金」。两者都不会重算已有账户的历史现金或累计收益率。
+- `initial_bankroll`（模拟初始本金）在「账户管理 → 新建账户」弹窗里填写，直接写入该新账户的基准权益；创建模拟账户时必须填写且大于 0，省略或为 0 时后端拒绝创建。它不是策略参数，修改策略设置不会重算已有账户的历史现金或累计收益率。
 
 ### 实盘账户（`mode=live`）
 
@@ -198,7 +198,6 @@
 | 单笔金额 | `100 USD` | 每次买入的名义下单金额 |
 | 单市场 / 总敞口上限 | `250 / 1,000 USD` | 单一市场最大投入与账户总持仓投入上限 |
 | 单事件敞口上限 (`max_event_exposure`) | `250 USD` | 同一事件下全部市场的合计成本上限；一场选举或一场比赛的所有盘口共用一个结果，逐个买入等于同一注押很多次。`0` 表示不限 |
-| 模拟初始资金 | `10,000 USD` | 「新建账户」弹窗的初始资金与策略页默认模板；弹窗未填时使用该值。已有基准权益的账户不受影响 |
 | 模拟滑点 (`slippage_bps`) | `20 BPS` | 模拟买入时的价格上浮比例（0.20%） |
 | 模拟费用 (`fee_bps`) | `15 BPS` | 按名义金额计，≈ `类别费率 × (1 − p)`；见上表换算 |
 | 实盘手续费 | 自动计算 | 按市场 `FeeSchedule` 动态读取并核算 |
@@ -292,7 +291,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | **Polymarket 代理钱包**（`1`/`2`/`3`） | polymarket.com 注册的 Proxy / Safe / Deposit 钱包 | 仅签名（控制该钱包的 EOA） | **必填**，且不能等于私钥地址 | 可经 relayer 免 gas（本系统暂不代赎回） |
 
 - `1` = 旧版 Magic/Google Proxy，`2` = 旧版外部签名钱包的 Safe，`3` = Deposit Wallet（2026-05 之后新注册账号的默认类型）。
-- **邮箱 / Magic 登录的账号无法导出私钥**（由 Polymarket 托管），因此不能直接用于本系统实盘；需要另用一个能导出私钥的钱包，或把资金转到由自己私钥控制的地址。
+- **邮箱 / Magic 登录的账号可导出私钥**（Polymarket 官方 Magic.Link 导出页），导出后按代理钱包使用：旧版账号是 `1` Proxy，2026-05 之后的新账号是 `3` Deposit Wallet。导出步骤与注意事项见下文。
 - 保存前会做本地校验：EOA 模式带 Funder、代理模式缺 Funder、Funder 等于私钥地址都会直接拒绝，避免订单签给一个没有余额的地址。
 
 #### 钱包类型与 Funder 自动识别
@@ -308,18 +307,22 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 
 #### 邮箱登录账号如何实盘
 
-邮箱 / Google 登录的 Polymarket 账号由 Magic 托管私钥（MPC），网页上的下单是 Magic 在浏览器内完成签名，**私钥无法导出**。本系统需要本地签名，所以无法直接用这类账号下单。可行路径：
+邮箱 / Google 登录的 Polymarket 账号默认由 Magic 托管私钥（MPC），网页上的下单是 Magic 在浏览器内完成签名。Polymarket 提供官方导出入口，导出后私钥即可在本系统本地签名实盘：
 
-1. **迁移到可导出私钥的钱包（推荐）**
-   - 新建或导入一个 MetaMask / Rabby 等钱包（记下私钥）。
-   - 在 polymarket.com（邮箱账号）里把 USDC 提现到这个新地址，提现由 Magic 在浏览器签名，无需导出私钥。
+1. **直接导出 Magic 私钥（推荐）**
+   - 在 polymarket.com 登录邮箱 / Google 账号。
+   - 打开官方导出页 <https://reveal.magic.link/polymarket>，按提示登录 Magic.Link。
+   - 导出并妥善保存私钥，完成后退出 Magic.Link。
+   - 在本系统选「Polymarket 代理钱包」，填入该私钥并点「自动检测」：旧版邮箱账号会识别为 `1` Proxy，2026-05 之后的新账号会识别为 `3` Deposit Wallet，Funder 会一并填入。核对后保存。
+2. **迁移到独立钱包（可选）**
+   - 不想长期使用 Magic 私钥，或想把交易账户与登录账号分开：新建或导入一个 MetaMask / Rabby 等钱包（记下私钥）。
+   - 在 polymarket.com（邮箱账号）里把 USDC 提现到这个新地址，提现由 Magic 在浏览器签名。
    - 用新钱包登录一次 polymarket.com，让平台为它部署 Deposit 钱包（类型 `3`）。
    - 在本系统「Polymarket 代理钱包」里填入新钱包私钥，系统会自动识别为 Deposit Wallet（类型 `3`）并填好 Funder（也可点「自动检测」重试，或从个人菜单复制地址手动填入）。
    - 不想用 Polymarket 智能钱包也可以选「自托管 EOA」：USDC 直接在新地址上，但需自行完成 USDC 授权（自付 Polygon gas）。
-2. **Session Key（官方 beta，仅 Deposit 钱包）**：Deposit Wallet 所有者可以授权一个独立 EOA 签名者代为交易（可按 venue 限定、180 天过期、不能提现），参见 [Session Keys](https://docs.polymarket.com/trading/session-keys)。但授权本身仍需 owner 私钥签名 + Builder API Key + relayer，且订单需要 session-key 签名包装，本系统当前 SDK 未实现，暂不支持。
-3. **不要尝试“导出” Magic 私钥**：没有公开接口，也违反平台条款。
+3. **Session Key（官方 beta，仅 Deposit 钱包）**：Deposit Wallet 所有者可以授权一个独立 EOA 签名者代为交易（可按 venue 限定、180 天过期、不能提现），参见 [Session Keys](https://docs.polymarket.com/trading/session-keys)。但授权本身仍需 owner 私钥签名 + Builder API Key + relayer，且订单需要 session-key 签名包装，本系统当前 SDK 未实现，暂不支持。
 
-> 迁移后是新的钱包 / 新账户，旧账号的持仓与余额需在网页里自行赎回、提现；本系统不代赎回。
+> 导出的私钥等同于账号控制权：不要分享，不要提交到仓库，建议先用小额账号验证。迁移到新钱包后是新的账户，旧账号的持仓与余额需在网页里自行赎回、提现；本系统不代赎回。
 
 - **网页凭据的存储方式**：私钥、L2 Secret 与 Passphrase 以 AES-256-GCM 加密写入 SQLite；密钥文件默认位于数据库旁（`<DATABASE_PATH>.key`，权限 `0600`）。请将数据库与密钥文件一同备份；丢失密钥将无法解密已保存的凭据。网页与 API 永远不会返回明文私钥。
 - 若未手动提供 L2 API 凭据，系统会在首次执行实盘操作时自动通过私钥派生。
@@ -375,7 +378,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POST` | `/accounts/:id/positions/:positionId/redeem` | 对已结算仓位提交链上赎回交易（当前仅 Predict.fun），返回 `{venue, tx_hash, method}`；同一仓位已有活跃赎回时返回 409，不会重复发交易 |
 | `GET` | `/health` | 服务健康检查、默认账户模式、实盘配置与就绪状态 |
 | `GET` | `/accounts` | 获取所有账户列表（含实盘就绪状态、`signer` 与 `maker` 地址） |
-| `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper","venue":"predictfun","initial_bankroll":25000}`（`venue` 省略时默认为 `polymarket`，创建后不可更改；`initial_bankroll` 仅对模拟账户生效，省略或为 `0` 时使用当前账户策略里的默认资金，负数返回 400） |
+| `POST` | `/accounts` | 创建新账户，请求体：`{"name":"...","mode":"paper","venue":"predictfun","initial_bankroll":25000}`（`venue` 省略时默认为 `polymarket`，创建后不可更改；`initial_bankroll` 仅对模拟账户且为必填，必须大于 0，省略、为 0 或负数返回 400） |
 | `PATCH` | `/accounts/:id` | 修改账户名称、自动交易开关或设为默认账户 |
 | `DELETE` | `/accounts/:id` | 删除指定模拟账户（级联清除其持仓、订单与净值记录） |
 | `GET` | `/dashboard?account_id=1&range=7d` | 获取账户核心指标、引擎状态、数据源状态与净值曲线快照。`range` 支持 `1d / 3d / 7d / 15d / 1m`；曲线锚定窗口起点前的最后一个快照并降采样，首条真实快照之前的模拟历史按已平仓盈亏重建，重建点带 `estimated: true` 且不写回数据库；省略 `range` 时保持最近 500 个快照 |

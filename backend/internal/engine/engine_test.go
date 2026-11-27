@@ -191,7 +191,22 @@ func newTestEngineWithRegistry(t *testing.T, registry *venue.Registry) (*engine.
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The seeded paper account starts unfunded; tests that trade fund it here.
+	paper := accountByMode(t, instance, engine.AccountModePaper)
+	if err := repository.UpdateAccountBaseline(context.Background(), paper.ID, testPaperBankroll); err != nil {
+		t.Fatal(err)
+	}
 	return instance, repository
+}
+
+const testPaperBankroll = 10000
+
+func createTestAccount(instance *engine.Engine, ctx context.Context, name string, mode engine.AccountMode, v market.Venue) (engine.Account, error) {
+	bankroll := 0.0
+	if mode == engine.AccountModePaper {
+		bankroll = testPaperBankroll
+	}
+	return instance.CreateAccountWithBankroll(ctx, name, mode, v, bankroll)
 }
 
 // testCapabilities is the Polymarket-shaped fact sheet the engine needs for
@@ -1027,7 +1042,7 @@ func TestStopLossIsScopedToAccount(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
 	instance, _ := newTestEngine(t, provider, nil)
 	armed := accountByMode(t, instance, engine.AccountModePaper)
-	idle, err := instance.CreateAccount(ctx, "闲置模拟账户", engine.AccountModePaper, market.VenuePolymarket)
+	idle, err := createTestAccount(instance, ctx, "闲置模拟账户", engine.AccountModePaper, market.VenuePolymarket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1811,7 +1826,7 @@ func TestOrderRefusesPausedOrderBook(t *testing.T) {
 	}
 }
 
-func TestPaperBaselineIsStableWhenDefaultChanges(t *testing.T) {
+func TestPaperBaselineIsStableAcrossSettingsChanges(t *testing.T) {
 	provider := &fakeProvider{markets: map[string]market.Market{"one": binary("one", 0.98, 20000, 2)}}
 	instance, _ := newTestEngine(t, provider, nil)
 	paper := accountByMode(t, instance, engine.AccountModePaper)
@@ -1824,8 +1839,12 @@ func TestPaperBaselineIsStableWhenDefaultChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if before.Metrics.InitialBankroll != testPaperBankroll {
+		t.Fatalf("seeded paper baseline = %v, want %v", before.Metrics.InitialBankroll, testPaperBankroll)
+	}
 	settings := instance.Settings()
-	settings.InitialBankroll = 20000
+	settings.OrderSize = 150
+	settings.MaxPosition = 300
 	if err := instance.UpdateSettings(context.Background(), settings); err != nil {
 		t.Fatal(err)
 	}
@@ -1834,7 +1853,7 @@ func TestPaperBaselineIsStableWhenDefaultChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	if math.Abs(after.Metrics.Cash-before.Metrics.Cash) > 1e-9 {
-		t.Fatalf("changing the default bankroll rewrote an existing paper account: before=%+v after=%+v", before.Metrics, after.Metrics)
+		t.Fatalf("changing strategy settings rewrote an existing paper account: before=%+v after=%+v", before.Metrics, after.Metrics)
 	}
 	if math.Abs(after.Metrics.InitialBankroll-before.Metrics.InitialBankroll) > 1e-9 {
 		t.Fatalf("paper baseline changed: before=%v after=%v", before.Metrics.InitialBankroll, after.Metrics.InitialBankroll)
@@ -1919,7 +1938,7 @@ func TestManualScanAutoTradesSelectedAccountAndSkipsHeld(t *testing.T) {
 	}}
 	instance, _ := newTestEngine(t, provider, nil)
 	focused := accountByMode(t, instance, engine.AccountModePaper)
-	other, err := instance.CreateAccount(context.Background(), "other paper", engine.AccountModePaper, market.VenuePolymarket)
+	other, err := createTestAccount(instance, context.Background(), "other paper", engine.AccountModePaper, market.VenuePolymarket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2421,7 +2440,7 @@ func TestPaperFeeIsVenueAware(t *testing.T) {
 			t.Fatal(err)
 		}
 		enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
-		pfPaper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+		pfPaper, err := createTestAccount(instance, ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2474,7 +2493,7 @@ func TestExposureCapsAreVenueScoped(t *testing.T) {
 	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{
 		OrderSize: 100, MaxPosition: 110, MaxExposure: 120,
 	})
-	pfPaper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	pfPaper, err := createTestAccount(instance, ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2581,17 +2600,17 @@ func TestLiveAccountIsUniquePerVenue(t *testing.T) {
 		venue: market.VenuePredictFun, markets: map[string]market.Market{},
 	}, nil)
 	instance, _ := newTestEngineWithRegistry(t, registry)
-	if _, err := instance.CreateAccount(ctx, "another PM live", engine.AccountModeLive, market.VenuePolymarket); !errors.Is(err, engine.ErrAccountConflict) {
+	if _, err := createTestAccount(instance, ctx, "another PM live", engine.AccountModeLive, market.VenuePolymarket); !errors.Is(err, engine.ErrAccountConflict) {
 		t.Fatalf("a second Polymarket live account must conflict, got %v", err)
 	}
-	pfLive, err := instance.CreateAccount(ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
+	pfLive, err := createTestAccount(instance, ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
 	if err != nil {
 		t.Fatalf("a Predict.fun live account may coexist: %v", err)
 	}
 	if pfLive.Venue != market.VenuePredictFun || pfLive.Currency != market.CurrencyUSDT {
 		t.Fatalf("unexpected predictfun account: %+v", pfLive)
 	}
-	if _, err := instance.CreateAccount(ctx, "second PF live", engine.AccountModeLive, market.VenuePredictFun); !errors.Is(err, engine.ErrAccountConflict) {
+	if _, err := createTestAccount(instance, ctx, "second PF live", engine.AccountModeLive, market.VenuePredictFun); !errors.Is(err, engine.ErrAccountConflict) {
 		t.Fatalf("a second Predict.fun live account must conflict, got %v", err)
 	}
 	pmVenue := market.VenuePolymarket
@@ -2621,7 +2640,7 @@ func TestSettlementIsSkippedForVenuesWithoutSupport(t *testing.T) {
 		t.Fatal(err)
 	}
 	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
-	paper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	paper, err := createTestAccount(instance, ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2679,7 +2698,7 @@ func TestPredictFunPositionSettlesOnPublishedWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
-	paper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	paper, err := createTestAccount(instance, ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2770,7 +2789,7 @@ func TestPredictFunAmountsAreRoundedForAPI(t *testing.T) {
 		venue: market.VenuePredictFun, markets: map[string]market.Market{},
 	}, nil)
 	instance, repository := newTestEngineWithRegistry(t, registry)
-	pfPaper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	pfPaper, err := createTestAccount(instance, ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2893,7 +2912,7 @@ func TestRedeemPositionBurnsSettledSharesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
-	account, err := instance.CreateAccount(ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
+	account, err := createTestAccount(instance, ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2984,7 +3003,7 @@ func TestRedeemPositionRejectsOpenAndSimulated(t *testing.T) {
 		t.Fatal(err)
 	}
 	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
-	live, err := instance.CreateAccount(ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
+	live, err := createTestAccount(instance, ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2997,7 +3016,7 @@ func TestRedeemPositionRejectsOpenAndSimulated(t *testing.T) {
 	if _, err := instance.RedeemPosition(ctx, live.ID, open.ID); err == nil {
 		t.Fatal("an unsettled position must not be redeemable")
 	}
-	paper, err := instance.CreateAccount(ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
+	paper, err := createTestAccount(instance, ctx, "PF paper", engine.AccountModePaper, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -227,7 +227,6 @@ type Settings struct {
 	ScanIntervalSeconds int     `json:"scan_interval_seconds"`
 	SlippageBPS         float64 `json:"slippage_bps"`
 	FeeBPS              float64 `json:"fee_bps"`
-	InitialBankroll     float64 `json:"initial_bankroll"`
 	// DefaultCategory only controls which category the radar opens with. It
 	// does not change automatic trading; SportsPolicy does.
 	DefaultCategory string `json:"default_category"`
@@ -321,8 +320,8 @@ func DefaultSettings() Settings {
 		MinPrice: 0.95, MaxPrice: 0.99, MaxDays: 30, MinLiquidity: 10000,
 		OrderSize: 100, MaxPosition: 250, MaxExposure: 1000, MaxEventExposure: 250,
 		ScanIntervalSeconds: 60, SlippageBPS: 20, FeeBPS: DefaultFeeBPS,
-		InitialBankroll: 10000, DefaultCategory: RadarCategoryNonSports,
-		SportsPolicy: SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
+		DefaultCategory: RadarCategoryNonSports,
+		SportsPolicy:    SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
 		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5, CryptoEntryWindowSeconds: 60,
 		StopLossEnabled: false, StopLossRatio: DefaultStopLossRatio,
 		FeeModelVersion: FeeModelVersion,
@@ -346,8 +345,8 @@ func (s Settings) Validate() error {
 	if s.MinLiquidity < 0 || math.IsNaN(s.MinLiquidity) || math.IsInf(s.MinLiquidity, 0) {
 		return fmt.Errorf("最低流动性不能小于 0")
 	}
-	if !finitePositive(s.OrderSize) || !finitePositive(s.MaxPosition) || !finitePositive(s.MaxExposure) || !finitePositive(s.InitialBankroll) {
-		return fmt.Errorf("订单、持仓、敞口和初始资金必须为有限正数")
+	if !finitePositive(s.OrderSize) || !finitePositive(s.MaxPosition) || !finitePositive(s.MaxExposure) {
+		return fmt.Errorf("订单、持仓和敞口必须为有限正数")
 	}
 	if s.MaxPosition < s.OrderSize {
 		return fmt.Errorf("单市场敞口上限不能小于单笔金额")

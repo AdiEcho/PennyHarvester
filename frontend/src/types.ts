@@ -354,7 +354,6 @@ export interface Settings {
   scan_interval_seconds: number
   slippage_bps: number
   fee_bps: number
-  initial_bankroll: number
   default_category: string
   sports_policy: string
   max_price_change_24h: number

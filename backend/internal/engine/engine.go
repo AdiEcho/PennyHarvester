@@ -89,21 +89,6 @@ func New(ctx context.Context, repo Repository, venues *venue.Registry, proxy *ne
 		// booting; the system settings page will surface the stored value.
 		proxy = netproxy.NewMust(netproxy.DefaultConfig())
 	}
-	// Paper accounts created before the baseline was persisted (or legacy
-	// accounts) get the current default once. After that the stored baseline
-	// is authoritative and changing the global default does not rewrite
-	// historical performance.
-	accounts, err := repo.ListAccounts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, account := range accounts {
-		if account.Mode == AccountModePaper && account.BaselineEquity <= 0 {
-			if err := repo.UpdateAccountBaseline(ctx, account.ID, settings.InitialBankroll); err != nil {
-				return nil, err
-			}
-		}
-	}
 	if venues == nil {
 		venues = venue.NewRegistry()
 	}

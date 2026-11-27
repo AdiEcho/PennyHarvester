@@ -215,7 +215,7 @@ func TestRedeemPositionRefusesBeforeSigning(t *testing.T) {
 	// A paper account holds simulated shares; burning them on chain would spend
 	// gas to burn nothing.
 	created := requestWithCookie(t, handler, http.MethodPost, "/api/v1/accounts",
-		map[string]string{"name": "PF paper", "mode": "paper", "venue": "predictfun"}, cookies)
+		map[string]any{"name": "PF paper", "mode": "paper", "venue": "predictfun", "initial_bankroll": 10000}, cookies)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create account: %d %s", created.Code, created.Body.String())
 	}

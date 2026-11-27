@@ -59,7 +59,7 @@ func newSettledChainFixture(t *testing.T) *settledChainFixture {
 		t.Fatal(err)
 	}
 	enableVenue(t, instance, market.VenuePredictFun, engine.VenueSettings{})
-	account, err := instance.CreateAccount(ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
+	account, err := createTestAccount(instance, ctx, "PF live", engine.AccountModeLive, market.VenuePredictFun)
 	if err != nil {
 		t.Fatal(err)
 	}

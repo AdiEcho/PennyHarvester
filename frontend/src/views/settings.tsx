@@ -38,7 +38,7 @@ import { TabBar, type TabItem } from '@/components/ui/tab-bar'
 import { PageHeader } from '@/components/page-header'
 import { ModeBadge, VenueChip } from '@/components/status-badges'
 
-const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'max_event_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'initial_bankroll', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes', 'crypto_entry_window_seconds', 'stop_loss_ratio'] as const
+const numericKeys = ['min_price', 'max_price', 'max_days', 'min_liquidity', 'order_size', 'max_position', 'max_exposure', 'max_event_exposure', 'scan_interval_seconds', 'slippage_bps', 'fee_bps', 'max_price_change_24h', 'entry_window_minutes', 'sports_entry_window_minutes', 'crypto_entry_window_seconds', 'stop_loss_ratio'] as const
 const selectKeys = ['default_category', 'sports_policy'] as const
 type NumericKey = typeof numericKeys[number]
 type SelectKey = typeof selectKeys[number]
@@ -104,7 +104,6 @@ function toDraft(settings: Settings): Draft {
       scan_interval_seconds: String(settings.scan_interval_seconds),
       slippage_bps: String(settings.slippage_bps),
       fee_bps: String(settings.fee_bps),
-      initial_bankroll: String(settings.initial_bankroll),
       default_category: settings.default_category,
       sports_policy: settings.sports_policy,
       max_price_change_24h: String(settings.max_price_change_24h),
@@ -134,7 +133,6 @@ function toShared(draft: SharedDraft) {
     scan_interval_seconds: Number(draft.scan_interval_seconds),
     slippage_bps: Number(draft.slippage_bps),
     fee_bps: Number(draft.fee_bps),
-    initial_bankroll: Number(draft.initial_bankroll),
     default_category: draft.default_category,
     sports_policy: draft.sports_policy,
     max_price_change_24h: Number(draft.max_price_change_24h),
@@ -197,7 +195,6 @@ function validateShared(shared: SharedDraft): FieldErrors {
   if (!Number.isInteger(settings.scan_interval_seconds) || settings.scan_interval_seconds < 10 || settings.scan_interval_seconds > 86400) errors.scan_interval_seconds = '请输入 10–86400 之间的整数秒数。'
   if (settings.slippage_bps < 0 || settings.slippage_bps > 1000) errors.slippage_bps = '滑点范围为 0–1000 bps。'
   if (settings.fee_bps < 0 || settings.fee_bps > 1000) errors.fee_bps = '费用范围为 0–1000 bps。'
-  if (settings.initial_bankroll <= 0) errors.initial_bankroll = '模拟初始资金必须大于 0。'
   if (!defaultCategoryOptions.some((option) => option.value === settings.default_category)) errors.default_category = '请选择有效的默认分类。'
   if (!sportsPolicyOptions.some((option) => option.value === settings.sports_policy)) errors.sports_policy = '请选择有效的体育市场策略。'
   if (settings.max_price_change_24h < 0 || settings.max_price_change_24h > 1) errors.max_price_change_24h = '请输入 0–1 之间的数值（0 表示不限制）。'
@@ -341,7 +338,7 @@ function SettingsSection({ icon: Icon, title, description, children }: {
   )
 }
 
-function AccountSection({ account, accounts, defaultBankroll }: { account: Account; accounts: Account[]; defaultBankroll: string }) {
+function AccountSection({ account, accounts }: { account: Account; accounts: Account[] }) {
   const { refreshAccounts, selectAccount } = useAccount()
   const { toast } = useToast()
   const [name, setName] = useState(account.name)
@@ -468,7 +465,7 @@ function AccountSection({ account, accounts, defaultBankroll }: { account: Accou
             <div className="mt-3 flex flex-wrap gap-2">
               {!account.is_default && <Button variant="ghost" size="sm" onClick={() => void save({ is_default: true }, '默认账户已切换')} disabled={saving}><Star className="h-3.5 w-3.5" />设为默认</Button>}
               {!isLive && !account.is_default && <Button variant="ghost" size="sm" className="text-rose-600 hover:bg-rose-50 hover:text-rose-700" onClick={() => void removeAccount()} disabled={saving}><Trash2 className="h-3.5 w-3.5" />删除</Button>}
-              <Button variant="ghost" size="sm" onClick={() => { setNewBankroll(defaultBankroll); setCreateOpen(true) }}><Plus className="h-3.5 w-3.5" />新建账户</Button>
+              <Button variant="ghost" size="sm" onClick={() => { setNewBankroll(''); setCreateOpen(true) }}><Plus className="h-3.5 w-3.5" />新建账户</Button>
             </div>
           </div>
 
@@ -479,10 +476,13 @@ function AccountSection({ account, accounts, defaultBankroll }: { account: Accou
             </div>
             <dl className="mt-4 space-y-2 text-xs">
               <div className="flex justify-between gap-3"><dt className="text-slate-500">账户模式</dt><dd className="font-medium text-slate-800">{isLive ? `真实资金 · ${meta.label} · ${meta.orderTypes.join(' / ')}` : `虚拟资金 · ${meta.label} · 本地撮合`}</dd></div>
-              <div className="flex justify-between gap-3"><dt className="text-slate-500">{isLive ? '基准权益' : '模拟基准权益'}</dt><dd className="font-medium tabular-nums text-slate-800">{account.baseline_equity > 0 ? fmtMoney(account.baseline_equity, venue) : isLive ? '待首次余额同步' : '待初始化'}</dd></div>
+              <div className="flex justify-between gap-3"><dt className="text-slate-500">{isLive ? '基准权益' : '模拟基准权益'}</dt><dd className="font-medium tabular-nums text-slate-800">{account.baseline_equity > 0 ? fmtMoney(account.baseline_equity, venue) : isLive ? '待首次余额同步' : '未设置'}</dd></div>
               {isLive && <div className="flex justify-between gap-3"><dt className="text-slate-500">交易钱包 (Maker)</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-700" title={account.live_maker || account.live_signer}>{account.live_maker || account.live_signer || '未配置'}</dd></div>}
               {isLive && account.live_maker && account.live_signer && account.live_maker.toLowerCase() !== account.live_signer.toLowerCase() && <div className="flex justify-between gap-3"><dt className="text-slate-500">签名地址</dt><dd className="max-w-[220px] truncate font-mono text-[11px] text-slate-500" title={account.live_signer}>{account.live_signer}</dd></div>}
             </dl>
+            {!isLive && account.baseline_equity <= 0 && (
+              <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">该模拟账户没有初始资金，无法下单。请删除后重新创建，并在创建时填写初始资金。</p>
+            )}
             {isLive && !account.live_ready && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-rose-200 bg-surface/70 p-3 text-xs leading-5 text-rose-700">
                 <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -555,11 +555,12 @@ function AccountSection({ account, accounts, defaultBankroll }: { account: Accou
           {newMode === 'paper' && (
             <NumberField
               id="new-account-bankroll"
-              label="模拟初始资金"
-              description={`写入该账户的基准权益，单位 ${venueMeta(newVenue).currency}；创建后不会随策略页的默认值变化而重算。`}
+              label="模拟初始资金（必填）"
+              description={`写入该账户的基准权益，必须大于 0，单位 ${venueMeta(newVenue).currency}；创建后保持不变，不会随策略参数修改而重算。`}
               value={newBankroll}
               unit={venueMeta(newVenue).currency}
               min={0}
+              placeholder="请输入初始资金"
               onChange={setNewBankroll}
             />
           )}
@@ -810,7 +811,7 @@ export function SettingsView() {
         {dashboardQuery.error && <div className="break-words border-t border-white/10 bg-white/5 px-5 py-3 text-xs text-rose-300">{engine ? `权威状态刷新失败，当前显示上一轮开关状态：${dashboardQuery.error}` : dashboardQuery.error}</div>}
       </Card>
 
-      {account && <div className="mb-4"><AccountSection key={account.id} account={account} accounts={accounts} defaultBankroll={settingsQuery.data ? String(settingsQuery.data.initial_bankroll) : ''} /></div>}
+      {account && <div className="mb-4"><AccountSection key={account.id} account={account} accounts={accounts} /></div>}
 
       {settingsQuery.isLoading ? <Card><div className="grid gap-5 p-6 sm:grid-cols-2"><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /></div></Card> : settingsQuery.error && !settingsQuery.data ? <Card><ErrorState message={settingsQuery.error} onRetry={settingsQuery.refresh} /></Card> : !draft ? <Card><div className="grid gap-5 p-6 sm:grid-cols-2"><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /><Skeleton className="h-24" /></div></Card> : (
         <form id="settings-form" onSubmit={(event) => { event.preventDefault(); void save() }} className="space-y-4">
@@ -846,7 +847,6 @@ export function SettingsView() {
 
               <SettingsSection icon={ShieldCheck} title="资金与风控（当前账户）" description="这里的金额属于当前账户，单位随场所变化（Polymarket = USDC、Predict.fun = USDT）。需要不同的单笔金额或敞口时，在对应场所页签填写覆写值；其他账户不受影响。">
                 <div className="grid gap-x-5 gap-y-6 sm:grid-cols-2 xl:grid-cols-4">
-                  <NumberField id="initial_bankroll" label="新建模拟账户默认资金" description="只作为「新建账户」弹窗的预填值；弹窗里填写的金额直接写入新账户的基准权益，已有基准权益的账户不会因修改此值而重算历史。" value={draft.shared.initial_bankroll} unit="场所币" min={0} error={errors.initial_bankroll} onChange={(value) => update('initial_bankroll', value)} />
                   <NumberField id="order_size" label="单笔金额（默认）" description="每次自动买入的目标名义金额；机会雷达的「盘口估算净收益」也按该场所的金额报价。" value={draft.shared.order_size} unit="场所币" min={0} error={errors.order_size} onChange={(value) => update('order_size', value)} />
                   <NumberField id="max_position" label="单市场持仓上限（默认）" description="不得低于单笔金额。" value={draft.shared.max_position} unit="场所币" min={0} error={errors.max_position} onChange={(value) => update('max_position', value)} />
                   <NumberField id="max_exposure" label="总敞口上限（默认）" description="单个场所全部未平仓头寸的风险预算上限；不得低于单市场持仓上限。绝不跨场所合并。" value={draft.shared.max_exposure} unit="场所币" min={0} error={errors.max_exposure} onChange={(value) => update('max_exposure', value)} />

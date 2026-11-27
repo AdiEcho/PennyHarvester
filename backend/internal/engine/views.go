@@ -174,11 +174,6 @@ func (e *Engine) decorateAccount(account Account) Account {
 	account.Venue = account.EffectiveVenue()
 	account.Currency = account.EffectiveCurrency()
 	account.BaselineEquity = roundForVenue(account.Venue, account.BaselineEquity)
-	if account.Mode == AccountModePaper && account.BaselineEquity <= 0 {
-		// New() backfills persisted accounts; this is a last-resort display
-		// fallback for a caller that constructed an engine without New.
-		account.BaselineEquity = e.Settings().InitialBankroll
-	}
 	account.LiveConfigured = false
 	account.LiveReady = false
 	account.LiveSigner = ""
@@ -203,15 +198,9 @@ func (e *Engine) decorateAccount(account Account) Account {
 	return account
 }
 
-func (e *Engine) CreateAccount(ctx context.Context, name string, mode AccountMode, v market.Venue) (Account, error) {
-	return e.CreateAccountWithBankroll(ctx, name, mode, v, 0)
-}
-
 // CreateAccountWithBankroll creates an account with an explicit paper baseline.
-// A non-positive initialBankroll keeps the historical behaviour and falls back
-// to the strategy block's InitialBankroll, so existing callers are unaffected.
-// The value is only meaningful for paper accounts: a live baseline is synced
-// from the wallet balance, never from a form field.
+// A paper account requires a positive initialBankroll; live baselines are
+// synced from the wallet balance and never come from the form.
 func (e *Engine) CreateAccountWithBankroll(ctx context.Context, name string, mode AccountMode, v market.Venue, initialBankroll float64) (Account, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -232,6 +221,8 @@ func (e *Engine) CreateAccountWithBankroll(ctx context.Context, name string, mod
 	}
 	if mode != AccountModePaper {
 		initialBankroll = 0
+	} else if initialBankroll <= 0 {
+		return Account{}, fmt.Errorf("%w: 模拟账户必须填写初始资金", ErrInvalidOrder)
 	}
 	e.tradeMu.Lock()
 	defer e.tradeMu.Unlock()
@@ -250,16 +241,7 @@ func (e *Engine) CreateAccountWithBankroll(ctx context.Context, name string, mod
 		Name: name, Mode: mode, Venue: v, Currency: currencyForVenue(v), AutoTrade: false, CreatedAt: time.Now().UTC(),
 	}
 	if mode == AccountModePaper {
-		// The form value wins; an empty field keeps the account's strategy
-		// default so the two entry points never disagree in silence.
-		bankroll := initialBankroll
-		if bankroll <= 0 {
-			bankroll = e.Settings().InitialBankroll
-		}
-		if bankroll <= 0 {
-			return Account{}, fmt.Errorf("%w: 模拟初始资金必须大于 0", ErrInvalidOrder)
-		}
-		account.BaselineEquity = roundForVenue(v, bankroll)
+		account.BaselineEquity = roundForVenue(v, initialBankroll)
 	}
 	account, err = e.repo.CreateAccount(ctx, account)
 	if err != nil {
@@ -395,13 +377,8 @@ func (e *Engine) dashboard(ctx context.Context, accountID int64, window time.Dur
 	if err != nil {
 		return Dashboard{}, err
 	}
-	settings, err := e.settingsForAccount(ctx, account.ID)
-	if err != nil {
-		return Dashboard{}, err
-	}
 	metrics := Metrics{
 		Mode: string(account.Mode), Venue: account.EffectiveVenue(), Currency: account.EffectiveCurrency(),
-		InitialBankroll: settings.InitialBankroll,
 	}
 	wins, marketValue := 0, 0.0
 	for _, position := range positions {
@@ -427,13 +404,9 @@ func (e *Engine) dashboard(ctx context.Context, accountID int64, window time.Dur
 	}
 	metrics.TotalPNL = metrics.RealizedPNL + metrics.UnrealizedPNL
 	if account.Mode == AccountModePaper {
-		baseline := account.BaselineEquity
-		if baseline <= 0 {
-			baseline = settings.InitialBankroll
-		}
-		metrics.Cash = baseline + metrics.RealizedPNL - metrics.OpenExposure
+		metrics.Cash = account.BaselineEquity + metrics.RealizedPNL - metrics.OpenExposure
 		metrics.Equity = metrics.Cash + marketValue
-		metrics.InitialBankroll = baseline
+		metrics.InitialBankroll = account.BaselineEquity
 		if metrics.InitialBankroll > 0 {
 			metrics.TotalReturn = metrics.TotalPNL / metrics.InitialBankroll
 		}

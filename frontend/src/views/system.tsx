@@ -542,7 +542,6 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
           {environment.funder && <Badge variant="info">环境 Funder {environment.funder.slice(0, 6)}…{environment.funder.slice(-4)}</Badge>}
           {environmentCredentialsSet && <Badge variant="info">环境变量已提供 L2 凭据</Badge>}
           {environmentCredentialsPartial && <Badge variant="warning">环境变量 L2 凭据不完整</Badge>}
-          {!environment.private_key_set && !environment.funder && !environment.api_key_set && !environment.api_secret_set && !environment.api_passphrase_set && <Badge variant="default">未检测到实盘环境变量</Badge>}
         </div>
       </div>
 
@@ -581,7 +580,7 @@ function LiveTradingSection({ system, draft, dirty, saving, busy, clobBaseURL, r
             <span className="mt-1 block text-xs leading-5 text-slate-500">私钥只负责签名，pUSD 与持仓在 Funder（Proxy / Safe / Deposit）地址。下单仍由私钥签名后提交 CLOB。</span>
           </button>
         </div>
-        <p className="mt-2 text-xs leading-5 text-slate-400">邮箱 / Magic 登录的账号私钥由 Polymarket 托管、无法导出，不能直接用于本系统实盘；请改用可导出私钥的钱包（步骤见 README「邮箱登录账号如何实盘」）。</p>
+        <p className="mt-2 text-xs leading-5 text-slate-400">邮箱 / Magic 登录的账号可从 Polymarket 官方导出私钥（登录后访问 reveal.magic.link/polymarket），导出后按代理钱包填入即可实盘；步骤见 README「邮箱登录账号如何实盘」。</p>
       </div>
 
       <div className="mt-5 grid gap-x-5 gap-y-5 lg:grid-cols-3">

@@ -305,9 +305,6 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		totalExposure += position.Cost
 	}
 	baseline := account.BaselineEquity
-	if baseline <= 0 {
-		baseline = settings.InitialBankroll
-	}
 	cash := baseline + realized - totalExposure
 	now := time.Now().UTC()
 	for _, opportunity := range opportunities {
@@ -851,10 +848,10 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	totalExposure += risk.total
 	marketExposure += risk.market
 	eventExposure += risk.event
-	baseline := account.BaselineEquity
-	if baseline <= 0 {
-		baseline = settings.InitialBankroll
+	if account.BaselineEquity <= 0 {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "模拟账户未设置初始资金，请删除后重新创建并填写初始资金", "")
 	}
+	baseline := account.BaselineEquity
 	cash := baseline + realized - totalExposure
 	reason := ""
 	switch {

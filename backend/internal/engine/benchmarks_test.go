@@ -130,6 +130,8 @@ func benchmarkMarkets(count int) []market.Market {
 	return markets
 }
 
+const benchmarkPaperBankroll = 10000
+
 func newBenchmarkEngine(b *testing.B, paperAccounts int, provider *benchProvider) (*Engine, *benchRepository) {
 	b.Helper()
 	settings := DefaultSettings()
@@ -139,7 +141,7 @@ func newBenchmarkEngine(b *testing.B, paperAccounts int, provider *benchProvider
 	for i := 1; i <= paperAccounts; i++ {
 		accounts = append(accounts, Account{
 			ID: int64(i), Name: fmt.Sprintf("Benchmark Paper %d", i), Mode: AccountModePaper,
-			Venue: market.VenuePolymarket, BaselineEquity: settings.InitialBankroll,
+			Venue: market.VenuePolymarket, BaselineEquity: benchmarkPaperBankroll,
 			CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		})
 	}

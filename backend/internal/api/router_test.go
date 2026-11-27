@@ -92,6 +92,19 @@ func setupRouterWithLive(t *testing.T, live engine.LiveExecutor) (http.Handler, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The seeded paper account starts unfunded; API tests fund it before trading.
+	const testPaperBankroll = 10000
+	accounts, err := instance.Accounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range accounts.Items {
+		if account.Mode == engine.AccountModePaper {
+			if err := repository.UpdateAccountBaseline(context.Background(), account.ID, testPaperBankroll); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	return api.NewRouter(instance, "", api.NewAuthenticator(repository)), instance
 }
 
@@ -265,7 +278,7 @@ func TestLiveOrderRequiresConfiguration(t *testing.T) {
 func TestAccountCreationAndDefaultSwitch(t *testing.T) {
 	handler, _ := setupRouter(t)
 	created := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
-		"name": "策略测试", "mode": "paper",
+		"name": "策略测试", "mode": "paper", "initial_bankroll": 10000,
 	})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create account failed: %d %s", created.Code, created.Body.String())
@@ -303,19 +316,12 @@ func TestAccountCreationUsesSubmittedBankroll(t *testing.T) {
 	if account.BaselineEquity != 25000 {
 		t.Fatalf("submitted bankroll was ignored: baseline=%v", account.BaselineEquity)
 	}
-	// Omitting the field keeps the strategy default instead of writing zero.
+	// Omitting the field must fail: a paper account has no built-in default.
 	fallback := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
 		"name": "默认本金", "mode": "paper",
 	})
-	if fallback.Code != http.StatusCreated {
-		t.Fatalf("create account failed: %d %s", fallback.Code, fallback.Body.String())
-	}
-	var inherited engine.Account
-	if err := json.Unmarshal(fallback.Body.Bytes(), &inherited); err != nil {
-		t.Fatal(err)
-	}
-	if inherited.BaselineEquity <= 0 {
-		t.Fatalf("default bankroll was not applied: baseline=%v", inherited.BaselineEquity)
+	if fallback.Code != http.StatusBadRequest {
+		t.Fatalf("missing bankroll should be rejected: %d %s", fallback.Code, fallback.Body.String())
 	}
 	negative := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
 		"name": "非法本金", "mode": "paper", "initial_bankroll": -100,
@@ -504,7 +510,7 @@ func TestVenueFilterAppliesBeforeOrderTotals(t *testing.T) {
 func TestAccountVenueCreationAndImmutability(t *testing.T) {
 	handler, _ := setupRouter(t)
 	created := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
-		"name": "Predict.fun 模拟", "mode": "paper", "venue": "predictfun",
+		"name": "Predict.fun 模拟", "mode": "paper", "venue": "predictfun", "initial_bankroll": 10000,
 	})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("creating a predictfun account failed: %d %s", created.Code, created.Body.String())
@@ -607,7 +613,7 @@ func TestOpportunitiesResponseCarriesVenues(t *testing.T) {
 func TestOrderRejectsVenueMismatchAndUnconfiguredLive(t *testing.T) {
 	handler, _ := setupRouter(t)
 	created := request(t, handler, http.MethodPost, "/api/v1/accounts", map[string]any{
-		"name": "PF paper", "mode": "paper", "venue": "predictfun",
+		"name": "PF paper", "mode": "paper", "venue": "predictfun", "initial_bankroll": 10000,
 	})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("creating predictfun account failed: %d %s", created.Code, created.Body.String())
