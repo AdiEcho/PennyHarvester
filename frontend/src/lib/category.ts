@@ -42,6 +42,24 @@ export function matchesCategory(item: Opportunity, filter: CategoryFilter) {
   return item.category === filter
 }
 
+export const defaultCategoryOptions: { value: string; label: string }[] = [
+  { value: 'non_sports', label: '非体育（推荐）' },
+  { value: 'all', label: '全部分类' },
+  { value: 'politics', label: '政治' },
+  { value: 'crypto', label: '加密' },
+  { value: 'finance', label: '金融' },
+  { value: 'tech', label: '科技' },
+  { value: 'culture', label: '文化' },
+  { value: 'sports', label: '体育' },
+  { value: 'other', label: '其他' },
+]
+
+export const sportsPolicyOptions: { value: string; label: string }[] = [
+  { value: 'exclude_games', label: '排除体育赛事盘口（推荐）' },
+  { value: 'exclude_all', label: '排除全部体育分类' },
+  { value: 'allow', label: '保留体育市场并标记风险' },
+]
+
 export function categoryCounts(items: Opportunity[]) {
   const counts: Record<CategoryFilter, number> = {
     all: items.length,

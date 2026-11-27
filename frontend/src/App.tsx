@@ -20,18 +20,22 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
+  const viewMap: Record<View, React.ReactElement> = {
+    dashboard: <DashboardView onOpenOrders={() => navigate('orders')} />,
+    opportunities: <OpportunitiesView onOrderCreated={() => navigate('positions')} />,
+    positions: <PositionsView />,
+    orders: <OrdersView />,
+    operations: <OperationsView />,
+    settings: <SettingsView />,
+    system: <SystemView />,
+  }
+
   return (
     <AuthGate>
       <AccountProvider>
         <AppShell view={view} onNavigate={navigate}>
           <Suspense fallback={<LoadingBlock />}>
-            {view === 'dashboard' && <DashboardView onOpenOrders={() => navigate('orders')} />}
-            {view === 'opportunities' && <OpportunitiesView onOrderCreated={() => navigate('positions')} />}
-            {view === 'positions' && <PositionsView />}
-            {view === 'orders' && <OrdersView />}
-            {view === 'operations' && <OperationsView />}
-            {view === 'settings' && <SettingsView />}
-            {view === 'system' && <SystemView />}
+            {viewMap[view]}
           </Suspense>
         </AppShell>
       </AccountProvider>
