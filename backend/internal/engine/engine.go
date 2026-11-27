@@ -14,7 +14,10 @@ import (
 )
 
 const (
-	localizationTimeout    = 2 * time.Second
+	localizationTimeout = 2 * time.Second
+	// livePriceQuoteTimeout bounds the real-time CLOB quote that guards each
+	// automatic buy. A slow venue must not hold the order path open.
+	livePriceQuoteTimeout  = 2 * time.Second
 	positionRefreshTimeout = 3 * time.Second
 	// positionBatchTimeout bounds the one batched read that resolves every
 	// position market the scan view did not carry. Marking runs even when the

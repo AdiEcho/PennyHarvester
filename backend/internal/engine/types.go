@@ -256,6 +256,15 @@ type Settings struct {
 	// which the stop triggers. 0.70 means "exit when the mark falls to 70% of
 	// the entry price", not an absolute price of 0.70.
 	StopLossRatio float64 `json:"stop_loss_ratio"`
+	// MaxPriceDriftBPS rejects a live order when the real-time CLOB limit
+	// price exceeds the scan-time reference price by more than this many basis
+	// points. Zero disables the drift guard.
+	MaxPriceDriftBPS float64 `json:"max_price_drift_bps"`
+	// CryptoMinConfidence is the minimum outcome price required for automatic
+	// entry in crypto category markets, independent of MinPrice. It prevents
+	// entries on directional (Up/Down) markets whose implied win probability is
+	// below this threshold. Zero disables the guard.
+	CryptoMinConfidence float64 `json:"crypto_min_confidence"`
 	// FeeModelVersion is managed by the server; clients must not set it.
 	FeeModelVersion int `json:"fee_model_version"`
 	// Venues holds per-venue overrides and the per-venue paper fee. Missing
@@ -324,6 +333,7 @@ func DefaultSettings() Settings {
 		SportsPolicy:    SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
 		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5, CryptoEntryWindowSeconds: 60,
 		StopLossEnabled: false, StopLossRatio: DefaultStopLossRatio,
+		MaxPriceDriftBPS: 50, CryptoMinConfidence: 0.50,
 		FeeModelVersion: FeeModelVersion,
 		// Polymarket stays enabled for existing installations; Predict.fun is
 		// opt-in because it was never traded by this build before.
@@ -385,6 +395,14 @@ func (s Settings) Validate() error {
 	}
 	if s.CryptoEntryWindowSeconds < 0 || s.CryptoEntryWindowSeconds > MaxCryptoEntryWindowSeconds {
 		return fmt.Errorf("加密尾盘下单窗口须为 0–%d 秒", MaxCryptoEntryWindowSeconds)
+	}
+	if s.MaxPriceDriftBPS < 0 || s.MaxPriceDriftBPS > 1000 ||
+		math.IsNaN(s.MaxPriceDriftBPS) || math.IsInf(s.MaxPriceDriftBPS, 0) {
+		return fmt.Errorf("实时价格漂移上限须为 0–1000 BPS")
+	}
+	if s.CryptoMinConfidence < 0 || s.CryptoMinConfidence > 1 ||
+		math.IsNaN(s.CryptoMinConfidence) || math.IsInf(s.CryptoMinConfidence, 0) {
+		return fmt.Errorf("加密市场最低置信度须为 0–1")
 	}
 	if s.StopLossRatio <= 0 || s.StopLossRatio >= 1 ||
 		math.IsNaN(s.StopLossRatio) || math.IsInf(s.StopLossRatio, 0) {
@@ -1463,6 +1481,10 @@ func findOpportunity(m market.Market, outcomeName, tokenID string, settings Sett
 		}
 		if outcome.Price < settings.MinPrice || outcome.Price > settings.MaxPrice {
 			return Opportunity{}, fmt.Errorf("%w: 参考价 %.4f 不在 %.4f–%.4f 内", ErrInvalidOrder, outcome.Price, settings.MinPrice, settings.MaxPrice)
+		}
+		if settings.CryptoMinConfidence > 0 && market.Category(m.Category) == market.CategoryCrypto &&
+			outcome.Price < settings.CryptoMinConfidence {
+			return Opportunity{}, fmt.Errorf("%w: 加密市场参考价 %.4f 低于最低置信度 %.4f", ErrInvalidOrder, outcome.Price, settings.CryptoMinConfidence)
 		}
 		return opportunityFor(m, outcome, now), nil
 	}

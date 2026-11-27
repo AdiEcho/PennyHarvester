@@ -1033,6 +1033,34 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "超过单事件敞口上限（含预估手续费）", "")
 	}
 
+	// O1: real-time CLOB quote guard. Read the live ask side before signing so
+	// a price that moved since the last scan cannot slip through.
+	liveQuoteCtx, cancelLiveQuote := context.WithTimeout(ctx, livePriceQuoteTimeout)
+	liveQuote, liveQuoteErr := exec.Quote(liveQuoteCtx, opportunity.TokenID, opportunity.ConditionID, amount)
+	cancelLiveQuote()
+	if liveQuoteErr != nil {
+		_ = e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "无法获取实时盘口报价："+liveQuoteErr.Error(), "")
+		return Position{}, fmt.Errorf("%w: 无法获取实时盘口报价: %v", ErrUpstream, liveQuoteErr)
+	}
+	if liveQuote.LimitPrice > settings.MaxPrice+1e-9 {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
+			fmt.Sprintf("实时限价 %.4f 超过最高价 %.4f，拒绝下单", liveQuote.LimitPrice, settings.MaxPrice), "")
+	}
+	if settings.MaxPriceDriftBPS > 0 && opportunity.Price > 0 {
+		drift := liveQuote.LimitPrice - opportunity.Price
+		if drift > settings.MaxPriceDriftBPS/10000+1e-9 {
+			return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
+				fmt.Sprintf("实时限价 %.4f 较参考价 %.4f 偏移 %.1f BPS，超过上限 %.0f BPS，拒绝下单",
+					liveQuote.LimitPrice, opportunity.Price, drift*10000, settings.MaxPriceDriftBPS), "")
+		}
+	}
+
+	// O3: record scan-to-order latency for diagnostics.
+	pendingReason := "实盘订单已签名，等待成交回报"
+	if !opportunity.FetchedAt.IsZero() {
+		pendingReason += fmt.Sprintf("（报价年龄 %d ms）", time.Since(opportunity.FetchedAt).Milliseconds())
+	}
+
 	var pending Order
 	fill, err := placeLiveBuy(ctx, exec, venue.ProtocolOrder{
 		TokenID: opportunity.TokenID, ConditionID: opportunity.ConditionID,
@@ -1043,7 +1071,7 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 			MarketID: opportunity.MarketID, EventID: opportunity.EventID, Question: opportunity.Question,
 			Outcome: opportunity.Outcome, TokenID: opportunity.TokenID, Kind: kind, Type: "buy",
 			Amount: amount, Price: opportunity.Price, Status: "pending",
-			Reason: "实盘订单已签名，等待成交回报", ExternalID: orderID, CreatedAt: time.Now().UTC(),
+			Reason: pendingReason, ExternalID: orderID, CreatedAt: time.Now().UTC(),
 		})
 		if createErr == nil {
 			pending = created
