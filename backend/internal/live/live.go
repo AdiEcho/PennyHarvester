@@ -987,6 +987,25 @@ func planMarketBuy(ctx context.Context, client *clobclient.Client, tokenID strin
 	if minimum := polymarketMinBuyNotional; minimum > 0 && signedNotional+1e-9 < minimum {
 		return buyPlan{}, fmt.Errorf("下单金额 %.2f USDC 低于市场最小下单额 %.2f USDC（卖盘深度 %.4f USDC）", signedNotional, minimum, available)
 	}
+	// When limitPrice bumped to 1.0 (ceiling), the main loop exits without
+	// finding a valid signed ratio. Roll back one tick and step down shares in
+	// 0.01 increments until the signed-notional ratio is satisfied.
+	// Example: bestAsk=0.99, tick=0.01, budget=2.00 → shares=2.0202 gives
+	// signedNotional=1.99, ratio=0.9851 (fails); stepping to shares=2.00 gives
+	// signedNotional=1.98, ratio=0.99 ✓.
+	if signedNotional/shares+1e-9 < bestAsk {
+		if prev := alignTick(limitPrice-tick, tick); prev > 0 && prev < 1 {
+			limitPrice = prev
+			for s := math.Floor(budget/limitPrice*100) / 100; s > 0; s -= 0.01 {
+				sn := math.Floor(limitPrice*s*100) / 100
+				if sn > 0 && sn/s+1e-9 >= bestAsk {
+					shares = s
+					signedNotional = sn
+					break
+				}
+			}
+		}
+	}
 	if signedNotional/shares+1e-9 < bestAsk {
 		return buyPlan{}, fmt.Errorf("盘口价格 %.6f 按最小价位签名后无法成交", bestAsk)
 	}
