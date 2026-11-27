@@ -96,6 +96,24 @@ type fakeLive struct {
 	err       error
 	lookup    map[string]engine.LiveFill
 	reloads   int
+	// protocolV2 advertises the optional ProtocolExecutor surface. It mirrors
+	// the deployment flag: without it the engine must refuse before signing.
+	protocolV2   bool
+	protocolBuys int
+}
+
+func (f *fakeLive) SupportsProtocol(version string) bool {
+	return f.protocolV2 && strings.EqualFold(version, "v2")
+}
+
+func (f *fakeLive) BuyProtocol(ctx context.Context, order venue.ProtocolOrder, amount, maxPrice float64, onSigned func(string) error) (engine.LiveFill, error) {
+	f.protocolBuys++
+	return f.Buy(ctx, order.TokenID, order.ConditionID, amount, maxPrice, onSigned)
+}
+
+func (f *fakeLive) SellProtocol(ctx context.Context, order venue.ProtocolOrder, shares float64, onSigned func(string) error) (engine.LiveFill, error) {
+	f.protocolBuys++
+	return f.Sell(ctx, order.TokenID, order.ConditionID, shares, onSigned)
 }
 
 func (f *fakeLive) ReloadProxy() { f.reloads++ }
@@ -1782,10 +1800,9 @@ func TestLiveOrderRecordsExchangeFill(t *testing.T) {
 	}
 }
 
-// TestLiveOrderRefusesProtocolV2Market guards the Protocol V2 boundary: those
-// markets settle through ExchangeV3 with signing domain version "3" and pUSD
-// approvals, so signing one with the CTFExchangeV2 domain would be rejected by
-// the exchange after the order had already been submitted.
+// TestLiveOrderRefusesProtocolV2Market guards the Protocol V2 boundary: when
+// the executor cannot sign ExchangeV3 orders, the engine must refuse before
+// signing anything rather than submit a CTF-signed order.
 func TestLiveOrderRefusesProtocolV2Market(t *testing.T) {
 	item := binary("v2", 0.98, 20000, 2)
 	item.Version = "v2"
@@ -1805,6 +1822,41 @@ func TestLiveOrderRefusesProtocolV2Market(t *testing.T) {
 	orders, orderErr := instance.Orders(context.Background(), liveAccount.ID, "all", 10, 0, "")
 	if orderErr != nil || orders.Total != 1 || orders.Items[0].Status != "rejected" {
 		t.Fatalf("the refusal must be recorded as a rejected order: %+v, %v", orders, orderErr)
+	}
+	if executor.protocolBuys != 0 {
+		t.Fatalf("an unsupported V2 market must not reach the versioned signer: %d", executor.protocolBuys)
+	}
+}
+
+// TestLiveOrderSignsProtocolV2Market is the positive half: with a Protocol
+// executor, a v2 market is routed through BuyProtocol and the position keeps
+// the version so the eventual stop-loss sells with the same domain.
+func TestLiveOrderSignsProtocolV2Market(t *testing.T) {
+	item := binary("v2", 0.98, 20000, 2)
+	item.Version = "v2"
+	provider := &fakeProvider{markets: map[string]market.Market{"v2": item}}
+	executor := &fakeLive{
+		balance:    1000,
+		protocolV2: true,
+		fill:       engine.LiveFill{OrderID: "v2-order", Shares: 1, Cost: 1, Price: 0.98},
+	}
+	instance, _ := newTestEngine(t, provider, executor)
+	liveAccount := accountByMode(t, instance, engine.AccountModeLive)
+	position, err := instance.PlaceOrder(context.Background(), liveAccount.ID, engine.OrderRequest{
+		MarketID: "v2", Outcome: "Yes", TokenID: "v2-yes", Amount: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executor.protocolBuys != 1 {
+		t.Fatalf("a supported V2 market must use the versioned buyer, got %d", executor.protocolBuys)
+	}
+	if position.ProtocolVersion != "v2" || position.TokenID != "v2-yes" {
+		t.Fatalf("the position must keep the signing version: %+v", position)
+	}
+	positions, err := instance.Positions(context.Background(), liveAccount.ID, "open", "")
+	if err != nil || positions.Total != 1 || positions.Items[0].ProtocolVersion != "v2" {
+		t.Fatalf("protocol version was not persisted: %+v, %v", positions, err)
 	}
 }
 

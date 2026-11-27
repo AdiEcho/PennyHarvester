@@ -66,6 +66,7 @@ func run() error {
 		APIKey:        cfg.PolymarketAPIKey,
 		APISecret:     cfg.PolymarketAPISecret,
 		APIPassphrase: cfg.PolymarketAPIPassphrase,
+		ProtocolV2:    cfg.PolymarketProtocolV2,
 		BuilderCode:   config.BuilderCode,
 		Proxy:         proxyManager,
 	})

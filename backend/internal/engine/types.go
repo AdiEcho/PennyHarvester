@@ -1128,18 +1128,22 @@ type Position struct {
 	// ExitKind is empty for normal holdings and "stop" for a position closed by
 	// the stop-loss monitor. The status itself stays won/lost/split so the
 	// existing SQLite CHECK constraints (and any older database) remain valid.
-	ExitKind      string     `json:"exit_kind"`
-	EntryPrice    float64    `json:"entry_price"`
-	CurrentPrice  float64    `json:"current_price"`
-	Shares        float64    `json:"shares"`
-	Cost          float64    `json:"cost"`
-	Fee           float64    `json:"fee"`
-	Status        string     `json:"status"`
-	OpenedAt      time.Time  `json:"opened_at"`
-	ClosedAt      *time.Time `json:"closed_at"`
-	EndDate       time.Time  `json:"end_date"`
-	RealizedPNL   float64    `json:"realized_pnl"`
-	UnrealizedPNL float64    `json:"unrealized_pnl"`
+	ExitKind string `json:"exit_kind"`
+	// ProtocolVersion is the market's Gamma version ("v1" or "v2") captured at
+	// entry. Sell-side signing must reuse it: a V2 position can only be exited
+	// with the ExchangeV3 domain, and a V1 position with the CTF domain.
+	ProtocolVersion string     `json:"protocol_version,omitempty"`
+	EntryPrice      float64    `json:"entry_price"`
+	CurrentPrice    float64    `json:"current_price"`
+	Shares          float64    `json:"shares"`
+	Cost            float64    `json:"cost"`
+	Fee             float64    `json:"fee"`
+	Status          string     `json:"status"`
+	OpenedAt        time.Time  `json:"opened_at"`
+	ClosedAt        *time.Time `json:"closed_at"`
+	EndDate         time.Time  `json:"end_date"`
+	RealizedPNL     float64    `json:"realized_pnl"`
+	UnrealizedPNL   float64    `json:"unrealized_pnl"`
 }
 
 // EffectiveVenue defaults an unset venue to Polymarket; legacy rows were all

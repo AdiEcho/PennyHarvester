@@ -30,6 +30,11 @@ type Config struct {
 	PolymarketAPIKey        string
 	PolymarketAPISecret     string
 	PolymarketAPIPassphrase string
+	// PolymarketProtocolV2 enables signing for Gamma version "v2" markets
+	// (ExchangeV3 + position ids). It defaults to true; set
+	// POLYMARKET_PROTOCOL_V2=false to keep the previous refuse-before-signing
+	// behaviour while approvals are being rolled out.
+	PolymarketProtocolV2 bool
 
 	// Predict.fun (BSC). Enabled is explicit so a half-filled block cannot
 	// switch live trading on by accident.
@@ -59,6 +64,7 @@ func FromEnv() Config {
 		PolymarketAPIKey:        os.Getenv("POLYMARKET_API_KEY"),
 		PolymarketAPISecret:     os.Getenv("POLYMARKET_API_SECRET"),
 		PolymarketAPIPassphrase: os.Getenv("POLYMARKET_API_PASSPHRASE"),
+		PolymarketProtocolV2:    envBoolDefault("POLYMARKET_PROTOCOL_V2", true),
 
 		PredictFunEnabled:     envBool("PREDICTFUN_ENABLED"),
 		PredictFunAPIKey:      os.Getenv("PREDICTFUN_API_KEY"),
@@ -119,6 +125,19 @@ func envBool(key string) bool {
 		return true
 	}
 	return false
+}
+
+// envBoolDefault is envBool with an explicit fallback for flags that are on
+// unless the operator turns them off. An unparsable value keeps the fallback
+// instead of silently changing the deployment's behaviour.
+func envBoolDefault(key string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return fallback
 }
 
 func trimURL(raw string) string {

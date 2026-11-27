@@ -21,12 +21,12 @@ func insertPosition(ctx context.Context, db execer, p engine.Position) (engine.P
 	venue := p.EffectiveVenue()
 	currency := p.EffectiveCurrency()
 	result, err := db.ExecContext(ctx, `INSERT INTO positions(
-		account_id, venue, currency, market_id, event_id, condition_id, question, outcome, token_id, side, kind, exit_kind, entry_price,
-		current_price, shares, cost, fee, status, opened_at, closed_at, end_date,
+		account_id, venue, currency, market_id, event_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
+		protocol_version, entry_price, current_price, shares, cost, fee, status, opened_at, closed_at, end_date,
 		realized_pnl, unrealized_pnl
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.AccountID, venue, currency, p.MarketID, p.EventID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, kind, p.ExitKind, p.EntryPrice,
-		p.CurrentPrice, p.Shares, p.Cost, p.Fee, p.Status, formatTime(p.OpenedAt),
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.AccountID, venue, currency, p.MarketID, p.EventID, p.ConditionID, p.Question, p.Outcome, p.TokenID, p.Side, kind, p.ExitKind,
+		p.ProtocolVersion, p.EntryPrice, p.CurrentPrice, p.Shares, p.Cost, p.Fee, p.Status, formatTime(p.OpenedAt),
 		nullableTime(p.ClosedAt), formatTime(p.EndDate), p.RealizedPNL, p.UnrealizedPNL)
 	if err != nil {
 		return engine.Position{}, err
@@ -65,7 +65,7 @@ func (s *SQLite) CreatePositionWithOrder(ctx context.Context, p engine.Position,
 
 func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status string, v market.Venue) ([]engine.Position, error) {
 	query := `SELECT id, account_id, venue, currency, market_id, event_id, condition_id, question, outcome, token_id, side, kind, exit_kind,
-		entry_price, current_price, shares, cost, fee, status, opened_at, closed_at,
+		protocol_version, entry_price, current_price, shares, cost, fee, status, opened_at, closed_at,
 		end_date, realized_pnl, unrealized_pnl FROM positions WHERE account_id = ?`
 	args := []any{accountID}
 	switch status {
@@ -100,7 +100,7 @@ func (s *SQLite) ListPositions(ctx context.Context, accountID int64, status stri
 		var openedAt, endDate string
 		var closedAt sql.NullString
 		if err := rows.Scan(&p.ID, &p.AccountID, &p.Venue, &p.Currency, &p.MarketID, &p.EventID, &p.ConditionID, &p.Question, &p.Outcome,
-			&p.TokenID, &p.Side, &p.Kind, &p.ExitKind, &p.EntryPrice, &p.CurrentPrice, &p.Shares, &p.Cost,
+			&p.TokenID, &p.Side, &p.Kind, &p.ExitKind, &p.ProtocolVersion, &p.EntryPrice, &p.CurrentPrice, &p.Shares, &p.Cost,
 			&p.Fee, &p.Status, &openedAt, &closedAt, &endDate, &p.RealizedPNL, &p.UnrealizedPNL); err != nil {
 			return nil, err
 		}

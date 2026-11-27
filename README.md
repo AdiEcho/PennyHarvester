@@ -59,7 +59,7 @@
 
 ### 2. 实盘执行与防丢单机制
 - **CLOB 原生交易**：支持 Polymarket CLOB V2 EIP-712 订单签名、FAK（Fill-and-Kill，立即成交剩余取消）市价买入、FOK（Fill-or-Kill，全部成交或取消）止损卖出、真实成交回报解析与 CLOB 订单号审计。
-- **V2 边界保护**：Polymarket Protocol V2 市场使用 ExchangeV3（签名域版本 `3`）与 pUSD / PositionManager 授权，本系统尚未实现该签名路径，因此对 `version=v2` 的市场会**在下单前明确拒单并记录原因**，不会用 CTF 域签出一笔注定被交易所拒绝的订单；模拟账户不受影响。
+- **Protocol V2 签单**：Gamma `version=v2` 的市场（`positionIds` + ExchangeV3，签名域版本 `3`）走本地 EIP-712 签名，v1 市场继续使用 CLOB SDK；两条路径共用同一套 FAK/FOK 下单、成交解析、对账与账务逻辑。签单前会校验 ExchangeV3 授权额度，仓位会记录开仓协议版本，止损卖单复用同一签名域。由 `POLYMARKET_PROTOCOL_V2`（默认 `true`）控制，设为 `false` 时恢复「下单前明确拒单」的旧行为。
 - **预写日志与自动对账**：实盘订单在签名后、提交前会先持久化为 `pending` 状态；若因网络抖动、超时或异步撮合导致结果未知（`unknown`），后续扫描会自动向 CLOB 查询对账，并从 `/data/trades` 汇总该订单的逐笔成交来还原**真实成交均价**（`/data/order` 只返回订单限价，不含均价）。**在未决订单完成对账前，系统会暂停该账户的自动下单**，防止真实成交丢失或重复建仓。
 - **真实费率核算**：自动读取目标市场的 CLOB `FeeSchedule` 计算 Taker 手续费，并在下单前预留相应现金与敞口额度，成交后计入持仓成本。
 
@@ -272,6 +272,7 @@ npm run dev
 export POLYMARKET_PRIVATE_KEY=0x...          # 可选：钱包签名私钥
 export POLYMARKET_SIGNATURE_TYPE=0           # 0=EOA，1=Proxy，2=Safe，3=Deposit/Poly1271
 export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式必须留空
+# export POLYMARKET_PROTOCOL_V2=true         # 默认 true；false 表示只签 v1（v2 市场下单前拒单）
 # export POLYMARKET_API_KEY=...              # 可选：复用已有的 CLOB L2 凭据（不是 Relayer API Key）
 # export POLYMARKET_API_SECRET=...
 # export POLYMARKET_API_PASSPHRASE=...
@@ -348,6 +349,7 @@ export POLYMARKET_FUNDER=0x...               # 非 EOA 模式必填；EOA 模式
 | `POLYMARKET_SIGNATURE_TYPE` | `0` | 签名类型的可选回退值：`0` EOA、`1` Proxy、`2` Safe、`3` Deposit/Poly1271 |
 | `POLYMARKET_FUNDER` | 空 | 非 EOA 签名类型对应的代理/Safe 钱包地址的可选回退值；EOA 模式必须留空（兼容旧变量名 `POLYMARKET_MAKER_ADDRESS`） |
 | `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | CLOB 交易地址的默认值；可在网页「系统设置」中覆盖 |
+| `POLYMARKET_PROTOCOL_V2` | `true` | 是否为 Gamma `version=v2` 的市场签 ExchangeV3 订单（域版本 `3`）；`false` 时这类市场在下单前拒单。需重启生效 |
 | `POLYGON_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | 钱包类型自动识别用的只读 Polygon RPC（`eth_getCode` / `eth_call`）；兼容旧变量名 `POLYMARKET_RPC_URL`，不支持网页修改 |
 | `POLYMARKET_API_KEY` | 空 | 可选，复用已有的 CLOB L2 API Key（**不是** polymarket.com 设置页的 Relayer API Key）；也可在网页中填写 |
 | `POLYMARKET_API_SECRET` | 空 | 可选，复用已有的 CLOB L2 API Secret；也可在网页中加密保存 |
@@ -485,7 +487,7 @@ go run ./cmd/ledger-export -db data/pennyharvester.db -account 1 -out ledger.jso
 在使用本系统进行策略研究或实盘交易前，请充分了解以下系统边界与市场风险：
 
 - **真实资金风险**：实盘模式会直接动用钱包内的真实 pUSD（Polymarket 自 CLOB V2 起以此结算，取代 USDC.e）。自动交易默认关闭，开启前请务必先通过模拟账户和最小实盘金额验证完整链路。
-- **协议边界（Polymarket Protocol V2）**：Polymarket 正在把新市场迁到 Protocol V2（`version=v2`，结果标识为 `positionIds`，结算走 ExchangeV3 + pUSD/PositionManager 授权）。本系统能识别并展示这类市场，但**实盘下单会明确拒单**（不会用 CTF 签名域发出注定失败的订单），模拟账户可正常演练；自动实盘交易会直接跳过它们。
+- **Protocol V2 仍是新链路**：V2 市场用 `positionIds` 报价、ExchangeV3 结算，签名域为 `name="Polymarket CTF Exchange"`、`version="3"`。本仓库已实现并离线校验该签名（域分隔符与链上 `domainSeparator()` 一致，签名与独立 Python 向量及 CLOB SDK 逐字节一致），但**尚未用真实资金跑过一笔 V2 成交**；首次启用请先用最小金额验证，并确认钱包已完成 pUSD → ExchangeV3 授权与仓位 → PositionManager 授权。授权不足时引擎会拒单并提示，不会盲签。把 `POLYMARKET_PROTOCOL_V2=false` 可立即退回只支持 v1 的模式。
 - **0.99 并非无风险套利**：高价格二元结果的潜在收益空间极其有限（1%–5%），但一旦尾部风险发生、结果反转归零，将面临接近全部本金的损失。
 - **公开参考价 ≠ 可成交盘口价**：Gamma 接口返回的 `outcomePrices` 仅代表公开参考价，不等于订单簿上的实际卖一价（Best Ask）。买卖点差、盘口深度不足与手续费都可能显著影响最终收益。
 - **实盘成交不确定性**：实盘采用 FAK 订单，实际成交价格由 CLOB 实时订单簿决定，可能与页面显示的参考价存在偏差，也可能出现部分成交或因深度不足而未成交。

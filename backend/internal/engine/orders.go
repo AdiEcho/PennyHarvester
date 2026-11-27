@@ -430,10 +430,10 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		if opportunity.ConditionID == "" {
 			continue
 		}
-		if opportunity.IsV2() {
-			// Protocol V2 markets cannot be signed by this build. Skip them
-			// instead of writing a rejected order on every scan; a manual order
-			// still reports the reason explicitly.
+		if !protocolSupported(exec, opportunity.Version) {
+			// The executor cannot sign this market version. Skip it instead of
+			// writing a rejected order on every scan; a manual order still
+			// reports the reason explicitly.
 			continue
 		}
 		budget := effective.OrderSize
@@ -459,7 +459,7 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		if cost > cash+1e-9 {
 			return outcome, fmt.Errorf("%w: 实盘策略资金不足（含预估手续费）", ErrInvalidOrder)
 		}
-		allowance, hasAllowance := snapshot.AllowanceFor(opportunity.NegRisk)
+		allowance, hasAllowance := snapshot.AllowanceForProtocol(opportunity.Version, opportunity.NegRisk)
 		if hasAllowance && cost > allowance+1e-9 {
 			break
 		}
@@ -651,8 +651,14 @@ func (e *Engine) executeLiveSell(ctx context.Context, account Account, position 
 		return Position{}, e.rejectSellOrder(ctx, account.ID, position,
 			"缺少 condition_id 或 token_id，无法提交止损卖单")
 	}
+	if !protocolSupported(exec, position.ProtocolVersion) {
+		return Position{}, e.rejectSellOrder(ctx, account.ID, position, protocolV2Unsupported)
+	}
 	var pending Order
-	fill, err := exec.Sell(ctx, position.TokenID, position.ConditionID, position.Shares, func(orderID string) error {
+	fill, err := placeLiveSell(ctx, exec, venue.ProtocolOrder{
+		TokenID: position.TokenID, ConditionID: position.ConditionID,
+		Version: position.ProtocolVersion,
+	}, position.Shares, func(orderID string) error {
 		created, createErr := e.repo.CreateOrder(ctx, Order{
 			AccountID: account.ID, Venue: position.EffectiveVenue(), Currency: position.EffectiveCurrency(),
 			PositionID: &position.ID, MarketID: position.MarketID, EventID: position.EventID,
@@ -896,6 +902,45 @@ func (e *Engine) executePaperBuy(ctx context.Context, account Account, opportuni
 	return position, nil
 }
 
+// protocolV2Unsupported is the one refusal message both manual and automatic
+// paths use, so the UI never has to guess why a V2 order was not signed.
+const protocolV2Unsupported = "该市场属于 Polymarket Protocol V2（positionId + ExchangeV3），当前部署未启用 V2 实盘签单；设置 POLYMARKET_PROTOCOL_V2=true 并完成 pUSD/PositionManager 授权后重试"
+
+// protocolSupported reports whether exec can sign this market version. An
+// empty or v1 version is always supported by the plain Executor methods.
+func protocolSupported(exec venue.Executor, version string) bool {
+	if !venue.IsProtocolV2(version) {
+		return true
+	}
+	router, ok := exec.(venue.ProtocolExecutor)
+	return ok && router.SupportsProtocol(version)
+}
+
+// placeLiveBuy dispatches to the versioned extension only for market versions
+// the plain Buy method cannot sign. A missing extension fails before anything
+// is signed.
+func placeLiveBuy(ctx context.Context, exec venue.Executor, order venue.ProtocolOrder, amount, maxPrice float64, onSigned func(orderID string) error) (LiveFill, error) {
+	if venue.IsProtocolV2(order.Version) {
+		router, ok := exec.(venue.ProtocolExecutor)
+		if !ok || !router.SupportsProtocol(order.Version) {
+			return LiveFill{}, fmt.Errorf("%w: %s", ErrInvalidOrder, protocolV2Unsupported)
+		}
+		return router.BuyProtocol(ctx, order, amount, maxPrice, onSigned)
+	}
+	return exec.Buy(ctx, order.TokenID, order.ConditionID, amount, maxPrice, onSigned)
+}
+
+func placeLiveSell(ctx context.Context, exec venue.Executor, order venue.ProtocolOrder, shares float64, onSigned func(orderID string) error) (LiveFill, error) {
+	if venue.IsProtocolV2(order.Version) {
+		router, ok := exec.(venue.ProtocolExecutor)
+		if !ok || !router.SupportsProtocol(order.Version) {
+			return LiveFill{}, fmt.Errorf("%w: %s", ErrInvalidOrder, protocolV2Unsupported)
+		}
+		return router.SellProtocol(ctx, order, shares, onSigned)
+	}
+	return exec.Sell(ctx, order.TokenID, order.ConditionID, shares, onSigned)
+}
+
 func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunity Opportunity, kind string, amount float64, settings Settings) (Position, error) {
 	v := opportunity.EffectiveVenue()
 	if v != account.EffectiveVenue() {
@@ -917,14 +962,8 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
 			"缺少 condition_id，无法加载实盘手续费", "")
 	}
-	if opportunity.IsV2() {
-		// Protocol V2 orders settle through ExchangeV3, which requires a
-		// different EIP-712 domain (version "3"), pUSD/PositionManager approvals
-		// and CONDITIONAL-V2 balances. Signing one with the CTFExchangeV2 domain
-		// would be rejected by the exchange after the order is already on the
-		// wire, so refuse it here with an actionable message instead.
-		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
-			"该市场属于 Polymarket Protocol V2（positionId + ExchangeV3），当前实盘执行器只支持 CTF（v1）市场；请改用模拟账户或等待 V2 签名支持", "")
+	if !protocolSupported(exec, opportunity.Version) {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, protocolV2Unsupported, "")
 	}
 	effective := settings.For(v)
 	unresolved, err := e.repo.ListUnresolvedOrders(ctx, account.ID)
@@ -974,7 +1013,7 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	}
 	totalCost := amount + estimatedFee
 	cash := math.Min(strategyCash, snapshot.Amount)
-	allowance, hasAllowance := snapshot.AllowanceFor(opportunity.NegRisk)
+	allowance, hasAllowance := snapshot.AllowanceForProtocol(opportunity.Version, opportunity.NegRisk)
 	switch {
 	case risk.marketConflict:
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount, "该市场存在未确认订单，暂不允许新开仓", "")
@@ -995,7 +1034,10 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 	}
 
 	var pending Order
-	fill, err := exec.Buy(ctx, opportunity.TokenID, opportunity.ConditionID, amount, settings.MaxPrice, func(orderID string) error {
+	fill, err := placeLiveBuy(ctx, exec, venue.ProtocolOrder{
+		TokenID: opportunity.TokenID, ConditionID: opportunity.ConditionID,
+		Version: opportunity.Version, NegRisk: opportunity.NegRisk,
+	}, amount, settings.MaxPrice, func(orderID string) error {
 		created, createErr := e.repo.CreateOrder(ctx, Order{
 			AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
 			MarketID: opportunity.MarketID, EventID: opportunity.EventID, Question: opportunity.Question,
@@ -1048,7 +1090,8 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		AccountID: account.ID, Venue: v, Currency: opportunity.EffectiveCurrency(),
 		MarketID: opportunity.MarketID, EventID: opportunity.EventID, ConditionID: opportunity.ConditionID,
 		Question: opportunity.Question, Outcome: opportunity.Outcome, TokenID: opportunity.TokenID,
-		Side: "BUY", Kind: kind, EntryPrice: fill.Price, CurrentPrice: opportunity.Price,
+		Side: "BUY", Kind: kind, ProtocolVersion: opportunity.Version,
+		EntryPrice: fill.Price, CurrentPrice: opportunity.Price,
 		Shares: fill.Shares, Cost: fill.Cost, Fee: fill.Fee, Status: "open", OpenedAt: now,
 		EndDate: opportunity.EndDate, UnrealizedPNL: opportunity.Price*fill.Shares - fill.Cost,
 	}

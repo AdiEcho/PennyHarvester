@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sort"
@@ -24,6 +25,7 @@ import (
 	"pennyharvester/backend/internal/engine"
 	"pennyharvester/backend/internal/market"
 	"pennyharvester/backend/internal/netproxy"
+	pmorder "pennyharvester/backend/internal/polymarket/order"
 	"pennyharvester/backend/internal/venue"
 )
 
@@ -38,6 +40,11 @@ type Config struct {
 	APIKey        string
 	APISecret     string
 	APIPassphrase string
+	// ProtocolV2 enables signing for markets whose Gamma version is "v2".
+	// Those orders settle through ExchangeV3 with the version "3" EIP-712
+	// domain; when false the executor reports the market as unsupported and
+	// the engine refuses before signing anything.
+	ProtocolV2 bool
 	// BuilderCode attributes every signed order to a Polymarket builder
 	// profile. It is public and may be empty (unattributed orders).
 	BuilderCode string
@@ -520,6 +527,17 @@ func (e *Executor) ensure(ctx context.Context) (*clobclient.Client, error) {
 }
 
 func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount, maxPrice float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	return e.buy(ctx, venue.ProtocolOrder{TokenID: tokenID, ConditionID: conditionID}, amount, maxPrice, onSigned)
+}
+
+// BuyProtocol signs a buy for the market's own version. A v2 market uses the
+// ExchangeV3 domain; anything else falls back to the plain CTF path.
+func (e *Executor) BuyProtocol(ctx context.Context, order venue.ProtocolOrder, amount, maxPrice float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	return e.buy(ctx, order, amount, maxPrice, onSigned)
+}
+
+func (e *Executor) buy(ctx context.Context, inst venue.ProtocolOrder, amount, maxPrice float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	tokenID, conditionID := inst.TokenID, inst.ConditionID
 	if tokenID == "" || conditionID == "" || amount <= 0 {
 		return engine.LiveFill{}, fmt.Errorf("%w: token、condition 与金额必须有效", engine.ErrInvalidOrder)
 	}
@@ -545,7 +563,7 @@ func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount,
 	if maxPrice > 0 && order.Price > maxPrice+1e-9 {
 		return engine.LiveFill{}, fmt.Errorf("%w: 盘口成交价 %.6f 超过最高买入价 %.6f", engine.ErrInvalidOrder, order.Price, maxPrice)
 	}
-	signed, err := client.CreateOrder(ctx, order)
+	signed, err := e.signOrder(ctx, client, inst, order)
 	if err != nil {
 		return engine.LiveFill{}, fmt.Errorf("签名实盘买单: %w", err)
 	}
@@ -618,6 +636,16 @@ func (e *Executor) Buy(ctx context.Context, tokenID, conditionID string, amount,
 // taker fee is reported separately in LiveFill.Fee, so the engine subtracts it
 // exactly once.
 func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	return e.sell(ctx, venue.ProtocolOrder{TokenID: tokenID, ConditionID: conditionID}, shares, onSigned)
+}
+
+// SellProtocol signs a sell with the domain the position was opened under.
+func (e *Executor) SellProtocol(ctx context.Context, order venue.ProtocolOrder, shares float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	return e.sell(ctx, order, shares, onSigned)
+}
+
+func (e *Executor) sell(ctx context.Context, inst venue.ProtocolOrder, shares float64, onSigned func(orderID string) error) (engine.LiveFill, error) {
+	tokenID, conditionID := inst.TokenID, inst.ConditionID
 	if tokenID == "" || conditionID == "" || shares <= 0 || math.IsNaN(shares) || math.IsInf(shares, 0) {
 		return engine.LiveFill{}, fmt.Errorf("%w: token、condition 与份额必须有效", engine.ErrInvalidOrder)
 	}
@@ -637,7 +665,7 @@ func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares
 		return engine.LiveFill{}, fmt.Errorf("构建实盘卖单: %w", err)
 	}
 	order.Builder = e.builderCode
-	signed, err := client.CreateOrder(ctx, order)
+	signed, err := e.signOrder(ctx, client, inst, order)
 	if err != nil {
 		return engine.LiveFill{}, fmt.Errorf("签名实盘卖单: %w", err)
 	}
@@ -689,6 +717,114 @@ func (e *Executor) Sell(ctx context.Context, tokenID, conditionID string, shares
 		return engine.LiveFill{OrderID: fill.OrderID, Status: "unknown"}, err
 	}
 	return fill, nil
+}
+
+// protocolV2Disabled explains why a V2 market cannot be signed by this
+// deployment. The engine uses the executor's SupportsProtocol answer, so this
+// text only reaches a caller that forced the versioned path.
+const protocolV2Disabled = "Polymarket Protocol V2 实盘签单未启用（设置 POLYMARKET_PROTOCOL_V2=true）"
+
+// SupportsProtocol reports whether this executor can sign a market version end
+// to end. Legacy (v1) markets are always supported; v2 needs the explicit flag
+// because it settles through ExchangeV3 with a different EIP-712 domain and
+// different collateral approvals.
+func (e *Executor) SupportsProtocol(version string) bool {
+	if e == nil || !venue.IsProtocolV2(version) {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg.ProtocolV2
+}
+
+// signOrder builds the protocol-specific signature. Legacy markets keep using
+// the SDK signer exactly as before. V2 markets are signed locally because the
+// Go SDK only knows the CTFExchangeV2 domain; the wire body is the same
+// SignedOrderV2 the SDK submits, so submission, rejection handling and
+// reconciliation stay untouched.
+func (e *Executor) signOrder(ctx context.Context, client *clobclient.Client, inst venue.ProtocolOrder, order clobclient.UserOrder) (clobclient.SignedOrderV2, error) {
+	if !venue.IsProtocolV2(inst.Version) {
+		return client.CreateOrder(ctx, order)
+	}
+	e.mu.Lock()
+	privateKey := e.cfg.PrivateKey
+	signatureType := e.cfg.SignatureType
+	builder := e.builderCode
+	enabled := e.cfg.ProtocolV2
+	e.mu.Unlock()
+	if !enabled {
+		return clobclient.SignedOrderV2{}, fmt.Errorf("%w: %s", engine.ErrInvalidOrder, protocolV2Disabled)
+	}
+	if signatureType < 0 || signatureType > 3 {
+		return clobclient.SignedOrderV2{}, fmt.Errorf("%w: 签名类型 %d 无效", engine.ErrInvalidOrder, signatureType)
+	}
+	key, err := crypto.HexToECDSA(strings.TrimPrefix(strings.TrimSpace(privateKey), "0x"))
+	if err != nil {
+		return clobclient.SignedOrderV2{}, fmt.Errorf("解析实盘私钥: %w", err)
+	}
+	tokenID, ok := new(big.Int).SetString(strings.TrimSpace(order.TokenID), 10)
+	if !ok || tokenID.Sign() <= 0 {
+		return clobclient.SignedOrderV2{}, fmt.Errorf("%w: token_id 不是有效的十进制整数", engine.ErrInvalidOrder)
+	}
+	var side uint8
+	switch order.Side {
+	case clobclient.SideBuy:
+		side = 0
+	case clobclient.SideSell:
+		side = 1
+	default:
+		return clobclient.SignedOrderV2{}, fmt.Errorf("%w: 买卖方向 %q 无效", engine.ErrInvalidOrder, order.Side)
+	}
+	makerAmount, takerAmount, err := pmorder.Amounts(string(order.Side), order.Price, order.Shares, string(order.OrderType))
+	if err != nil {
+		return clobclient.SignedOrderV2{}, fmt.Errorf("%w: %v", engine.ErrInvalidOrder, err)
+	}
+	if makerAmount.Sign() <= 0 || takerAmount.Sign() <= 0 {
+		return clobclient.SignedOrderV2{}, fmt.Errorf("%w: 订单金额取整后为 0", engine.ErrInvalidOrder)
+	}
+	domain, err := pmorder.DomainFor(inst.Version, inst.NegRisk)
+	if err != nil {
+		return clobclient.SignedOrderV2{}, err
+	}
+	maker := common.HexToAddress(client.MakerAddress())
+	signer := common.HexToAddress(client.Address())
+	if signatureType == 3 {
+		// A deposit wallet is both the token holder and the 1271 signer.
+		signer = maker
+	}
+	now := time.Now().UnixMilli()
+	proto := pmorder.Order{
+		Salt:          now,
+		Maker:         maker,
+		Signer:        signer,
+		TokenID:       tokenID,
+		MakerAmount:   makerAmount,
+		TakerAmount:   takerAmount,
+		Side:          side,
+		SignatureType: uint8(signatureType),
+		Timestamp:     now,
+		Builder:       common.HexToHash(builder),
+	}
+	signed, err := pmorder.Sign(key, domain, proto)
+	if err != nil {
+		return clobclient.SignedOrderV2{}, fmt.Errorf("签署 Protocol V2 订单: %w", err)
+	}
+	return clobclient.SignedOrderV2{
+		OrderID:       signed.OrderID(),
+		Salt:          now,
+		Maker:         maker.Hex(),
+		Signer:        signer.Hex(),
+		TokenID:       order.TokenID,
+		MakerAmount:   makerAmount.String(),
+		TakerAmount:   takerAmount.String(),
+		Expiration:    strconv.FormatInt(order.Expiration, 10),
+		Side:          string(order.Side),
+		SignatureType: signatureType,
+		Timestamp:     strconv.FormatInt(now, 10),
+		Metadata:      common.Hash{}.Hex(),
+		Builder:       common.HexToHash(builder).Hex(),
+		Signature:     signed.Signature,
+	}, nil
 }
 
 // reportSellFee reports the taker fee on a sell without folding it into Cost.

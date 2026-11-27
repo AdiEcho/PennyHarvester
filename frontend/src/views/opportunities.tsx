@@ -183,17 +183,19 @@ function RealYield({ state, venue, onQuote }: { state?: QuoteState; venue: Venue
 }
 
 // ProtocolBadge marks Polymarket Protocol V2 markets. They quote themselves
-// through positionIds and settle on ExchangeV3, which the live executor cannot
-// sign for yet, so a live order is refused with an explicit reason while paper
-// accounts still rehearse on them. Predict.fun has no protocol versions.
+// through positionIds and settle on ExchangeV3 with the version "3" EIP-712
+// domain, so a live order is signed differently from a v1 market. The label
+// stays informational: whether this deployment can sign V2 is a backend flag
+// (POLYMARKET_PROTOCOL_V2), and the order rejection explains it when disabled.
+// Predict.fun has no protocol versions.
 function ProtocolBadge({ item }: { item: Opportunity }) {
   if (protocolVersionOf(item) !== 'v2') return null
   return (
     <Badge
-      variant="danger"
-      title="Polymarket Protocol V2 市场（positionId + ExchangeV3）：模拟账户可正常演练，实盘下单会被明确拒绝"
+      variant="info"
+      title="Polymarket Protocol V2 市场（positionId + ExchangeV3，签名域版本 3）：实盘需要开启 POLYMARKET_PROTOCOL_V2，并完成 pUSD / PositionManager 授权"
     >
-      协议 V2 · 实盘不支持
+      协议 V2 · ExchangeV3
     </Badge>
   )
 }

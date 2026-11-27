@@ -101,6 +101,7 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		side TEXT NOT NULL,
 		kind TEXT NOT NULL DEFAULT 'manual',
 		exit_kind TEXT NOT NULL DEFAULT '',
+		protocol_version TEXT NOT NULL DEFAULT '',
 		entry_price REAL NOT NULL,
 		current_price REAL NOT NULL,
 		shares REAL NOT NULL,
@@ -232,6 +233,12 @@ func (s *SQLite) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "positions", "currency", "TEXT NOT NULL DEFAULT 'USDC'"); err != nil {
+		return err
+	}
+	// protocol_version records which signing domain opened the position so the
+	// stop-loss sell signs with the same one. It is added after the status
+	// rebuild, whose explicit column list predates it.
+	if err := s.ensureColumn(ctx, "positions", "protocol_version", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "orders", "venue", "TEXT NOT NULL DEFAULT 'polymarket'"); err != nil {

@@ -62,16 +62,39 @@ const (
 	PolymarketNegRiskExchange = "0xe2222d279d744050d28e00520010520000310f59"
 )
 
+// Polymarket Protocol V2 spenders. Trades settle through ExchangeV3, which
+// consumes pUSD approved by the maker and position tokens approved to the
+// PositionManager; the legacy exchange addresses never see a V2 order.
+const (
+	PolymarketExchangeV3      = "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"
+	PolymarketPositionManager = "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF"
+)
+
 // AllowanceFor returns the approval for the exchange that will settle the
 // trade. ok is false when the snapshot has no per-spender evidence, in which
 // case callers may fall back to the legacy scalar.
 func (c CashSnapshot) AllowanceFor(negRisk bool) (float64, bool) {
-	if len(c.Allowances) == 0 {
-		return 0, false
-	}
 	spender := PolymarketExchange
 	if negRisk {
 		spender = PolymarketNegRiskExchange
+	}
+	return c.allowanceFor(spender)
+}
+
+// AllowanceForProtocol returns the approval the order will actually spend.
+// Protocol V2 trades always debit the ExchangeV3 approval, whatever the
+// market's neg-risk flag says, because neg-risk routing is part of the V2
+// exchange itself.
+func (c CashSnapshot) AllowanceForProtocol(version string, negRisk bool) (float64, bool) {
+	if IsProtocolV2(version) {
+		return c.allowanceFor(PolymarketExchangeV3)
+	}
+	return c.AllowanceFor(negRisk)
+}
+
+func (c CashSnapshot) allowanceFor(spender string) (float64, bool) {
+	if len(c.Allowances) == 0 {
+		return 0, false
 	}
 	for address, value := range c.Allowances {
 		if strings.EqualFold(address, spender) {
@@ -81,6 +104,12 @@ func (c CashSnapshot) AllowanceFor(negRisk bool) (float64, bool) {
 	// The map is authoritative: an unknown target means the wallet has not
 	// approved this exchange, not that the trade is free.
 	return 0, true
+}
+
+// IsProtocolV2 reports whether a market version string denotes Polymarket
+// Protocol V2 (ExchangeV3 + position ids).
+func IsProtocolV2(version string) bool {
+	return strings.EqualFold(strings.TrimSpace(version), "v2")
 }
 
 // Quote is a pre-trade estimate for a buy. AvailableNotional is how much the
@@ -171,6 +200,28 @@ type Executor interface {
 	EstimateBuyFee(ctx context.Context, conditionID string, amount, price float64) (float64, error)
 	Quote(ctx context.Context, tokenID, conditionID string, amount float64) (Quote, error)
 	Collateral(ctx context.Context) (CashSnapshot, error)
+}
+
+// ProtocolOrder carries the market identity a versioned order needs. The
+// version is the market's Gamma version ("v1" or "v2"); an empty version means
+// the legacy CTF exchange.
+type ProtocolOrder struct {
+	TokenID     string
+	ConditionID string
+	Version     string
+	NegRisk     bool
+}
+
+// ProtocolExecutor is an optional extension of Executor for venues with more
+// than one signing protocol. The engine only type-asserts it for markets whose
+// version the plain Buy/Sell path cannot sign, so venues that never need it
+// (Predict.fun) stay untouched.
+type ProtocolExecutor interface {
+	// SupportsProtocol reports whether the executor can sign this market
+	// version end to end, including the required approvals.
+	SupportsProtocol(version string) bool
+	BuyProtocol(ctx context.Context, order ProtocolOrder, amount, maxPrice float64, onSigned func(orderID string) error) (Fill, error)
+	SellProtocol(ctx context.Context, order ProtocolOrder, shares float64, onSigned func(orderID string) error) (Fill, error)
 }
 
 // Registry is the read-mostly map from venue to its data source and executor.
