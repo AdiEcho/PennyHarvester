@@ -327,7 +327,7 @@ const DefaultStopLossRatio = 0.70
 func DefaultSettings() Settings {
 	return Settings{
 		MinPrice: 0.95, MaxPrice: 0.99, MaxDays: 30, MinLiquidity: 10000,
-		OrderSize: 100, MaxPosition: 250, MaxExposure: 1000, MaxEventExposure: 250,
+		OrderSize: 100, MaxPosition: 250, MaxExposure: 1000, MaxEventExposure: 500,
 		ScanIntervalSeconds: 60, SlippageBPS: 20, FeeBPS: DefaultFeeBPS,
 		DefaultCategory: RadarCategoryNonSports,
 		SportsPolicy:    SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
@@ -1367,6 +1367,27 @@ type LiveExecutor = venue.Executor
 // FillPrice is the expected average execution price after walking every level.
 type LiveQuote = venue.Quote
 
+// PositionSummary is a lightweight projection of a Position used by the
+// auto-trade loop to build exposure maps and ordered-markets sets without
+// loading question text, outcome text, and other display-only fields.
+type PositionSummary struct {
+	Venue       market.Venue
+	MarketID    string
+	EventID     string
+	Status      string
+	Cost        float64
+	RealizedPNL float64
+}
+
+// EffectiveVenue returns VenuePolymarket when Venue is not set, matching the
+// same fallback that Position.EffectiveVenue uses.
+func (s PositionSummary) EffectiveVenue() market.Venue {
+	if s.Venue == "" {
+		return market.VenuePolymarket
+	}
+	return s.Venue
+}
+
 type Repository interface {
 	LoadSettings(context.Context) (Settings, error)
 	SaveSettings(context.Context, Settings) error
@@ -1395,6 +1416,11 @@ type Repository interface {
 	CreatePositionWithOrder(context.Context, Position, Order) (Position, Order, error)
 	CreateOrder(context.Context, Order) (Order, error)
 	ListPositions(context.Context, int64, string, market.Venue) ([]Position, error)
+	// ListPositionSummaries returns a lightweight projection of all positions for
+	// one account. It is equivalent to ListPositions("all") but loads only the
+	// fields the auto-trade loop needs, which keeps the scan efficient as the
+	// position history grows.
+	ListPositionSummaries(context.Context, int64) ([]PositionSummary, error)
 	ListOrders(context.Context, int64, string, int, int, market.Venue) ([]Order, error)
 	// RedeemIntent returns the pending or filled redemption for one position.
 	// A position-scoped lookup is bounded by the index, unlike scanning the

@@ -491,14 +491,21 @@ func (e *Engine) marketsLocale(ctx context.Context, provider market.LocalizedPro
 }
 
 // sortOpportunities orders the radar the way the UI renders it: soonest to
-// resolve first, highest gross yield first within a day.
+// resolve first, highest gross yield first within a day. When yield is equal,
+// prefer the venue with the lower taker-fee rate so the auto-trade loop fills
+// the cheaper opportunity first within the same expiry+yield bucket.
 func sortOpportunities(opportunities []Opportunity) {
 	// Stable so equal rows keep their scan order between refreshes: an unstable
 	// sort makes the table reshuffle for no reason and breaks the row identity
 	// the UI keeps across a poll.
 	sort.SliceStable(opportunities, func(i, j int) bool {
 		if opportunities[i].EndDate.Equal(opportunities[j].EndDate) {
-			return opportunities[i].GrossYield > opportunities[j].GrossYield
+			yi, yj := opportunities[i].GrossYield, opportunities[j].GrossYield
+			if yi == yj {
+				// Equal yield: prefer the venue with the lower taker-fee rate.
+				return opportunities[i].FeeRateBPS < opportunities[j].FeeRateBPS
+			}
+			return yi > yj
 		}
 		return opportunities[i].EndDate.Before(opportunities[j].EndDate)
 	})

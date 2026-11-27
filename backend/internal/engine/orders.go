@@ -197,8 +197,12 @@ func clampReason(reason string) string {
 
 // autoTradeOutcome summarizes one account's automatic entry pass.
 type autoTradeOutcome struct {
-	Placed      int
-	SkippedHeld int
+	Placed          int
+	SkippedHeld     int
+	// SkippedProtocol counts opportunities the executor silently skipped because
+	// it cannot sign the market's protocol version. A non-zero count is a signal
+	// to the operator that enabling ProtocolV2 would unlock additional trades.
+	SkippedProtocol int
 }
 
 func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (autoTradeOutcome, error) {
@@ -274,7 +278,10 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	if !effective.Enabled {
 		return outcome, nil
 	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
+	// ListPositionSummaries loads only the fields needed to build exposure maps
+	// and ordered-market sets, skipping question text and display-only columns.
+	// This keeps the auto-trade loop efficient as the position history grows.
+	summaries, err := e.repo.ListPositionSummaries(ctx, account.ID)
 	if err != nil {
 		return outcome, err
 	}
@@ -283,14 +290,14 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	// a second outcome of the same binary market is the mirror bet, and a
 	// settled market must never be re-entered by a later scan. The key is
 	// namespaced by venue because token/market ids are only venue-local.
-	orderedMarkets := make(map[string]bool, len(positions))
-	heldMarkets := make(map[string]bool, len(positions))
+	orderedMarkets := make(map[string]bool, len(summaries))
+	heldMarkets := make(map[string]bool, len(summaries))
 	skippedMarkets := make(map[string]bool)
 	defer func() { outcome.SkippedHeld = len(skippedMarkets) }()
 	marketExposure := make(map[string]float64)
 	eventExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
-	for _, position := range positions {
+	for _, position := range summaries {
 		key := marketKey(position.EffectiveVenue(), position.MarketID)
 		orderedMarkets[key] = true
 		heldMarkets[key] = true
@@ -379,18 +386,20 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 	if message := exec.ReadyError(); message != "" {
 		return outcome, fmt.Errorf("%w: %s 实盘自动交易已开启，但实盘凭据未就绪: %s", ErrVenueNotConfigured, account.EffectiveVenue().Label(), message)
 	}
-	positions, err := e.repo.ListPositions(ctx, account.ID, "all", "")
+	// ListPositionSummaries loads only the fields needed to build exposure maps
+	// and ordered-market sets, skipping question text and display-only columns.
+	summaries, err := e.repo.ListPositionSummaries(ctx, account.ID)
 	if err != nil {
 		return outcome, err
 	}
 	orderedMarkets := make(map[string]bool)
-	heldMarkets := make(map[string]bool, len(positions))
+	heldMarkets := make(map[string]bool, len(summaries))
 	skippedMarkets := make(map[string]bool)
 	defer func() { outcome.SkippedHeld = len(skippedMarkets) }()
 	marketExposure := make(map[string]float64)
 	eventExposure := make(map[string]float64)
 	totalExposure, realized := 0.0, 0.0
-	for _, position := range positions {
+	for _, position := range summaries {
 		key := marketKey(position.EffectiveVenue(), position.MarketID)
 		orderedMarkets[key] = true
 		heldMarkets[key] = true
@@ -433,16 +442,21 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 		if !protocolSupported(exec, opportunity.Version) {
 			// The executor cannot sign this market version. Skip it instead of
 			// writing a rejected order on every scan; a manual order still
-			// reports the reason explicitly.
+			// reports the reason explicitly. Count skips so the scan summary
+			// can surface a "enable ProtocolV2" hint when the count is non-zero.
+			outcome.SkippedProtocol++
 			continue
 		}
 		budget := effective.OrderSize
 		estimatedFee, feeErr := exec.EstimateBuyFee(ctx, opportunity.ConditionID, budget, opportunity.Price)
 		if feeErr != nil {
-			return outcome, fmt.Errorf("%w: 估算实盘手续费失败: %v", ErrLiveUnavailable, feeErr)
+			// A single market's fee query failing must not abort the whole
+			// scan cycle: skip this opportunity and try the next one so a
+			// transient RPC error on one token does not block all entries.
+			continue
 		}
 		if estimatedFee < 0 || math.IsNaN(estimatedFee) || math.IsInf(estimatedFee, 0) {
-			return outcome, fmt.Errorf("%w: 实盘手续费估算无效", ErrLiveUnavailable)
+			continue
 		}
 		cost := budget + estimatedFee
 		if totalExposure+cost > effective.MaxExposure+1e-9 {
@@ -457,7 +471,10 @@ func (e *Engine) autoLiveTrade(ctx context.Context, account Account, opportuniti
 			continue
 		}
 		if cost > cash+1e-9 {
-			return outcome, fmt.Errorf("%w: 实盘策略资金不足（含预估手续费）", ErrInvalidOrder)
+			// No remaining budget: stop evaluating further opportunities for
+			// this scan cycle. This is a normal steady-state condition once
+			// the account is fully deployed, not an error.
+			break
 		}
 		allowance, hasAllowance := snapshot.AllowanceForProtocol(opportunity.Version, opportunity.NegRisk)
 		if hasAllowance && cost > allowance+1e-9 {
@@ -604,8 +621,15 @@ func (e *Engine) reportedFeeRate(v market.Venue, tokenID string) float64 {
 	return 0
 }
 
+// stopLossSlippageMultiplier makes simulated stop-loss exits more pessimistic
+// than entry fills. A stop-loss trigger fires when the price is already falling:
+// the bid side is thin and the actual fill lands below the mark price, so
+// symmetric 1× slippage underestimates the true exit cost. 2× is a
+// conservative but realistic approximation for a thinly-traded binary market.
+const stopLossSlippageMultiplier = 2.0
+
 func (e *Engine) executePaperSell(ctx context.Context, account Account, position Position, reason string, settings Settings, scanRate float64) (Position, error) {
-	fillPrice := position.CurrentPrice * (1 - settings.SlippageBPS/10000)
+	fillPrice := position.CurrentPrice * (1 - stopLossSlippageMultiplier*settings.SlippageBPS/10000)
 	if fillPrice <= 0 || fillPrice >= 1 {
 		return Position{}, e.rejectSellOrder(ctx, account.ID, position, "模拟止损卖出价无效")
 	}

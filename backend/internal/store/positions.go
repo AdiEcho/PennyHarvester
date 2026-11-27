@@ -150,3 +150,28 @@ func (s *SQLite) SettlePosition(ctx context.Context, p engine.Position, order en
 	}
 	return tx.Commit()
 }
+
+// ListPositionSummaries returns a lightweight projection of all positions for
+// one account. It loads only the fields needed for the auto-trade exposure loop
+// (venue, market, event, status, cost, realized PNL), skipping question text,
+// outcome text, and other display-only columns. This keeps the scan efficient
+// as the position history grows.
+func (s *SQLite) ListPositionSummaries(ctx context.Context, accountID int64) ([]engine.PositionSummary, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT venue, market_id, event_id, status, cost, realized_pnl
+		 FROM positions WHERE account_id = ? ORDER BY id DESC`,
+		accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var summaries []engine.PositionSummary
+	for rows.Next() {
+		var p engine.PositionSummary
+		if err := rows.Scan(&p.Venue, &p.MarketID, &p.EventID, &p.Status, &p.Cost, &p.RealizedPNL); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, p)
+	}
+	return summaries, rows.Err()
+}
