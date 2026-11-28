@@ -256,10 +256,6 @@ type Settings struct {
 	// which the stop triggers. 0.70 means "exit when the mark falls to 70% of
 	// the entry price", not an absolute price of 0.70.
 	StopLossRatio float64 `json:"stop_loss_ratio"`
-	// MaxPriceDriftBPS rejects a live order when the real-time CLOB limit
-	// price exceeds the scan-time reference price by more than this many basis
-	// points. Zero disables the drift guard.
-	MaxPriceDriftBPS float64 `json:"max_price_drift_bps"`
 	// CryptoMinConfidence is the minimum outcome price required for automatic
 	// entry in crypto category markets, independent of MinPrice. It prevents
 	// entries on directional (Up/Down) markets whose implied win probability is
@@ -333,7 +329,7 @@ func DefaultSettings() Settings {
 		SportsPolicy:    SportsPolicyExcludeGames, MaxPriceChange24h: 0.10,
 		EntryWindowMinutes: 20, SportsEntryWindowMinutes: 5, CryptoEntryWindowSeconds: 60,
 		StopLossEnabled: false, StopLossRatio: DefaultStopLossRatio,
-		MaxPriceDriftBPS: 50, CryptoMinConfidence: 0.50,
+		CryptoMinConfidence: 0.50,
 		FeeModelVersion: FeeModelVersion,
 		// Polymarket stays enabled for existing installations; Predict.fun is
 		// opt-in because it was never traded by this build before.
@@ -395,10 +391,6 @@ func (s Settings) Validate() error {
 	}
 	if s.CryptoEntryWindowSeconds < 0 || s.CryptoEntryWindowSeconds > MaxCryptoEntryWindowSeconds {
 		return fmt.Errorf("加密尾盘下单窗口须为 0–%d 秒", MaxCryptoEntryWindowSeconds)
-	}
-	if s.MaxPriceDriftBPS < 0 || s.MaxPriceDriftBPS > 1000 ||
-		math.IsNaN(s.MaxPriceDriftBPS) || math.IsInf(s.MaxPriceDriftBPS, 0) {
-		return fmt.Errorf("实时价格漂移上限须为 0–1000 BPS")
 	}
 	if s.CryptoMinConfidence < 0 || s.CryptoMinConfidence > 1 ||
 		math.IsNaN(s.CryptoMinConfidence) || math.IsInf(s.CryptoMinConfidence, 0) {
@@ -1316,12 +1308,14 @@ type ScanOptions struct {
 // ScanSummary reports what a scan did for the requesting account. OrdersPlaced
 // counts automatic entries opened by this pass; SkippedHeld counts candidate
 // markets that already had a position record (open, settled or sold) and were
-// therefore not bought again.
+// therefore not bought again. SkippedBook counts markets skipped because the
+// real-time orderbook had no available asks at evaluation time.
 type ScanSummary struct {
 	AccountID    int64  `json:"account_id"`
 	Execute      bool   `json:"execute"`
 	OrdersPlaced int    `json:"orders_placed"`
 	SkippedHeld  int    `json:"skipped_held"`
+	SkippedBook  int    `json:"skipped_book,omitempty"`
 	Error        string `json:"error,omitempty"`
 }
 

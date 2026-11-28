@@ -399,6 +399,7 @@ func (e *Engine) scan(ctx context.Context, options ScanOptions) (ScanSummary, er
 					outcome, tradeErr := e.autoTrade(ctx, account, opportunitiesByAccount[account.ID], plan.settings)
 					summary.OrdersPlaced += outcome.Placed
 					summary.SkippedHeld += outcome.SkippedHeld
+					summary.SkippedBook += outcome.SkippedBook
 					if tradeErr != nil {
 						appendError(fmt.Sprintf("%s: %v", account.Name, tradeErr))
 					}

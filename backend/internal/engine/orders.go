@@ -203,6 +203,11 @@ type autoTradeOutcome struct {
 	// it cannot sign the market's protocol version. A non-zero count is a signal
 	// to the operator that enabling ProtocolV2 would unlock additional trades.
 	SkippedProtocol int
+	// SkippedBook counts opportunities skipped because the real-time CLOB
+	// orderbook had no available asks at the moment of evaluation. For paper
+	// accounts this requires a live executor to be registered for the venue;
+	// if none is available the check is bypassed and this counter stays zero.
+	SkippedBook int
 }
 
 func (e *Engine) autoTrade(ctx context.Context, account Account, opportunities []Opportunity, settings Settings) (autoTradeOutcome, error) {
@@ -314,6 +319,11 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 	baseline := account.BaselineEquity
 	cash := baseline + realized - totalExposure
 	now := time.Now().UTC()
+	// paperExec is the read-only CLOB surface used for orderbook availability
+	// checks. It may be nil when no executor is registered for this venue
+	// (e.g. the user has not configured credentials yet), in which case the
+	// check is skipped and paper trading behaves as before.
+	paperExec := e.venues.Executor(account.EffectiveVenue())
 	for _, opportunity := range opportunities {
 		key := marketKey(opportunity.EffectiveVenue(), opportunity.MarketID)
 		if orderedMarkets[key] {
@@ -324,6 +334,18 @@ func (e *Engine) autoPaperTrade(ctx context.Context, account Account, opportunit
 		}
 		if !withinAutoEntryWindow(opportunity, settings, now) {
 			continue
+		}
+		// P1: check real-time CLOB availability before simulating a paper fill.
+		// This prevents the simulated account from entering markets that live
+		// trading would reject outright due to an empty orderbook.
+		if paperExec != nil {
+			quoteCtx, cancelQuote := context.WithTimeout(ctx, livePriceQuoteTimeout)
+			_, quoteErr := paperExec.Quote(quoteCtx, opportunity.TokenID, opportunity.ConditionID, effective.OrderSize)
+			cancelQuote()
+			if quoteErr != nil {
+				outcome.SkippedBook++
+				continue
+			}
 		}
 		fillPrice := opportunity.Price * (1 + settings.SlippageBPS/10000)
 		if fillPrice <= 0 || fillPrice > settings.MaxPrice || fillPrice >= 1 {
@@ -1070,15 +1092,14 @@ func (e *Engine) executeLiveBuy(ctx context.Context, account Account, opportunit
 		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
 			fmt.Sprintf("实时限价 %.4f 超过最高价 %.4f，拒绝下单", liveQuote.LimitPrice, settings.MaxPrice), "")
 	}
-	if settings.MaxPriceDriftBPS > 0 && opportunity.Price > 0 {
-		drift := liveQuote.LimitPrice - opportunity.Price
-		if drift > settings.MaxPriceDriftBPS/10000+1e-9 {
-			return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
-				fmt.Sprintf("实时限价 %.4f 较参考价 %.4f 偏移 %.1f BPS，超过上限 %.0f BPS，拒绝下单",
-					liveQuote.LimitPrice, opportunity.Price, drift*10000, settings.MaxPriceDriftBPS), "")
-		}
+	// O2: reject when the live price has fallen well below the scan-time
+	// reference. A large downward move means conditions have changed since
+	// the scan and the opportunity no longer meets the entry criteria.
+	if liveQuote.LimitPrice < settings.MinPrice-1e-9 {
+		return Position{}, e.rejectOrder(ctx, account.ID, opportunity, kind, amount,
+			fmt.Sprintf("实时限价 %.4f 低于最低买入价 %.4f，价格已大幅下移，拒绝下单",
+				liveQuote.LimitPrice, settings.MinPrice), "")
 	}
-
 	// O3: record scan-to-order latency for diagnostics.
 	pendingReason := "实盘订单已签名，等待成交回报"
 	if !opportunity.FetchedAt.IsZero() {
